@@ -13,8 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Copy dependency manifests and install
-COPY package.json ./
-RUN npm install --production
+COPY package*.json ./
+RUN npm install --omit=dev
 
 # Copy application source
 COPY . .
