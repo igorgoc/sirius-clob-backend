@@ -1288,7 +1288,16 @@ function importNodeDriveSnapshot(targetNodeName, snapshotBundle) {
 
     fs.rmSync(targetSandbox, { recursive: true, force: true });
     fs.rmSync(targetMarkets, { recursive: true, force: true });
-    fs.renameSync(tmpMarkets, targetMarkets);
+    try {
+      fs.renameSync(tmpMarkets, targetMarkets);
+    } catch (renameErr) {
+      if (renameErr.code === 'EXDEV' || renameErr.code === 'EPERM') {
+        fs.cpSync(tmpMarkets, targetMarkets, { recursive: true, force: true });
+        fs.rmSync(tmpMarkets, { recursive: true, force: true });
+      } else {
+        throw renameErr;
+      }
+    }
     return { ok: true, node: targetNodeName, stateRootHash: stagedHash };
   } catch (err) {
     fs.rmSync(tmpMarkets, { recursive: true, force: true });
@@ -3851,7 +3860,9 @@ async function claimFaucet(publicKey, addressOverride = null) {
     UInt64.fromUint(200_000)
   );
 
-  const signedTx = treasury.preV2Sign(tx, testnet2Config.GENERATION_HASH);
+  const signedTx = typeof treasury.preV2Sign === 'function'
+    ? treasury.preV2Sign(tx, testnet2Config.GENERATION_HASH)
+    : treasury.sign(tx, testnet2Config.GENERATION_HASH);
   await testnetClient.announceSignedTransaction(signedTx);
   await testnetClient.verifyTransactionAccepted(signedTx.hash);
 

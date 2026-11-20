@@ -262,7 +262,9 @@ class BatchSettlerTestnet2 {
           UInt64.fromUint(feeUnits)
         );
 
-        const signedTx = vault.preV2Sign(aggregateTx, config.GENERATION_HASH);
+        const signedTx = typeof vault.preV2Sign === 'function'
+          ? vault.preV2Sign(aggregateTx, config.GENERATION_HASH)
+          : vault.sign(aggregateTx, config.GENERATION_HASH);
 
         // Record deterministic signedTx BEFORE announcing so retries reuse the exact same hash
         this.inFlightChunks.push({ chunk, signedTx });

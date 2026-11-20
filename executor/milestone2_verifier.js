@@ -68,6 +68,28 @@ function copyDirRecursive(src, dest) {
   }
 }
 
+function safeAtomicRename(src, dest) {
+  try {
+    fs.renameSync(src, dest);
+  } catch (err) {
+    if (err.code === 'EXDEV' || err.code === 'EPERM' || err.code === 'EBUSY') {
+      if (fs.existsSync(src)) {
+        const stat = fs.statSync(src);
+        if (stat.isDirectory()) {
+          fs.rmSync(dest, { recursive: true, force: true });
+          copyDirRecursive(src, dest);
+          fs.rmSync(src, { recursive: true, force: true });
+        } else {
+          fs.copyFileSync(src, dest);
+          fs.unlinkSync(src);
+        }
+      }
+    } else {
+      throw err;
+    }
+  }
+}
+
 /**
  * Per-Execution Drive Sandbox Overlay Manager (`VirtualMachineStorageQueryHandler`)
  * Stages Drive files in an isolated sandbox directory during WASM execution,
@@ -249,7 +271,7 @@ class DriveSandboxOverlay {
         const oldAbs = this.resolveSandboxPath(old_path);
         const newAbs = this.resolveSandboxPath(new_path);
         fs.mkdirSync(path.dirname(newAbs), { recursive: true });
-        fs.renameSync(oldAbs, newAbs);
+        safeAtomicRename(oldAbs, newAbs);
         return { move_filesystem_entry_return: { success: true } };
       } catch (e) {
         return { move_filesystem_entry_return: { success: false } };
@@ -325,9 +347,9 @@ class DriveSandboxOverlay {
     copyDirRecursive(this.sandboxDir, stagingDir);
     if (fs.existsSync(this.driveDir)) {
       fs.rmSync(backupDir, { recursive: true, force: true });
-      fs.renameSync(this.driveDir, backupDir);
+      safeAtomicRename(this.driveDir, backupDir);
     }
-    fs.renameSync(stagingDir, this.driveDir);
+    safeAtomicRename(stagingDir, this.driveDir);
     fs.rmSync(backupDir, { recursive: true, force: true });
   }
 

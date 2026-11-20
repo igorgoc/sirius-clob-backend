@@ -307,7 +307,9 @@ async function broadcastVaultTransfer(vaultAccount, recipientAddressStr, mosaicI
     UInt64.fromUint(200000) // Default fee units
   );
 
-  const signedTx = vaultAccount.preV2Sign(transferTx, config.GENERATION_HASH);
+  const signedTx = typeof vaultAccount.preV2Sign === 'function'
+    ? vaultAccount.preV2Sign(transferTx, config.GENERATION_HASH)
+    : vaultAccount.sign(transferTx, config.GENERATION_HASH);
 
   const { response: res, nodeUrl } = await announceSignedTransaction(signedTx);
 
