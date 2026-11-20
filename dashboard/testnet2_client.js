@@ -142,22 +142,40 @@ async function getLatestHeight() {
   );
 }
 
+const onChainBalancesCache = new Map();
+const ONCHAIN_BALANCE_CACHE_TTL_MS = 15000; // 15s TTL to avoid flooding Sirius L1 RPC
+
+function invalidateAccountBalanceCache(rawAddress) {
+  if (rawAddress) {
+    onChainBalancesCache.delete(String(rawAddress).toUpperCase());
+  } else {
+    onChainBalancesCache.clear();
+  }
+}
+
 /**
- * Get on-chain mosaic balances for an account address with automatic failover
+ * Get on-chain mosaic balances for an account address with automatic failover and memory caching
  */
-async function getAccountOnChainBalances(rawAddress) {
-  return withNodeFailover(
+async function getAccountOnChainBalances(rawAddress, forceRefresh = false) {
+  const normAddr = String(rawAddress || '').toUpperCase();
+  const now = Date.now();
+  const cached = onChainBalancesCache.get(normAddr);
+  if (!forceRefresh && cached && (now - cached.timestamp < ONCHAIN_BALANCE_CACHE_TTL_MS)) {
+    return new Map(cached.balances);
+  }
+
+  const balances = await withNodeFailover(
     ({ accountHttp }) =>
       new Promise((resolve, reject) => {
         try {
           const addr = Address.createFromRawAddress(rawAddress);
           accountHttp.getAccountInfo(addr).subscribe(
             (info) => {
-              const balances = new Map();
+              const res = new Map();
               for (const m of info.mosaics) {
-                balances.set(m.id.toHex().toLowerCase(), BigInt(m.amount.compact()));
+                res.set(m.id.toHex().toLowerCase(), BigInt(m.amount.compact()));
               }
-              resolve(balances);
+              resolve(res);
             },
             (err) => {
               if (
@@ -175,6 +193,9 @@ async function getAccountOnChainBalances(rawAddress) {
         }
       })
   );
+
+  onChainBalancesCache.set(normAddr, { balances, timestamp: now });
+  return new Map(balances);
 }
 
 /**
@@ -389,6 +410,7 @@ module.exports = {
   verifyTransactionAccepted,
   getLatestHeight,
   getAccountOnChainBalances,
+  invalidateAccountBalanceCache,
   queryTransaction,
   broadcastVaultTransfer,
   getOrInitVaultAccount,

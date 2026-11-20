@@ -2295,7 +2295,7 @@ function syncAllGatewayBalancesFromDrive() {
 syncAllGatewayBalancesFromDrive();
 
 const vaultBalanceCache = new Map();
-const VAULT_CACHE_TTL_MS = 10_000;
+const VAULT_CACHE_TTL_MS = 120_000; // 120s TTL; updated continuously in background by syncVaultBalancesFromTestnet2
 
 function invalidateVaultBalanceCache(mosaicId = null) {
   if (mosaicId) {
@@ -2316,6 +2316,10 @@ function getVaultBalance(mosaicHex, forceSync = false) {
   const now = Date.now();
   const cached = vaultBalanceCache.get(normHex);
   if (!forceSync && cached && (now - cached.timestamp < VAULT_CACHE_TTL_MS)) {
+    return cached.balance;
+  }
+  if (cached) {
+    // Return cached balance immediately to prevent blocking order execution
     return cached.balance;
   }
   try {

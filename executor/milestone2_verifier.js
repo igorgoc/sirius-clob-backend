@@ -55,9 +55,11 @@ function sha256Hex(bufferOrPath) {
 }
 
 function copyDirRecursive(src, dest) {
+  if (!fs.existsSync(src)) return;
   fs.mkdirSync(dest, { recursive: true });
   for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
     if (entry.isSymbolicLink()) continue; // Never follow symlinks out of sandbox/drive
+    if (entry.name.endsWith('.wasm')) continue; // Skip static WASM binaries (immutable code)
     const srcPath = path.join(src, entry.name);
     const destPath = path.join(dest, entry.name);
     if (entry.isDirectory()) {
@@ -341,16 +343,8 @@ class DriveSandboxOverlay {
 
   commitOverlay() {
     this.closeAllHandles();
-    const stagingDir = `${this.driveDir}.staging.${process.pid}`;
-    const backupDir = `${this.driveDir}.bak.${process.pid}`;
-    fs.rmSync(stagingDir, { recursive: true, force: true });
-    copyDirRecursive(this.sandboxDir, stagingDir);
-    if (fs.existsSync(this.driveDir)) {
-      fs.rmSync(backupDir, { recursive: true, force: true });
-      safeAtomicRename(this.driveDir, backupDir);
-    }
-    safeAtomicRename(stagingDir, this.driveDir);
-    fs.rmSync(backupDir, { recursive: true, force: true });
+    copyDirRecursive(this.sandboxDir, this.driveDir);
+    fs.rmSync(this.sandboxDir, { recursive: true, force: true });
   }
 
   rollbackOverlay() {
