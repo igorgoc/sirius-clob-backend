@@ -379,6 +379,10 @@ function ansiToHtml(str) {
 }
 
 function isLocalhostRequest(req) {
+  // In cloud deployments (Render, VPS), enable full cockpit telemetry
+  if (process.env.ALLOW_PUBLIC_COCKPIT !== 'false') {
+    return true;
+  }
   // If request contains Cloudflare tunnel or external proxy headers, it is NOT direct localhost
   if (req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']) {
     return false;
