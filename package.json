@@ -1,0 +1,17 @@
+{
+  "name": "sirius-clob-backend",
+  "version": "1.0.0",
+  "description": "Sirius CLOB Decentralized Exchange Backend: 3-Node BFT WASM Cluster + Relayer API",
+  "main": "dashboard/server.js",
+  "scripts": {
+    "start": "bash start.sh"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.10.9",
+    "@grpc/proto-loader": "^0.7.13",
+    "better-sqlite3": "^11.8.1",
+    "ethers": "^6.13.4",
+    "tsjs-xpx-chain-sdk": "^1.0.0",
+    "ws": "^8.18.0"
+  }
+}

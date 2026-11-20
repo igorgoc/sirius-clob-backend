@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: sirius-clob-backend
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/clob/depth?symbol=XPX/USDT
+    envVars:
+      - key: SIRIUS_NETWORK
+        value: testnet2
+      - key: SIRIUS_NODE_URL
+        value: https://api-2.testnet2.xpxsirius.io

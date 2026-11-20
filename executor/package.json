@@ -1,0 +1,14 @@
+{
+  "name": "sirius-supercontract-grpc-vm",
+  "version": "2.0.0",
+  "description": "Milestone 2 Production gRPC WASM Virtual Machine & Executor Bridge for ProximaX Sirius SuperContract V2",
+  "main": "grpc_vm_server.js",
+  "scripts": {
+    "start": "node grpc_vm_server.js",
+    "test-milestone2": "node milestone2_verifier.js"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.10.9",
+    "@grpc/proto-loader": "^0.7.13"
+  }
+}

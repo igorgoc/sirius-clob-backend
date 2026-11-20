@@ -1,0 +1,328 @@
+/**
+ * Sirius SuperContract V2 — Production gRPC Virtual Machine Server
+ * Implements `supercontractserver.SupercontractServer` (`supercontract_server.proto`)
+ * for a single validator node (e.g. 127.0.0.1:5051, 5052, 5053).
+ */
+
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const { Worker } = require('worker_threads');
+const grpc = require('@grpc/grpc-js');
+const protoLoader = require('@grpc/proto-loader');
+
+const ROOT_DIR = path.resolve(__dirname, '..');
+const CLUSTER_DIR = path.join(ROOT_DIR, 'cluster');
+const CONTRACTS_DIR = path.join(ROOT_DIR, 'contracts');
+const PROTO_DIR = path.join(__dirname, 'proto');
+const PROTO_PATH = path.join(PROTO_DIR, 'supercontract_server.proto');
+
+function verifyVmAuthMetadata(callOrStream) {
+  const expectedToken = process.env.SIRIUS_VM_AUTH_TOKEN;
+  if (!expectedToken) return true; // Local dev backward-compatibility when unset
+  const metaVals = callOrStream && callOrStream.metadata ? callOrStream.metadata.get('x-sirius-vm-token') : [];
+  const provided = String((metaVals && metaVals[0]) || '');
+  const a = Buffer.from(provided, 'utf8');
+  const b = Buffer.from(String(expectedToken), 'utf8');
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+function validateWasmFileToCall(filePath) {
+  if (!filePath || typeof filePath !== 'string') {
+    throw new Error('Missing file_to_call path');
+  }
+  const resolved = path.resolve(filePath);
+  const clusterRoot = CLUSTER_DIR.endsWith(path.sep) ? CLUSTER_DIR : CLUSTER_DIR + path.sep;
+  const contractsRoot = CONTRACTS_DIR.endsWith(path.sep) ? CONTRACTS_DIR : CONTRACTS_DIR + path.sep;
+  if (!resolved.startsWith(clusterRoot) && !resolved.startsWith(contractsRoot)) {
+    throw new Error(`Security rejection: file_to_call (${filePath}) is outside allowed cluster/contracts directory`);
+  }
+  if (!resolved.endsWith('.wasm') || !fs.existsSync(resolved)) {
+    throw new Error(`Security rejection: WASM binary does not exist at ${resolved}`);
+  }
+  const allowedHashesRaw = process.env.SIRIUS_ALLOWED_WASM_SHA256;
+  if (allowedHashesRaw) {
+    const allowedSet = new Set(
+      allowedHashesRaw
+        .split(',')
+        .map((s) => s.trim().toLowerCase())
+        .filter(Boolean)
+    );
+    if (allowedSet.size > 0) {
+      const actualHash = crypto.createHash('sha256').update(fs.readFileSync(resolved)).digest('hex').toLowerCase();
+      if (!allowedSet.has(actualHash)) {
+        throw new Error(`Security rejection: WASM SHA-256 (${actualHash}) is not in SIRIUS_ALLOWED_WASM_SHA256 allowlist`);
+      }
+    }
+  }
+  return resolved;
+}
+
+const packageDefinition = protoLoader.loadSync(PROTO_PATH, {
+  keepCase: true,
+  longs: String,
+  enums: String,
+  defaults: true,
+  oneofs: true,
+  includeDirs: [PROTO_DIR],
+});
+
+const protoDescriptor = grpc.loadPackageDefinition(packageDefinition);
+const supercontractserver = protoDescriptor.supercontractserver;
+
+const SHARED_BUFFER_BYTES = 1024 * 1024; // 1 MB shared IPC buffer per call
+
+/**
+ * Normalizes protobuf Buffer fields to base64 strings before serializing into SharedArrayBuffer.
+ */
+function normalizeClientMessage(msg) {
+  if (Array.isArray(msg)) {
+    return msg.map((item) => {
+      if (Buffer.isBuffer(item)) return item.toString('base64');
+      if (item && typeof item === 'object') return normalizeClientMessage(item);
+      return item;
+    });
+  }
+  const out = {};
+  for (const [k, v] of Object.entries(msg)) {
+    if (Buffer.isBuffer(v)) {
+      out[k] = v.toString('base64');
+    } else if (Array.isArray(v)) {
+      out[k] = normalizeClientMessage(v);
+    } else if (v && typeof v === 'object') {
+      out[k] = normalizeClientMessage(v);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+/**
+ * Converts base64 fields in worker serverMessage back into Buffers where protobuf expects `bytes`.
+ */
+function prepareServerMessage(serverMsg) {
+  if (serverMsg.write_file_stream && typeof serverMsg.write_file_stream.buffer === 'string') {
+    return {
+      write_file_stream: {
+        identifier: serverMsg.write_file_stream.identifier,
+        buffer: Buffer.from(serverMsg.write_file_stream.buffer, 'base64'),
+      },
+    };
+  }
+  return serverMsg;
+}
+
+function createSupercontractService(nodeName, bindAddress) {
+  return {
+    Ping(call, callback) {
+      if (!verifyVmAuthMetadata(call)) {
+        return callback({
+          code: grpc.status.UNAUTHENTICATED,
+          message: 'Invalid or missing x-sirius-vm-token metadata',
+        });
+      }
+      const callerName = call.request.name || 'unknown';
+      callback(null, {
+        message: `PONG from ${nodeName} WASM VM (${bindAddress}) to ${callerName}`,
+      });
+    },
+
+    ExecuteCall(stream) {
+      if (!verifyVmAuthMetadata(stream)) {
+        console.warn(`[${nodeName} VM] ⛔ Rejected unauthenticated ExecuteCall stream`);
+        if (!stream.writableEnded) {
+          stream.write({
+            returns: {
+              success: false,
+              execution_gas_consumed: '0',
+              download_gas_consumed: '0',
+              poex_secret_data: '0',
+              return_val: -401,
+            },
+          });
+          stream.end();
+        }
+        return;
+      }
+      let worker = null;
+      let sharedBuffer = null;
+      let control = null;
+      let dataBuffer = null;
+
+      stream.on('data', (reqMsg) => {
+        // 1. Initial ExecuteRequest starts the WASM Worker
+        if (reqMsg.request && !worker) {
+          const execReq = reqMsg.request;
+          let validatedWasmPath;
+          try {
+            validatedWasmPath = validateWasmFileToCall(execReq.file_to_call);
+          } catch (secErr) {
+            console.error(`[${nodeName} VM] ⛔ ${secErr.message}`);
+            if (!stream.writableEnded) {
+              stream.write({
+                returns: {
+                  success: false,
+                  execution_gas_consumed: '0',
+                  download_gas_consumed: '0',
+                  poex_secret_data: '0',
+                  return_val: -403,
+                },
+              });
+              stream.end();
+            }
+            return;
+          }
+          sharedBuffer = new SharedArrayBuffer(SHARED_BUFFER_BYTES);
+          control = new Int32Array(sharedBuffer, 0, 2);
+          dataBuffer = new Uint8Array(sharedBuffer, 8);
+
+          const paramsHex = Buffer.isBuffer(execReq.parameters)
+            ? execReq.parameters.toString('hex')
+            : '';
+
+          console.log(
+            `[${nodeName} VM] ⚡ ExecuteCall started: file=${path.basename(validatedWasmPath)} fn=${execReq.function_to_call} gasLimit=${execReq.execution_gas_limit}`
+          );
+
+          worker = new Worker(path.join(__dirname, 'wasm_worker.js'), {
+            workerData: {
+              fileToCall: validatedWasmPath,
+              functionToCall: execReq.function_to_call,
+              parametersHex: paramsHex,
+              poexSecretDataPrefix: execReq.poex_secret_data_prefix || '0',
+              executionGasLimit: execReq.execution_gas_limit || '0',
+              downloadGasLimit: execReq.download_gas_limit || '0',
+              callMode: execReq.call_mode || 0,
+              sharedBuffer,
+            },
+          });
+
+          worker.on('message', (msg) => {
+            if (msg.type === 'host_call') {
+              const outbound = prepareServerMessage(msg.serverMessage);
+              stream.write(outbound);
+            } else if (msg.type === 'execution_complete') {
+              const ret = msg.returns;
+              const protoReturns = {
+                success: Boolean(ret.success),
+                execution_gas_consumed: String(ret.execution_gas_consumed || '0'),
+                download_gas_consumed: String(ret.download_gas_consumed || '0'),
+                poex_secret_data: String(ret.poex_secret_data || '0'),
+                return_val: Number(ret.return_val || 0),
+              };
+
+              if (ret.transaction) {
+                protoReturns.transaction = {
+                  max_fee: String(ret.transaction.max_fee || '0'),
+                  transactions: (ret.transaction.transactions || []).map((tx) => ({
+                    entity_type: Number(tx.entity_type),
+                    version: Number(tx.version),
+                    payload: Buffer.from(tx.payload, 'base64'),
+                  })),
+                };
+              }
+
+              console.log(
+                `[${nodeName} VM] ✅ ExecuteCall complete: success=${protoReturns.success} return=${protoReturns.return_val} gas=${protoReturns.execution_gas_consumed} poex=${protoReturns.poex_secret_data}`
+              );
+
+              if (!stream.writableEnded) {
+                stream.write({ returns: protoReturns });
+                stream.end();
+              }
+            }
+          });
+
+          worker.on('error', (err) => {
+            console.error(`[${nodeName} VM] ❌ Worker error:`, err);
+            if (!stream.writableEnded) {
+              stream.write({
+                returns: {
+                  success: false,
+                  execution_gas_consumed: '0',
+                  download_gas_consumed: '0',
+                  poex_secret_data: '0',
+                  return_val: -1,
+                },
+              });
+              stream.end();
+            }
+          });
+
+          return;
+        }
+
+        // 2. Host call reply from C++ Executor -> wake up blocked WASM worker via Atomics.notify()
+        if (worker && control) {
+          const normalized = normalizeClientMessage(reqMsg);
+          const jsonBytes = Buffer.from(JSON.stringify(normalized), 'utf8');
+          if (jsonBytes.length > dataBuffer.length) {
+            const errBytes = Buffer.from('IPC response exceeded SharedArrayBuffer capacity', 'utf8');
+            const copyLen = Math.min(errBytes.length, dataBuffer.length);
+            errBytes.copy(dataBuffer, 0, 0, copyLen);
+            Atomics.store(control, 1, copyLen);
+            Atomics.store(control, 0, -1);
+          } else {
+            jsonBytes.copy(dataBuffer, 0);
+            Atomics.store(control, 1, jsonBytes.length);
+            Atomics.store(control, 0, 2); // 2 = response ready
+          }
+          Atomics.notify(control, 0, 1);
+        }
+      });
+
+      function abortWorker() {
+        if (control) {
+          Atomics.store(control, 1, 0);
+          Atomics.store(control, 0, -1);
+          Atomics.notify(control, 0, 1);
+        }
+        if (worker) {
+          const w = worker;
+          worker = null;
+          w.terminate().catch(() => {});
+        }
+      }
+
+      stream.on('end', abortWorker);
+
+      stream.on('error', (err) => {
+        console.error(`[${nodeName} VM] Stream error:`, err.message);
+        abortWorker();
+      });
+    },
+  };
+}
+
+function startVmServer(port, nodeName, bindHost = process.env.SIRIUS_VM_BIND_HOST || '127.0.0.1') {
+  return new Promise((resolve, reject) => {
+    const bindAddress = `${bindHost}:${port}`;
+    const server = new grpc.Server();
+    server.addService(
+      supercontractserver.SupercontractServer.service,
+      createSupercontractService(nodeName, bindAddress)
+    );
+    server.bindAsync(bindAddress, grpc.ServerCredentials.createInsecure(), (err, boundPort) => {
+      if (err) {
+        return reject(err);
+      }
+      console.log(`🚀 [${nodeName}] SuperContract V2 gRPC WASM VM listening on ${bindHost}:${boundPort}`);
+      resolve(server);
+    });
+  });
+}
+
+if (require.main === module) {
+  const port = parseInt(process.argv[2] || process.env.VM_PORT || '5051', 10);
+  const nodeName = process.argv[3] || process.env.NODE_NAME || `node-${port}`;
+  // Keep Node.js event loop alive indefinitely for daemon mode
+  setInterval(() => {}, 60000);
+  startVmServer(port, nodeName).catch((err) => {
+    console.error(`Failed to start VM server on port ${port}:`, err);
+    process.exit(1);
+  });
+}
+
+module.exports = { startVmServer, supercontractserver, verifyVmAuthMetadata, validateWasmFileToCall };

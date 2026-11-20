@@ -1,0 +1,10 @@
+{
+  "role": "Exchange Fee Collector",
+  "description": "Dedicated isolated account for trading and withdrawal fee revenue collection",
+  "address": "VB3QOFNGGL7DENKPBW2RO3OVIXLOVLQ5F5WLG4XE",
+  "publicKey": "04EF8D54AAEFBC4746257723FD1EFB7B37F30452DE8BD022F5FB3CABC5246A64",
+  "privateKey": "2A0D14C9C19E9F7E17D24557923C416448E023F25CB4DD1387BFD0CD7FE1846A",
+  "network": "publicTest",
+  "networkType": 168,
+  "createdAt": "2026-10-24T21:35:28.659Z"
+}
