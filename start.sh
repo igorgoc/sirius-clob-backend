@@ -14,12 +14,15 @@ trap cleanup SIGTERM SIGINT
 # Start 3 BFT WASM VM Executors
 echo "Starting BFT Node 1 (:5051)..."
 node executor/grpc_vm_server.js 5051 node1 &
+echo $! > cluster/node1_vm.pid
 
 echo "Starting BFT Node 2 (:5052)..."
 node executor/grpc_vm_server.js 5052 node2 &
+echo $! > cluster/node2_vm.pid
 
 echo "Starting BFT Node 3 (:5053)..."
 node executor/grpc_vm_server.js 5053 node3 &
+echo $! > cluster/node3_vm.pid
 
 sleep 2
 

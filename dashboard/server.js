@@ -973,7 +973,7 @@ const server = http.createServer((req, res) => {
 
   // SiriusCLOB DEX Endpoint: Live Depth Snapshot
   if (pathname === '/api/clob/depth' && req.method === 'GET') {
-    const market = sanitizeMarket(parsedUrl.searchParams.get('pair') || parsedUrl.searchParams.get('market'));
+    const market = sanitizeMarket(parsedUrl.searchParams.get('pair') || parsedUrl.searchParams.get('market') || parsedUrl.searchParams.get('symbol'));
     const DRIVE_KEY_HEX = 'bd1d100a98c34f62e170a8395b4498dc1e730286f5a12c489b37d01562f0cb23';
     const depthPath = path.join(CLUSTER_DIR, 'node1', 'data', 'drives', DRIVE_KEY_HEX, 'drive', 'markets', market, 'depth.json');
     if (fs.existsSync(depthPath)) {
