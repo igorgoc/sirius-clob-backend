@@ -3,6 +3,7 @@ services:
     name: sirius-clob-backend
     runtime: docker
     plan: free
+    autoDeploy: true
     healthCheckPath: /api/clob/depth?symbol=XPX/USDT
     envVars:
       - key: SIRIUS_NETWORK
