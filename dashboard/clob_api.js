@@ -2015,11 +2015,26 @@ async function syncVaultBalancesFromTestnet2() {
     const t2Client = require('./testnet2_client');
     const vault = t2Client.getOrInitVaultAccount();
     const vaultAddr = vault.address.plain();
-    const balances = await t2Client.getAccountOnChainBalances(vaultAddr);
-    for (const [hex, amt] of balances.entries()) {
-      setVaultBalanceCache(hex, amt);
+    const scAddr = testnet2Config.SUPERCONTRACT_ADDRESS;
+
+    const vaultBalances = (await t2Client.getAccountOnChainBalances(vaultAddr)) || new Map();
+    let scBalances = new Map();
+    if (scAddr && scAddr !== vaultAddr) {
+      try {
+        scBalances = (await t2Client.getAccountOnChainBalances(scAddr)) || new Map();
+      } catch (_) {}
     }
-    return balances;
+
+    const allMosaics = new Set([...vaultBalances.keys(), ...scBalances.keys()]);
+    const combined = new Map();
+    for (const hex of allMosaics) {
+      const vAmt = vaultBalances.get(hex) || 0n;
+      const scAmt = scBalances.get(hex) || 0n;
+      const total = vAmt + scAmt;
+      setVaultBalanceCache(hex, total);
+      combined.set(hex, total);
+    }
+    return combined;
   } catch (err) {
     console.warn('[Vault Sync] Error fetching on-chain vault balances:', err.message);
     return null;
