@@ -8,6 +8,7 @@ const { parentPort, workerData } = require('worker_threads');
 const fs = require('fs');
 
 const {
+  wasmModule,
   fileToCall,
   functionToCall,
   parametersHex,
@@ -464,11 +465,17 @@ const importObject = {
 
 async function executeWasm() {
   try {
-    if (!fs.existsSync(fileToCall)) {
-      throw new Error(`WASM file not found: ${fileToCall}`);
+    let instance;
+    if (wasmModule) {
+      instance = await WebAssembly.instantiate(wasmModule, importObject);
+    } else {
+      if (!fs.existsSync(fileToCall)) {
+        throw new Error(`WASM file not found: ${fileToCall}`);
+      }
+      const wasmBytes = fs.readFileSync(fileToCall);
+      const res = await WebAssembly.instantiate(wasmBytes, importObject);
+      instance = res.instance;
     }
-    const wasmBytes = fs.readFileSync(fileToCall);
-    const { instance } = await WebAssembly.instantiate(wasmBytes, importObject);
     memory = instance.exports.memory;
 
     const fnName = functionToCall || 'run';

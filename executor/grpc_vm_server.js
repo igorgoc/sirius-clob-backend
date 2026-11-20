@@ -73,6 +73,15 @@ const supercontractserver = protoDescriptor.supercontractserver;
 
 const SHARED_BUFFER_BYTES = 1024 * 1024; // 1 MB shared IPC buffer per call
 
+const compiledWasmCache = new Map();
+async function getCompiledWasmModule(wasmPath) {
+  if (!compiledWasmCache.has(wasmPath)) {
+    const bytes = fs.readFileSync(wasmPath);
+    compiledWasmCache.set(wasmPath, WebAssembly.compile(bytes));
+  }
+  return compiledWasmCache.get(wasmPath);
+}
+
 /**
  * Normalizes protobuf Buffer fields to base64 strings before serializing into SharedArrayBuffer.
  */
@@ -151,7 +160,7 @@ function createSupercontractService(nodeName, bindAddress) {
       let control = null;
       let dataBuffer = null;
 
-      stream.on('data', (reqMsg) => {
+      stream.on('data', async (reqMsg) => {
         // 1. Initial ExecuteRequest starts the WASM Worker
         if (reqMsg.request && !worker) {
           const execReq = reqMsg.request;
@@ -186,8 +195,16 @@ function createSupercontractService(nodeName, bindAddress) {
             `[${nodeName} VM] ⚡ ExecuteCall started: file=${path.basename(validatedWasmPath)} fn=${execReq.function_to_call} gasLimit=${execReq.execution_gas_limit}`
           );
 
+          let wasmModule = null;
+          try {
+            wasmModule = await getCompiledWasmModule(validatedWasmPath);
+          } catch (compErr) {
+            console.warn(`[${nodeName} VM] Notice: Precompiled WASM cache fallback:`, compErr.message);
+          }
+
           worker = new Worker(path.join(__dirname, 'wasm_worker.js'), {
             workerData: {
+              wasmModule,
               fileToCall: validatedWasmPath,
               functionToCall: execReq.function_to_call,
               parametersHex: paramsHex,
