@@ -1988,19 +1988,19 @@ async function syncAndGetAccountBalance(publicKeyOrAddr) {
   const lockedUsdt = BigInt(currentEntry.lockedUsdt || 0n);
   const lockedBnb = BigInt(currentEntry.lockedBnb || 0n);
 
-  // Reconciled strictly between verified deposit ledger and SuperContract drive state
-  // External un-deposited wallet balances on Catapult L1 are never double-counted to prevent vault draining
+  // All coins in the wallet are immediately available for trading (minus currently locked in orders)
+  // Reconciled with on-chain wallet backing and SuperContract drive state
   const rawLocalXpx = BigInt(currentEntry.xpx || 0n);
   const rawLocalUsdt = BigInt(currentEntry.usdt || 0n);
   const rawLocalBnb = BigInt(currentEntry.bnb || 0n);
 
-  const driveXpx = BigInt(driveBal.xpx || 0n);
-  const driveUsdt = BigInt(driveBal.usdt || 0n);
-  const driveBnb = BigInt(driveBal.bnb || 0n);
+  const backingXpx = BigInt(onChainXpx || 0n) + BigInt(driveBal.xpx || 0n);
+  const backingUsdt = BigInt(onChainUsdt || 0n) + BigInt(driveBal.usdt || 0n);
+  const backingBnb = BigInt(onChainBnb || 0n) + BigInt(driveBal.bnb || 0n);
 
-  const totalXpx = rawLocalXpx > driveXpx ? rawLocalXpx : driveXpx;
-  const totalUsdt = rawLocalUsdt > driveUsdt ? rawLocalUsdt : driveUsdt;
-  const totalBnb = rawLocalBnb > driveBnb ? rawLocalBnb : driveBnb;
+  const totalXpx = rawLocalXpx > backingXpx ? rawLocalXpx : backingXpx;
+  const totalUsdt = rawLocalUsdt > backingUsdt ? rawLocalUsdt : backingUsdt;
+  const totalBnb = rawLocalBnb > backingBnb ? rawLocalBnb : backingBnb;
 
   const availXpx = totalXpx > lockedXpx ? (totalXpx - lockedXpx) : 0n;
   const availUsdt = totalUsdt > lockedUsdt ? (totalUsdt - lockedUsdt) : 0n;
@@ -4313,6 +4313,47 @@ async function withdrawTokens(withdrawReq) {
   return withAccountLock(lockKey, () => _withdrawTokensUnlocked(withdrawReq));
 }
 
+function getVerifiedVaultDepositedBalance(callerKey, mosaicId) {
+  const normKey = normalizeKey(callerKey).toLowerCase();
+  let senderAddr = '';
+  try {
+    senderAddr = Address.createFromPublicKey(normKey, NETWORK_ID).plain().replace(/[- ]/g, '').toUpperCase();
+  } catch (_) {}
+
+  const isXpx = mosaicId === XPX_MOSAIC_ID;
+  const isUsdt = mosaicId === USDT_MOSAIC_ID;
+  const isBnb = mosaicId === BNB_MOSAIC_ID;
+
+  let totalDeposited = 0n;
+  for (const dep of processedDeposits.values()) {
+    const depKey = normalizeKey(dep.senderPublicKey || dep.callerKey || '').toLowerCase();
+    const depAddr = (dep.senderAddress || '').replace(/[- ]/g, '').toUpperCase();
+    if (depKey !== normKey && (!senderAddr || depAddr !== senderAddr)) continue;
+
+    const mHex = String(dep.mosaicIdHex || '').toLowerCase().replace(/^0x/, '');
+    const isDepXpx = isXpxMosaic(mHex);
+    const isDepUsdt = mHex === '4430aefef7e15d0c' || mHex === '7525381a171d1e44' || mHex === String(testnet2Config.USDT_MOSAIC_ID || '').toLowerCase();
+    const isDepBnb = mHex === '3cc1d3ce7447b6f9' || mHex === '1e5c5fadec7b34dd' || mHex === String(testnet2Config.BNB_MOSAIC_ID || '').toLowerCase();
+
+    if ((isXpx && isDepXpx) || (isUsdt && isDepUsdt) || (isBnb && isDepBnb)) {
+      totalDeposited += BigInt(dep.amountAtomic || 0n);
+    }
+  }
+
+  let totalWithdrawn = 0n;
+  for (const w of withdrawals.values()) {
+    const wKey = normalizeKey(w.callerKey || '').toLowerCase();
+    if (wKey !== normKey) continue;
+    if (w.status === 'failed') continue;
+
+    if (String(w.mosaicId) === String(mosaicId)) {
+      totalWithdrawn += BigInt(w.amountAtomic || 0n);
+    }
+  }
+
+  return totalDeposited > totalWithdrawn ? totalDeposited - totalWithdrawn : 0n;
+}
+
 async function _withdrawTokensUnlocked(withdrawReq) {
   checkAndEnforceCircuitBreaker('Token Withdrawal');
   const callerKey = normalizeKey(withdrawReq.publicKey || withdrawReq.callerPublicKey);
@@ -4394,6 +4435,33 @@ async function _withdrawTokensUnlocked(withdrawReq) {
   // Enforce 24-Hour Global Withdrawal Volume Ceilings (Prevents hot vault drain / trips circuit breaker)
   checkWithdrawalCeiling(mosaicId, amountAtomic);
 
+  // Security guard: Hot Vault withdrawals are strictly limited to funds deposited in the exchange drive or verified vault deposits
+  // (Cannot withdraw personal Catapult wallet balance from the hot vault, since those funds are not in the vault)
+  const driveBal = getDriveBalances(callerKey) || { xpx: 0n, usdt: 0n, bnb: 0n };
+  const localBalances = loadBalances();
+  const currentEntry = localBalances[callerKey.toLowerCase()] || { xpx: 0n, usdt: 0n, bnb: 0n, lockedXpx: 0n, lockedUsdt: 0n, lockedBnb: 0n };
+  
+  const driveAvail = mosaicId === XPX_MOSAIC_ID
+    ? (BigInt(driveBal.xpx || 0n) > BigInt(currentEntry.lockedXpx || 0n) ? BigInt(driveBal.xpx || 0n) - BigInt(currentEntry.lockedXpx || 0n) : 0n)
+    : mosaicId === USDT_MOSAIC_ID
+      ? (BigInt(driveBal.usdt || 0n) > BigInt(currentEntry.lockedUsdt || 0n) ? BigInt(driveBal.usdt || 0n) - BigInt(currentEntry.lockedUsdt || 0n) : 0n)
+      : (BigInt(driveBal.bnb || 0n) > BigInt(currentEntry.lockedBnb || 0n) ? BigInt(driveBal.bnb || 0n) - BigInt(currentEntry.lockedBnb || 0n) : 0n);
+
+  const netDeposits = getVerifiedVaultDepositedBalance(callerKey, mosaicId);
+  const netDepositsAvail = mosaicId === XPX_MOSAIC_ID
+    ? (netDeposits > BigInt(currentEntry.lockedXpx || 0n) ? netDeposits - BigInt(currentEntry.lockedXpx || 0n) : 0n)
+    : mosaicId === USDT_MOSAIC_ID
+      ? (netDeposits > BigInt(currentEntry.lockedUsdt || 0n) ? netDeposits - BigInt(currentEntry.lockedUsdt || 0n) : 0n)
+      : (netDeposits > BigInt(currentEntry.lockedBnb || 0n) ? netDeposits - BigInt(currentEntry.lockedBnb || 0n) : 0n);
+
+  const maxVaultWithdrawable = driveAvail > netDepositsAvail ? driveAvail : netDepositsAvail;
+
+  if (amountAtomic > maxVaultWithdrawable) {
+    throw new Error(
+      `Insufficient deposited vault balance for withdrawal. Hot Vault withdrawals are strictly capped to deposited collateral (${formatAtomicUnits(maxVaultWithdrawable, 6)} available). Un-deposited coins remain safely in your personal Catapult wallet.`
+    );
+  }
+
   let userBal = await syncAndGetAccountBalance(callerKey);
   if (mosaicId === XPX_MOSAIC_ID && BigInt(userBal.xpx || 0n) < amountAtomic) {
     throw new Error(`Insufficient XPX balance for withdrawal. Requested: ${formatAtomicUnits(amountAtomic, 6)}, Available: ${formatAtomicUnits(userBal.xpx, 6)}`);
@@ -4443,7 +4511,6 @@ async function _withdrawTokensUnlocked(withdrawReq) {
   const contractCallId = Math.floor(Math.random() * 90000) + 10000;
 
   // Ensure drive has enough credited balance when withdrawing Testnet 2 deposits
-  const driveBal = getDriveBalances(callerKey);
   const availDrive = mosaicId === XPX_MOSAIC_ID
     ? BigInt(driveBal ? driveBal.xpx : 0n)
     : mosaicId === USDT_MOSAIC_ID

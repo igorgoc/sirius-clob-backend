@@ -1771,7 +1771,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // SiriusCLOB DEX Endpoint: Live On-Chain Testnet 2 Mosaics for any Account
+  // SiriusCLOB DEX Endpoint: Live On-Chain Mosaics for any Account (Supports Testnet 2 & Mainnet)
   if (pathname === '/api/clob/account/onchain-balance' && req.method === 'GET') {
     const address = (parsedUrl.searchParams.get('address') || '').replace(/[- ]/g, '').toUpperCase();
     if (!address || address.length < 40) {
@@ -1781,15 +1781,73 @@ const server = http.createServer((req, res) => {
     }
     (async () => {
       try {
-        const t2Client = require('./testnet2_client');
-        const balancesMap = await t2Client.getAccountOnChainBalances(address);
-        const xpxAtomic = balancesMap.get('13bfc518e40549d7') || 0n;
-        const usdtAtomic = balancesMap.get('4430aefef7e15d0c') || 0n;
-        const bnbAtomic = balancesMap.get('3cc1d3ce7447b6f9') || 0n;
+        const isMainnet = address.startsWith('X') || String(testnet2Config.NETWORK_ENV || '').toLowerCase() === 'mainnet';
+        let balancesMap = new Map();
+
+        if (address.startsWith('X')) {
+          // Direct Mainnet Catapult query
+          const mainnetUrls = [
+            'https://betelgeuse.xpxsirius.io',
+            'https://arcturus.xpxsirius.io',
+            'https://aldebaran.xpxsirius.io',
+          ];
+          for (const mUrl of mainnetUrls) {
+            let controller = null;
+            let timer = null;
+            if (typeof AbortController !== 'undefined') {
+              controller = new AbortController();
+              timer = setTimeout(() => controller.abort(), 4000);
+            }
+            try {
+              const res = await fetch(`${mUrl}/account/${address}`, {
+                headers: { 'Content-Type': 'application/json' },
+                signal: controller ? controller.signal : undefined,
+              });
+              if (res.ok) {
+                const aData = await res.json();
+                for (const m of (aData.account?.mosaics || [])) {
+                  let mHex = '';
+                  if (Array.isArray(m.id)) {
+                    const low = (m.id[0] >>> 0).toString(16).padStart(8, '0');
+                    const high = (m.id[1] >>> 0).toString(16).padStart(8, '0');
+                    mHex = (high + low).toLowerCase();
+                  } else if (typeof m.id === 'string') {
+                    mHex = m.id.toLowerCase().replace(/^0x/, '');
+                  }
+                  let amt = 0n;
+                  if (Array.isArray(m.amount)) {
+                    amt = BigInt(m.amount[1] >>> 0) * 4294967296n + BigInt(m.amount[0] >>> 0);
+                  } else if (m.amount) {
+                    amt = BigInt(m.amount);
+                  }
+                  if (mHex) balancesMap.set(mHex, amt);
+                }
+                break;
+              }
+            } catch (_) {
+            } finally {
+              if (timer) clearTimeout(timer);
+            }
+          }
+        } else {
+          const t2Client = require('./testnet2_client');
+          balancesMap = await t2Client.getAccountOnChainBalances(address);
+        }
+
+        const xpxHex = (isMainnet ? '402b2f579faebc59' : (testnet2Config.XPX_MOSAIC_ID || '13bfc518e40549d7')).toLowerCase();
+        const usdtHex = (isMainnet ? '7525381a171d1e44' : (testnet2Config.USDT_MOSAIC_ID || '4430aefef7e15d0c')).toLowerCase();
+        const bnbHex = (isMainnet ? '1e5c5fadec7b34dd' : (testnet2Config.BNB_MOSAIC_ID || '3cc1d3ce7447b6f9')).toLowerCase();
+
+        const xpxAtomic = balancesMap.get(xpxHex) || 
+                          (isMainnet ? (balancesMap.get('bffb42a19116bdf6') || 0n) : 0n);
+        const usdtAtomic = balancesMap.get(usdtHex) || 0n;
+        const bnbAtomic = balancesMap.get(bnbHex) || 0n;
+
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           ok: true,
           address,
+          network: isMainnet ? 'mainnet' : 'testnet2',
           balances: {
             xpx: Number(xpxAtomic) / 1e6,
             usdt: Number(usdtAtomic) / 1e6,
