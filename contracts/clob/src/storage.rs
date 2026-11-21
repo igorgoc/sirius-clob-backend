@@ -37,14 +37,19 @@ pub fn canonicalize_mosaic_id(id: u64) -> Option<u64> {
     }
 }
 
-/// Converts internal canonical mosaic IDs to live on-chain Testnet 2 mosaic IDs for payout transactions
+pub fn is_mainnet_active() -> bool {
+    path_exists("config/mainnet.flag")
+}
+
+/// Converts internal canonical mosaic IDs to live on-chain mosaic IDs for payout transactions (supports Mainnet via config/mainnet.flag)
 pub fn canonical_to_network_mosaic(id: u64) -> u64 {
+    let mainnet = is_mainnet_active();
     if id == XPX_MOSAIC_ID || id == TESTNET2_XPX_MOSAIC_ID || id == MAINNET_XPX_MOSAIC_ID || id == XPX_NAMESPACE_ID {
-        TESTNET2_XPX_MOSAIC_ID
+        if mainnet { MAINNET_XPX_MOSAIC_ID } else { TESTNET2_XPX_MOSAIC_ID }
     } else if id == USDT_MOSAIC_ID || id == TESTNET2_USDT_MOSAIC_ID || id == MAINNET_USDT_MOSAIC_ID {
-        TESTNET2_USDT_MOSAIC_ID
+        if mainnet { MAINNET_USDT_MOSAIC_ID } else { TESTNET2_USDT_MOSAIC_ID }
     } else if id == BNB_MOSAIC_ID || id == TESTNET2_BNB_MOSAIC_ID || id == MAINNET_BNB_MOSAIC_ID {
-        TESTNET2_BNB_MOSAIC_ID
+        if mainnet { MAINNET_BNB_MOSAIC_ID } else { TESTNET2_BNB_MOSAIC_ID }
     } else {
         id
     }
