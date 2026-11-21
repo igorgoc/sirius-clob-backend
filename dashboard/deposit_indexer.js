@@ -102,15 +102,18 @@ async function fetchCurrentHeight() {
 }
 
 /**
- * Fetch incoming transactions for vault account with automatic node failover
+ * Fetch incoming transactions for vault account with automatic node failover and pagination
  */
-async function fetchVaultIncomingTransactions(addr, limit = 50) {
+async function fetchVaultIncomingTransactions(addr, limit = 50, pageNumber = 1) {
   return t2Client.withNodeFailover(async (clients) => {
     return new Promise((resolve, reject) => {
       let qp;
       if (typeof TransactionQueryParams === 'function') {
         qp = new TransactionQueryParams();
         qp.pageSize = limit;
+        if (pageNumber > 1) {
+          qp.pageNumber = pageNumber;
+        }
       }
       clients.accountHttp.incomingTransactions(addr, qp).subscribe(
         (txs) => resolve(txs || []),
@@ -164,66 +167,79 @@ async function scanDeposits(onDepositCallback) {
     }
 
     for (const targetAddr of targets) {
-      const incomingTxs = await fetchVaultIncomingTransactions(targetAddr, 50);
+      let page = 1;
+      while (true) {
+        const incomingTxs = await fetchVaultIncomingTransactions(targetAddr, 50, page);
+        if (!incomingTxs || incomingTxs.length === 0) break;
 
-      for (const tx of incomingTxs) {
-        if (!tx.transactionInfo || !tx.transactionInfo.hash) continue;
-        const txHash = tx.transactionInfo.hash.toLowerCase();
+        let hasNewOnPage = false;
+        for (const tx of incomingTxs) {
+          if (!tx.transactionInfo || !tx.transactionInfo.hash) continue;
+          const txHash = tx.transactionInfo.hash.toLowerCase();
 
-        // Idempotency check
-        if (processedHashes.has(txHash)) continue;
+          // Idempotency check
+          if (processedHashes.has(txHash)) continue;
+          hasNewOnPage = true;
 
-        // Type 16724 = TransferTransaction
-        if (tx.type !== 16724) continue;
+          // Type 16724 = TransferTransaction
+          if (tx.type !== 16724) continue;
 
-        // Confirmation depth check (must be confirmed on-chain with height > 0)
-        const txHeight = tx.transactionInfo.height ? tx.transactionInfo.height.compact() : 0;
-        if (txHeight <= 0 || currentHeight - txHeight < CONFIRMATION_DEPTH) {
-          continue; // Wait for confirmation depth
-        }
+          // Confirmation depth check (must be confirmed on-chain with height > 0)
+          const txHeight = tx.transactionInfo.height ? tx.transactionInfo.height.compact() : 0;
+          if (txHeight <= 0 || currentHeight - txHeight < CONFIRMATION_DEPTH) {
+            continue; // Wait for confirmation depth
+          }
 
-        // Verify recipient matches target and sender is not the target itself
-        if (!tx.recipient || tx.recipient.plain() !== targetAddr.plain()) {
-          continue;
-        }
-        if (!tx.signer || !tx.signer.address || tx.signer.address.plain() === targetAddr.plain()) {
-          continue;
-        }
+          // Verify recipient matches target and sender is not the target itself
+          if (!tx.recipient || tx.recipient.plain() !== targetAddr.plain()) {
+            continue;
+          }
+          if (!tx.signer || !tx.signer.address || tx.signer.address.plain() === targetAddr.plain()) {
+            continue;
+          }
 
-        const senderAddress = tx.signer.address.plain();
-        const senderPublicKey = tx.signer.publicKey;
+          const senderAddress = tx.signer.address.plain();
+          const senderPublicKey = tx.signer.publicKey;
 
-        // Process each deposited mosaic
-        for (const m of tx.mosaics || []) {
-          const mosaicIdHex = m.id.toHex().toLowerCase();
-          const mosaicKey = `${txHash}:${mosaicIdHex}`;
-          if (processedHashes.has(mosaicKey)) continue;
+          // Process each deposited mosaic
+          for (const m of tx.mosaics || []) {
+            const mosaicIdHex = m.id.toHex().toLowerCase();
+            const mosaicKey = `${txHash}:${mosaicIdHex}`;
+            if (processedHashes.has(mosaicKey)) continue;
 
-          const amountAtomic = BigInt(m.amount.compact());
+            const amountAtomic = BigInt(m.amount.compact());
 
-          if (amountAtomic <= 0n) continue;
+            if (amountAtomic <= 0n) continue;
 
-          const depositRecord = {
-            txHash,
-            height: txHeight,
-            senderAddress,
-            senderPublicKey,
-            recipientAddress: targetAddr.plain(),
-            mosaicIdHex,
-            amountAtomic: amountAtomic.toString(),
-            timestamp: Date.now(),
-          };
+            const depositRecord = {
+              txHash,
+              height: txHeight,
+              senderAddress,
+              senderPublicKey,
+              recipientAddress: targetAddr.plain(),
+              mosaicIdHex,
+              amountAtomic: amountAtomic.toString(),
+              timestamp: Date.now(),
+            };
 
-          try {
-            if (typeof onDepositCallback === 'function') {
-              await onDepositCallback(depositRecord);
+            try {
+              if (typeof onDepositCallback === 'function') {
+                await onDepositCallback(depositRecord);
+              }
+              recordProcessedDeposit(depositRecord);
+              console.log(`[Deposit Indexer] Credited deposit ${mosaicIdHex} (${amountAtomic}) from ${senderAddress} to ${targetAddr.plain()} (Tx: ${txHash.slice(0, 16)}...)`);
+            } catch (cbErr) {
+              console.error(`[Deposit Indexer] Callback error for deposit tx ${txHash}:`, cbErr.message);
             }
-            recordProcessedDeposit(depositRecord);
-            console.log(`[Deposit Indexer] Credited deposit ${mosaicIdHex} (${amountAtomic}) from ${senderAddress} to ${targetAddr.plain()} (Tx: ${txHash.slice(0, 16)}...)`);
-          } catch (cbErr) {
-            console.error(`[Deposit Indexer] Callback error for deposit tx ${txHash}:`, cbErr.message);
           }
         }
+
+        // Fast exit: if all transactions on page are already indexed and we're not cold-starting, break
+        if (!hasNewOnPage && processedHashes.size > 0) {
+          break;
+        }
+        if (incomingTxs.length < 50) break;
+        page++;
       }
     }
   } catch (err) {

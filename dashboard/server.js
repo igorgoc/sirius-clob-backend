@@ -3079,6 +3079,29 @@ server.listen(PORT, HOST, () => {
   // Ensure historical fees are reconciled in SQLite collected_fees table
   reconcileHistoricalFees();
 
+  // Auto-start embedded 3-Node BFT WASM VM Executors if not already running on ports 5051..5053
+  try {
+    const { startVmServer } = require('../executor/grpc_vm_server');
+    const vmNodes = [
+      { name: 'node1', port: 5051 },
+      { name: 'node2', port: 5052 },
+      { name: 'node3', port: 5053 },
+    ];
+    for (const n of vmNodes) {
+      startVmServer(n.port, n.name)
+        .then(() => console.log(`[BFT Engine] Embedded ${n.name} listening on :${n.port}`))
+        .catch((err) => {
+          if (err.message && (err.message.includes('EADDRINUSE') || err.message.includes('address already in use'))) {
+            console.log(`[BFT Engine] ${n.name} already active on :${n.port}`);
+          } else {
+            console.warn(`[BFT Engine] Could not start embedded ${n.name}:`, err.message);
+          }
+        });
+    }
+  } catch (vmInitErr) {
+    console.warn('[BFT Engine] Embedded VM startup skipped:', vmInitErr.message);
+  }
+
   // Start autonomous BSC Testnet block watcher & relayer
   swapApi.startAutoRelayer();
 

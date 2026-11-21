@@ -73,6 +73,8 @@ let globalNextOrderId = 1000;
 
 // Per-account async mutex to eliminate TOCTOU races across concurrent order/withdrawal requests
 const accountLocks = new Map();
+// In-memory 10s TTL cache for on-chain wallet balance lookups to maximize high-concurrency throughput
+const accountOnChainCache = new Map();
 async function withAccountLock(accountKeyHex, fn) {
   const key = String(accountKeyHex || 'global').toLowerCase();
   const prev = accountLocks.get(key) || Promise.resolve();
@@ -1410,7 +1412,8 @@ function isCircuitBreakerTripped() {
 }
 
 function getCircuitBreakerStatus() {
-  return loadCircuitBreakerState();
+  loadCircuitBreakerState();
+  return { ...exchangeCircuitBreaker };
 }
 
 // Configured Protocol Withdrawal Fees (covers L1 network gas + generates exchange revenue)
@@ -1896,21 +1899,34 @@ async function syncAndGetAccountBalance(publicKeyOrAddr) {
     syncGatewayCacheFromDrive(key);
   } catch (_) {}
 
-  // 2. Fetch live on-chain balances of the user's wallet
+  // 2. Fetch live on-chain balances of the user's wallet (with 10s TTL cache for concurrency)
   let onChainXpx = 0n;
   let onChainUsdt = 0n;
   let onChainBnb = 0n;
-  try {
-    const t2Client = require('./testnet2_client');
-    const userAddr = sdk.Address.createFromPublicKey(key, testnet2Config.NETWORK_TYPE).plain();
-    const mosaics = await t2Client.getAccountOnChainBalances(userAddr);
-    const xpxHex = (testnet2Config.XPX_MOSAIC_ID || '13BFC518E40549D7').toLowerCase();
-    const usdtHex = (testnet2Config.USDT_MOSAIC_ID || '4430AEFEF7E15D0C').toLowerCase();
-    const bnbHex = (testnet2Config.BNB_MOSAIC_ID || '3CC1D3CE7447B6F9').toLowerCase();
-    onChainXpx = mosaics.get(xpxHex) || 0n;
-    onChainUsdt = mosaics.get(usdtHex) || 0n;
-    onChainBnb = mosaics.get(bnbHex) || 0n;
-  } catch (_) {}
+  const cached = accountOnChainCache.get(key);
+  if (cached && (Date.now() - cached.timestamp < 10000)) {
+    onChainXpx = cached.xpx;
+    onChainUsdt = cached.usdt;
+    onChainBnb = cached.bnb;
+  } else {
+    try {
+      const t2Client = require('./testnet2_client');
+      const userAddr = sdk.Address.createFromPublicKey(key, testnet2Config.NETWORK_TYPE).plain();
+      const mosaics = await t2Client.getAccountOnChainBalances(userAddr);
+      const xpxHex = (testnet2Config.XPX_MOSAIC_ID || '13BFC518E40549D7').toLowerCase();
+      const usdtHex = (testnet2Config.USDT_MOSAIC_ID || '4430AEFEF7E15D0C').toLowerCase();
+      const bnbHex = (testnet2Config.BNB_MOSAIC_ID || '3CC1D3CE7447B6F9').toLowerCase();
+      onChainXpx = mosaics.get(xpxHex) || 0n;
+      onChainUsdt = mosaics.get(usdtHex) || 0n;
+      onChainBnb = mosaics.get(bnbHex) || 0n;
+      accountOnChainCache.set(key, {
+        xpx: onChainXpx,
+        usdt: onChainUsdt,
+        bnb: onChainBnb,
+        timestamp: Date.now(),
+      });
+    } catch (_) {}
+  }
 
   // 3. Current drive balances and locked balances in open orders
   const balances = loadBalances();
