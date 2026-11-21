@@ -2,7 +2,11 @@ node_modules
 *.log
 .DS_Store
 *.key
-*.db*
+*.db-wal
+*.db-shm
+*.pid
+cluster/*.pid
+cluster/*.db-wal
+cluster/*.db-shm
 cluster/*.key
 contracts/clob/target
-
