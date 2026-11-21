@@ -1413,6 +1413,24 @@ function getCircuitBreakerStatus() {
   return loadCircuitBreakerState();
 }
 
+// Configured Protocol Withdrawal Fees (covers L1 network gas + generates exchange revenue)
+const WITHDRAWAL_FEES = {
+  XPX: 1_000_000n, // 1.0 XPX (covers ~0.2 XPX L1 gas -> +0.8 XPX exchange profit)
+  USDT: 1_000_000n, // 1.0 USDT
+  BNB: 1_000n, // 0.001 BNB
+};
+
+function getWithdrawalFee(mosaicOrSymbol) {
+  const sym = String(mosaicOrSymbol || 'XPX').toUpperCase();
+  if (sym.includes('USDT') || (testnet2Config.USDT_MOSAIC_ID && sym.includes(testnet2Config.USDT_MOSAIC_ID.toUpperCase()))) {
+    return WITHDRAWAL_FEES.USDT;
+  }
+  if (sym.includes('BNB') || (testnet2Config.BNB_MOSAIC_ID && sym.includes(testnet2Config.BNB_MOSAIC_ID.toUpperCase()))) {
+    return WITHDRAWAL_FEES.BNB;
+  }
+  return WITHDRAWAL_FEES.XPX;
+}
+
 // Global 24-Hour Withdrawal Volume Ceilings to Prevent Vault Drain (Circuit Breaker Protection)
 const WITHDRAWAL_LIMITS_24H = {
   XPX: 100_000n * 1_000_000n, // 100,000 XPX
@@ -2002,7 +2020,8 @@ function updateAccountBalance(publicKey, updater, authContext = null) {
       authContext.source === 'BRIDGE_DELIVERY' ||
       authContext.source === 'ESCROW_REFUND' ||
       authContext.source === 'FAUCET' ||
-      authContext.source === 'ON_CHAIN_SYNC'
+      authContext.source === 'ON_CHAIN_SYNC' ||
+      authContext.source === 'WITHDRAWAL_FEE'
     );
     if (!isAuthorized) {
       throw new Error(
@@ -3425,7 +3444,7 @@ async function _placeOrderUnlocked(orderReq) {
               }
             } catch (_) {}
 
-            // Credit Fee Collector account in local database/cache
+            // Credit Fee Collector account in local database/cache and record protocol revenue
             if (legFee > 0n) {
               const feeCollectorPub = (testnet2Config.FEE_COLLECTOR_PUBKEY || '04ef8d54aaefbc4746257723fd1efb7b37f30452de8bd022f5fb3cabc5246a64').toLowerCase();
               try {
@@ -3438,6 +3457,17 @@ async function _placeOrderUnlocked(orderReq) {
                     b.bnb = BigInt(b.bnb || 0n) + legFee;
                   }
                 }, { source: 'MATCH_SETTLEMENT' });
+
+                const feeMos = (mosaicId.toString(10) === XPX_MOSAIC_ID) ? 'XPX' : ((mosaicId.toString(10) === USDT_MOSAIC_ID) ? 'USDT' : 'BNB');
+                clobDb.recordCollectedFee({
+                  feeType: messageStr.includes(':MAKER_FEE=') ? 'TRADE_MAKER' : 'TRADE_TAKER',
+                  mosaic: feeMos,
+                  mosaicId: mosaicId.toString(10),
+                  amount: formatAtomicUnits(legFee, 6),
+                  amountAtomic: legFee.toString(),
+                  referenceId: `MATCH:${contractCallId}`,
+                  callerKey: recipientPub,
+                });
               } catch (_) {}
             }
           }
@@ -4275,15 +4305,28 @@ async function _withdrawTokensUnlocked(withdrawReq) {
     throw new Error(`Insufficient BNB balance for withdrawal. Requested: ${formatAtomicUnits(amountAtomic, 6)}, Available: ${formatAtomicUnits(userBal.bnb, 6)}`);
   }
 
+  const assetSymbol = withdrawReq.mosaic || (mosaicId === XPX_MOSAIC_ID ? 'XPX' : (mosaicId === USDT_MOSAIC_ID ? 'USDT' : 'BNB'));
+  const withdrawalFee = getWithdrawalFee(assetSymbol);
+  if (amountAtomic <= withdrawalFee) {
+    throw new Error(
+      `Withdrawal amount (${formatAtomicUnits(amountAtomic, 6)} ${assetSymbol}) must be strictly greater than the network withdrawal fee (${formatAtomicUnits(withdrawalFee, 6)} ${assetSymbol}).`
+    );
+  }
+  const netPayoutAtomic = amountAtomic - withdrawalFee;
+
   // Step 1: requested
   const record = {
     id: withdrawalKey,
     callerKey,
     recipient: sigInfo.recipient || null,
-    mosaic: withdrawReq.mosaic || (mosaicId === XPX_MOSAIC_ID ? 'XPX' : (mosaicId === USDT_MOSAIC_ID ? 'USDT' : 'BNB')),
+    mosaic: assetSymbol,
     mosaicId,
     amount: formatAtomicUnits(amountAtomic, 6),
     amountAtomic: amountAtomic.toString(),
+    fee: formatAtomicUnits(withdrawalFee, 6),
+    feeAtomic: withdrawalFee.toString(),
+    netPayout: formatAtomicUnits(netPayoutAtomic, 6),
+    netPayoutAtomic: netPayoutAtomic.toString(),
     nonce: String(nonce),
     expiry: Number(expiry),
     status: 'requested',
@@ -4362,7 +4405,7 @@ async function _withdrawTokensUnlocked(withdrawReq) {
 
   if (emittedTx && Array.isArray(emittedTx.transactions) && emittedTx.transactions.length > 0) {
     try {
-      if (fs.existsSync(path.join(CLUSTER_DIR, 'vault_account.json'))) {
+      if (fs.existsSync(path.join(CLUSTER_DIR, 'vault_account.json')) || process.env.SIRIUS_VAULT_PRIVATE_KEY) {
         const testnet2Client = require('./testnet2_client');
         const testnet2Config = require('./testnet2_config');
         const vault = testnet2Client.getOrInitVaultAccount();
@@ -4377,7 +4420,7 @@ async function _withdrawTokensUnlocked(withdrawReq) {
             vault,
             recipientAddr,
             t2MosaicHex,
-            amountAtomic,
+            netPayoutAtomic,
             `CLOB_WITHDRAW:${contractCallId}`
           );
           onChainTxHash = txRes.txHash;
@@ -4392,6 +4435,32 @@ async function _withdrawTokensUnlocked(withdrawReq) {
     record.status = 'debited';
     saveWithdrawals();
     throw new Error('On-chain withdrawal broadcast failed. Your withdrawal is safely recorded as debited and can be retried.');
+  }
+
+  // Credit withdrawal fee to Fee Collector account and record protocol revenue in SQLite
+  const feeCollectorPub = (testnet2Config.FEE_COLLECTOR_PUBKEY || '04ef8d54aaefbc4746257723fd1efb7b37f30452de8bd022f5fb3cabc5246a64').toLowerCase();
+  try {
+    updateAccountBalance(feeCollectorPub, (b) => {
+      if (mosaicId === XPX_MOSAIC_ID) {
+        b.xpx = (b.xpx || 0n) + withdrawalFee;
+      } else if (mosaicId === USDT_MOSAIC_ID) {
+        b.usdt = (b.usdt || 0n) + withdrawalFee;
+      } else if (mosaicId === BNB_MOSAIC_ID) {
+        b.bnb = (b.bnb || 0n) + withdrawalFee;
+      }
+    }, { source: 'WITHDRAWAL_FEE', txHash: onChainTxHash });
+
+    clobDb.recordCollectedFee({
+      feeType: 'WITHDRAWAL',
+      mosaic: assetSymbol,
+      mosaicId: mosaicId.toString(10),
+      amount: formatAtomicUnits(withdrawalFee, 6),
+      amountAtomic: withdrawalFee.toString(),
+      referenceId: withdrawalKey,
+      callerKey,
+    });
+  } catch (feeErr) {
+    console.warn('[Withdrawal] Failed to record collected withdrawal fee:', feeErr.message);
   }
 
   record.status = 'broadcast';
@@ -4411,6 +4480,10 @@ async function _withdrawTokensUnlocked(withdrawReq) {
     mosaicId,
     amount: formatAtomicUnits(amountAtomic, 6),
     amountAtomic: amountAtomic.toString(),
+    fee: formatAtomicUnits(withdrawalFee, 6),
+    feeAtomic: withdrawalFee.toString(),
+    netPayout: formatAtomicUnits(netPayoutAtomic, 6),
+    netPayoutAtomic: netPayoutAtomic.toString(),
     txHash: record.txHash,
     onChainTxHash: record.txHash,
     blockHeight: record.blockHeight,
@@ -4715,4 +4788,6 @@ module.exports = {
   startOrderTtlSweeper,
   runSolvencySentinelAudit,
   startSolvencySentinel,
+  WITHDRAWAL_FEES,
+  getWithdrawalFee,
 };

@@ -98,6 +98,20 @@ function getDb(customPath = null) {
       timestamp TEXT NOT NULL,
       created_at INTEGER NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS collected_fees (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      fee_type TEXT NOT NULL,
+      mosaic TEXT NOT NULL,
+      mosaic_id TEXT NOT NULL,
+      amount TEXT NOT NULL,
+      amount_atomic TEXT NOT NULL CHECK(CAST(amount_atomic AS INTEGER) > 0 AND amount_atomic NOT LIKE '-%' AND amount_atomic != '0'),
+      reference_id TEXT,
+      caller_key TEXT,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_collected_fees_mosaic ON collected_fees(mosaic);
+    CREATE INDEX IF NOT EXISTS idx_collected_fees_created ON collected_fees(created_at);
   `);
 
   // Automated schema migration to ensure CHECK constraints on pre-existing databases
@@ -618,6 +632,118 @@ function getBridgeRolling24hVolume(tokenSymbol, customDb = null) {
   return total;
 }
 
+function recordCollectedFee(feeRecord, customDb = null) {
+  const db = customDb || getDb();
+  const amtAtomic = BigInt(feeRecord.amountAtomic || 0);
+  if (amtAtomic <= 0n) return null;
+  const stmt = db.prepare(`
+    INSERT INTO collected_fees (
+      fee_type, mosaic, mosaic_id, amount, amount_atomic, reference_id, caller_key, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const res = stmt.run(
+    feeRecord.feeType || 'TRADE',
+    (feeRecord.mosaic || 'XPX').toUpperCase(),
+    String(feeRecord.mosaicId || ''),
+    String(feeRecord.amount || '0'),
+    amtAtomic.toString(),
+    feeRecord.referenceId || null,
+    feeRecord.callerKey || null,
+    feeRecord.createdAt || Date.now()
+  );
+  return res.lastInsertRowid;
+}
+
+function getCollectedFeesSummary(customDb = null) {
+  const db = customDb || getDb();
+  let allRows = [];
+  try {
+    allRows = db.prepare('SELECT * FROM collected_fees ORDER BY id DESC').all();
+  } catch (_) {
+    return {
+      total: { xpx: '0.0000', usdt: '0.0000', bnb: '0.0000', xpxAtomic: '0', usdtAtomic: '0', bnbAtomic: '0', count: 0 },
+      byType: {
+        trade: { xpx: '0.0000', usdt: '0.0000', bnb: '0.0000', count: 0 },
+        withdrawal: { xpx: '0.0000', usdt: '0.0000', bnb: '0.0000', count: 0 },
+        bridge: { xpx: '0.0000', usdt: '0.0000', bnb: '0.0000', count: 0 },
+      },
+      recent: [],
+    };
+  }
+
+  let totalXpxAtomic = 0n;
+  let totalUsdtAtomic = 0n;
+  let totalBnbAtomic = 0n;
+
+  const byType = {
+    TRADE: { xpx: 0n, usdt: 0n, bnb: 0n, count: 0 },
+    WITHDRAWAL: { xpx: 0n, usdt: 0n, bnb: 0n, count: 0 },
+    BRIDGE: { xpx: 0n, usdt: 0n, bnb: 0n, count: 0 },
+  };
+
+  for (const r of allRows) {
+    const amt = BigInt(r.amount_atomic || '0');
+    const mos = (r.mosaic || 'XPX').toUpperCase();
+    const type = r.fee_type.startsWith('TRADE') ? 'TRADE' : (r.fee_type === 'WITHDRAWAL' ? 'WITHDRAWAL' : 'BRIDGE');
+
+    if (byType[type]) {
+      byType[type].count++;
+      if (mos === 'XPX') byType[type].xpx += amt;
+      else if (mos === 'USDT') byType[type].usdt += amt;
+      else if (mos === 'BNB') byType[type].bnb += amt;
+    }
+
+    if (mos === 'XPX') totalXpxAtomic += amt;
+    else if (mos === 'USDT') totalUsdtAtomic += amt;
+    else if (mos === 'BNB') totalBnbAtomic += amt;
+  }
+
+  const recent = allRows.slice(0, 30).map((r) => ({
+    id: r.id,
+    type: r.fee_type,
+    mosaic: r.mosaic,
+    amount: r.amount,
+    amountAtomic: r.amount_atomic,
+    referenceId: r.reference_id,
+    callerKey: r.caller_key ? (r.caller_key.slice(0, 8) + '...' + r.caller_key.slice(-6)) : null,
+    timestamp: r.created_at,
+    time: new Date(r.created_at).toLocaleTimeString(),
+  }));
+
+  return {
+    total: {
+      xpx: (Number(totalXpxAtomic) / 1e6).toFixed(4),
+      usdt: (Number(totalUsdtAtomic) / 1e6).toFixed(4),
+      bnb: (Number(totalBnbAtomic) / 1e6).toFixed(6),
+      xpxAtomic: totalXpxAtomic.toString(),
+      usdtAtomic: totalUsdtAtomic.toString(),
+      bnbAtomic: totalBnbAtomic.toString(),
+      count: allRows.length,
+    },
+    byType: {
+      trade: {
+        xpx: (Number(byType.TRADE.xpx) / 1e6).toFixed(4),
+        usdt: (Number(byType.TRADE.usdt) / 1e6).toFixed(4),
+        bnb: (Number(byType.TRADE.bnb) / 1e6).toFixed(6),
+        count: byType.TRADE.count,
+      },
+      withdrawal: {
+        xpx: (Number(byType.WITHDRAWAL.xpx) / 1e6).toFixed(4),
+        usdt: (Number(byType.WITHDRAWAL.usdt) / 1e6).toFixed(4),
+        bnb: (Number(byType.WITHDRAWAL.bnb) / 1e6).toFixed(6),
+        count: byType.WITHDRAWAL.count,
+      },
+      bridge: {
+        xpx: (Number(byType.BRIDGE.xpx) / 1e6).toFixed(4),
+        usdt: (Number(byType.BRIDGE.usdt) / 1e6).toFixed(4),
+        bnb: (Number(byType.BRIDGE.bnb) / 1e6).toFixed(6),
+        count: byType.BRIDGE.count,
+      },
+    },
+    recent,
+  };
+}
+
 module.exports = {
   DB_FILE,
   getDb,
@@ -637,4 +763,6 @@ module.exports = {
   saveBridgeSwapRecord,
   getBridgeSwapRecord,
   getBridgeRolling24hVolume,
+  recordCollectedFee,
+  getCollectedFeesSummary,
 };

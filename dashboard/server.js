@@ -240,6 +240,21 @@ async function getAdminOverviewData() {
   clobApi.loadCircuitBreakerState();
   const rolling = clobApi.getRolling24hWithdrawalVolume();
 
+  let feesSummary = {
+    total: { xpx: '0.0000', usdt: '0.0000', bnb: '0.0000', xpxAtomic: '0', usdtAtomic: '0', bnbAtomic: '0', count: 0 },
+    byType: {
+      trade: { xpx: '0.0000', usdt: '0.0000', bnb: '0.0000', count: 0 },
+      withdrawal: { xpx: '0.0000', usdt: '0.0000', bnb: '0.0000', count: 0 },
+      bridge: { xpx: '0.0000', usdt: '0.0000', bnb: '0.0000', count: 0 },
+    },
+    recent: [],
+  };
+  try {
+    feesSummary = clobDb.getCollectedFeesSummary();
+  } catch (err) {
+    console.warn('[Admin Overview] Failed to fetch fees summary:', err.message);
+  }
+
   let xpxLiabilities = 0n, usdtLiabilities = 0n, bnbLiabilities = 0n;
   try {
     xpxLiabilities = clobApi.getTestnet2LiabilitiesAtomic ? clobApi.getTestnet2LiabilitiesAtomic('13bfc518e40549d7') : 0n;
@@ -338,8 +353,12 @@ async function getAdminOverviewData() {
       },
       feeCollector: {
         address: feeAcc.address.plain(),
-        xpx: (Number(fBal.get('13bfc518e40549d7') || 0n) / 1e6).toFixed(4),
-        usdt: (Number(fBal.get('4430aefef7e15d0c') || 0n) / 1e6).toFixed(4),
+        xpx: feesSummary.total.xpx,
+        usdt: feesSummary.total.usdt,
+        bnb: feesSummary.total.bnb,
+        onChainXpx: (Number(fBal.get('13bfc518e40549d7') || 0n) / 1e6).toFixed(4),
+        onChainUsdt: (Number(fBal.get('4430aefef7e15d0c') || 0n) / 1e6).toFixed(4),
+        totalEvents: feesSummary.total.count,
       },
       treasury: {
         address: treasuryAcc.address.plain(),
@@ -373,6 +392,23 @@ async function getAdminOverviewData() {
       },
     },
     recentTrades,
+    fees: feesSummary,
+    feeSchedule: {
+      trading: {
+        makerBps: 0,
+        takerBps: 10,
+        makerPercent: '0.00%',
+        takerPercent: '0.10%',
+      },
+      withdrawal: {
+        xpx: '1.0 XPX',
+        usdt: '1.0 USDT',
+        bnb: '0.001 BNB',
+        xpxAtomic: '1000000',
+        usdtAtomic: '1000000',
+        bnbAtomic: '1000',
+      },
+    },
   };
 
   cachedOverviewData = overview;
@@ -1525,6 +1561,7 @@ const server = http.createServer((req, res) => {
       } catch (_) {}
 
       const ledger = clobApi.getAccountBalance(feePub);
+      const feesSummary = clobDb.getCollectedFeesSummary();
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ok: true,
@@ -1533,11 +1570,44 @@ const server = http.createServer((req, res) => {
         publicKey: feePub,
         onChain,
         ledger,
+        feesSummary,
       }));
     })().catch((err) => {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: err.message }));
     });
+    return;
+  }
+
+  // SiriusCLOB DEX Endpoint: Protocol Revenue & Collected Fees API
+  if (pathname === '/api/clob/fees' && req.method === 'GET') {
+    const feeAddr = l1Config.FEE_COLLECTOR_ADDRESS || 'VB3QOFNGGL7DENKPBW2RO3OVIXLOVLQ5F5WLG4XE';
+    const feePub = (l1Config.FEE_COLLECTOR_PUBKEY || '04EF8D54AAEFBC4746257723FD1EFB7B37F30452DE8BD022F5FB3CABC5246A64').toLowerCase();
+    const summary = clobDb.getCollectedFeesSummary();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      ok: true,
+      role: 'Exchange Protocol Fee Collector',
+      address: feeAddr,
+      publicKey: feePub,
+      feeSchedule: {
+        trading: {
+          makerBps: 0,
+          takerBps: 10,
+          makerPercent: '0.00%',
+          takerPercent: '0.10%',
+        },
+        withdrawal: {
+          XPX: '1.0 XPX',
+          USDT: '1.0 USDT',
+          BNB: '0.001 BNB',
+          XPX_atomic: '1000000',
+          USDT_atomic: '1000000',
+          BNB_atomic: '1000',
+        },
+      },
+      summary,
+    }));
     return;
   }
 
@@ -1929,6 +1999,16 @@ function getDashboardHtml() {
       color: var(--accent);
       border: 1px solid rgba(56, 189, 248, 0.3);
     }
+    .pill-purple {
+      background: rgba(168, 85, 247, 0.15);
+      color: #c084fc;
+      border: 1px solid rgba(168, 85, 247, 0.3);
+    }
+    .pill-amber {
+      background: rgba(245, 158, 11, 0.15);
+      color: #fbbf24;
+      border: 1px solid rgba(245, 158, 11, 0.3);
+    }
     @keyframes pulse {
       0%, 100% { opacity: 1; }
       50% { opacity: 0.6; }
@@ -2288,7 +2368,9 @@ function getDashboardHtml() {
               <td style="text-align: right;">
                 <span id="feeCollectorUsdt" style="color: #34d399; font-weight: 700; font-size: 13px;">--- USDT</span>
               </td>
-              <td style="text-align: right; color: var(--text-muted);">—</td>
+              <td style="text-align: right;">
+                <span id="feeCollectorBnb" style="color: #f59e0b; font-weight: 700; font-size: 13px;">--- BNB</span>
+              </td>
               <td style="text-align: center;">
                 <span class="pill pill-blue" style="font-size: 10px;">Revenue Sink</span>
               </td>
@@ -2327,6 +2409,42 @@ function getDashboardHtml() {
             </tr>
           </tbody>
         </table>
+      </div>
+    </div>
+
+    <!-- Protocol Revenue & Fee Economics Grid (4 Cards) -->
+    <div class="grid-4" style="margin-bottom: 24px;">
+      <div class="card" style="border-left: 3px solid #38bdf8;">
+        <div class="card-title" style="display: flex; justify-content: space-between; align-items: center;">
+          <span>XPX Protocol Revenue</span>
+          <span class="pill pill-blue" style="font-size: 9px;">10 bps Taker</span>
+        </div>
+        <div class="hero-number" style="color: #38bdf8;" id="feeTotalXpx">0.0000 XPX</div>
+        <div class="hero-subtitle" id="feeSubXpx">Trade: 0.0000 | Withdraw: 0.0000</div>
+      </div>
+      <div class="card" style="border-left: 3px solid #34d399;">
+        <div class="card-title" style="display: flex; justify-content: space-between; align-items: center;">
+          <span>USDT Protocol Revenue</span>
+          <span class="pill pill-green" style="font-size: 9px;">1.0 USDT Fixed</span>
+        </div>
+        <div class="hero-number" style="color: #34d399;" id="feeTotalUsdt">0.0000 USDT</div>
+        <div class="hero-subtitle" id="feeSubUsdt">Trade: 0.0000 | Withdraw: 0.0000</div>
+      </div>
+      <div class="card" style="border-left: 3px solid #f59e0b;">
+        <div class="card-title" style="display: flex; justify-content: space-between; align-items: center;">
+          <span>BNB Protocol Revenue</span>
+          <span class="pill pill-amber" style="font-size: 9px;">0.001 BNB Fixed</span>
+        </div>
+        <div class="hero-number" style="color: #f59e0b;" id="feeTotalBnb">0.000000 BNB</div>
+        <div class="hero-subtitle" id="feeSubBnb">Network Gas Surcharge Buffer</div>
+      </div>
+      <div class="card" style="border-left: 3px solid #a855f7;">
+        <div class="card-title" style="display: flex; justify-content: space-between; align-items: center;">
+          <span>Total Fee Events</span>
+          <span class="pill pill-purple" style="font-size: 9px;">ACID SQLite Ledger</span>
+        </div>
+        <div class="hero-number" style="color: #a855f7;" id="feeTotalEvents">0 Events</div>
+        <div class="hero-subtitle">Maker: 0 bps (0%) | Taker: 10 bps (0.1%)</div>
       </div>
     </div>
 
@@ -2376,6 +2494,35 @@ function getDashboardHtml() {
         </thead>
         <tbody id="tradesBody">
           <tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 20px;">Loading recent trades...</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Real-Time Protocol Fee Ledger Table -->
+    <div class="table-container" style="margin-bottom: 24px;">
+      <div class="table-header">
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <span style="font-size: 14px;">💎</span>
+          <strong style="font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em;">Real-Time Protocol Fee Ledger (ACID SQLite)</strong>
+        </div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <span class="pill pill-green" style="font-size: 10px;">Self-Sustaining Protocol</span>
+          <span style="font-size: 11px; color: var(--text-muted);">Auto-Settled to Fee Collector</span>
+        </div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 14%;">Time</th>
+            <th style="width: 16%;">Event Type</th>
+            <th style="width: 10%;">Asset</th>
+            <th style="width: 18%; text-align: right;">Fee Amount</th>
+            <th style="width: 24%;">Reference / Order ID</th>
+            <th style="width: 18%;">Caller / Account</th>
+          </tr>
+        </thead>
+        <tbody id="feesBody">
+          <tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 20px;">Loading fee ledger...</td></tr>
         </tbody>
       </table>
     </div>
@@ -2504,6 +2651,10 @@ function getDashboardHtml() {
       document.getElementById('feeCollectorAddr').textContent = d.accounts.feeCollector.address;
       document.getElementById('feeCollectorAddr').title = d.accounts.feeCollector.address;
       document.getElementById('feeCollectorUsdt').textContent = d.accounts.feeCollector.usdt + ' USDT';
+      const fcb = document.getElementById('feeCollectorBnb');
+      if (fcb) {
+        fcb.textContent = (d.accounts.feeCollector.bnb || '0.000000') + ' BNB';
+      }
       document.getElementById('feeExplorerLink').href = 'https://proximax-foundry.github.io/web-explorer-vuejs/#/account/' + d.accounts.feeCollector.address;
 
       // Treasury Row
@@ -2551,6 +2702,53 @@ function getDashboardHtml() {
         \`).join('');
       } else {
         tb.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 20px;">No trades recorded yet.</td></tr>';
+      }
+
+      // Protocol Fees
+      if (d.fees && d.fees.total) {
+        const elTotalXpx = document.getElementById('feeTotalXpx');
+        if (elTotalXpx) elTotalXpx.textContent = d.fees.total.xpx + ' XPX';
+        const elTotalUsdt = document.getElementById('feeTotalUsdt');
+        if (elTotalUsdt) elTotalUsdt.textContent = d.fees.total.usdt + ' USDT';
+        const elTotalBnb = document.getElementById('feeTotalBnb');
+        if (elTotalBnb) elTotalBnb.textContent = d.fees.total.bnb + ' BNB';
+        const elTotalEvents = document.getElementById('feeTotalEvents');
+        if (elTotalEvents) elTotalEvents.textContent = d.fees.total.count + ' Events';
+
+        if (d.fees.byType) {
+          const tXpx = d.fees.byType.trade ? d.fees.byType.trade.xpx : '0.0000';
+          const wXpx = d.fees.byType.withdrawal ? d.fees.byType.withdrawal.xpx : '0.0000';
+          const elSubXpx = document.getElementById('feeSubXpx');
+          if (elSubXpx) elSubXpx.textContent = 'Trade: ' + tXpx + ' | Withdraw: ' + wXpx;
+
+          const tUsdt = d.fees.byType.trade ? d.fees.byType.trade.usdt : '0.0000';
+          const wUsdt = d.fees.byType.withdrawal ? d.fees.byType.withdrawal.usdt : '0.0000';
+          const elSubUsdt = document.getElementById('feeSubUsdt');
+          if (elSubUsdt) elSubUsdt.textContent = 'Trade: ' + tUsdt + ' | Withdraw: ' + wUsdt;
+        }
+
+        // Fee Ledger Table Rows
+        const fb = document.getElementById('feesBody');
+        if (fb) {
+          if (d.fees.recent && d.fees.recent.length > 0) {
+            fb.innerHTML = d.fees.recent.map(f => \`
+              <tr>
+                <td style="color: var(--text-muted); font-variant-numeric: tabular-nums;" title="\${f.timestamp ? new Date(f.timestamp).toLocaleString() : ''}">\${f.time}</td>
+                <td>
+                  <span class="pill \${f.type === 'WITHDRAWAL' ? 'pill-purple' : (f.type === 'TRADE_TAKER' ? 'pill-blue' : 'pill-green')}" style="font-size: 10px;">
+                    \${f.type}
+                  </span>
+                </td>
+                <td style="font-weight: 700;">\${f.mosaic}</td>
+                <td style="text-align: right; color: #38bdf8; font-weight: 700;">+\${f.amount} \${f.mosaic}</td>
+                <td style="color: var(--text-muted); font-family: monospace; font-size: 11px;">\${f.referenceId || '—'}</td>
+                <td style="color: var(--text-muted); font-family: monospace; font-size: 11px;">\${f.callerKey || 'Exchange'}</td>
+              </tr>
+            \`).join('');
+          } else {
+            fb.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 20px;">No fees collected yet.</td></tr>';
+          }
+        }
       }
     }
 
@@ -2735,12 +2933,48 @@ function getDashboardHtml() {
 </html>`;
 }
 
+function reconcileHistoricalFees() {
+  try {
+    const summary = clobDb.getCollectedFeesSummary();
+    if (summary && summary.total && summary.total.count > 0) {
+      console.log(`[FEE_ENGINE] Fee ledger populated with ${summary.total.count} events (${summary.total.xpx} XPX, ${summary.total.usdt} USDT).`);
+      return;
+    }
+    const tradesPath = path.join(CLUSTER_DIR, 'node1', 'data', 'drives', 'bd1d100a98c34f62e170a8395b4498dc1e730286f5a12c489b37d01562f0cb23', 'drive', 'markets', 'xpx_usdt', 'trades.json');
+    if (!fs.existsSync(tradesPath)) return;
+    const trades = JSON.parse(fs.readFileSync(tradesPath, 'utf8'));
+    let count = 0;
+    for (let i = 0; i < trades.length; i++) {
+      const t = trades[i];
+      const feeAtomic = BigInt(t.taker_fee || '0');
+      if (feeAtomic > 0n) {
+        clobDb.recordCollectedFee({
+          feeType: 'TRADE_TAKER',
+          mosaic: 'XPX',
+          mosaicId: '13bfc518e40549d7',
+          amount: (Number(feeAtomic) / 1e6).toFixed(6),
+          amountAtomic: feeAtomic.toString(),
+          referenceId: `trade_hist_${i}_${t.taker_order_id || 'fill'}`,
+          callerKey: t.taker_account || null,
+        });
+        count++;
+      }
+    }
+    console.log(`[FEE_ENGINE] Auto-reconciled and backfilled ${count} historical trade fee events into collected_fees table.`);
+  } catch (err) {
+    console.warn('[FEE_ENGINE] Warning reconciling historical fees:', err.message);
+  }
+}
+
 const HOST = process.env.HOST || '0.0.0.0';
 server.listen(PORT, HOST, () => {
   console.log(`==================================================================`);
   console.log(`🚀 Sirius Devnet Cockpit Dashboard running at:`);
   console.log(`👉 http://${HOST}:${PORT}`);
   console.log(`==================================================================`);
+
+  // Ensure historical fees are reconciled in SQLite collected_fees table
+  reconcileHistoricalFees();
 
   // Start autonomous BSC Testnet block watcher & relayer
   swapApi.startAutoRelayer();
