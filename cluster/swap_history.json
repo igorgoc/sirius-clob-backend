@@ -1,5 +1,21 @@
 [
   {
+    "swapId": "SWAP-BSC-1795293675101",
+    "timestamp": "2026-11-21T20:41:15.101Z",
+    "network": "BSC",
+    "txnHash": "0xdab116e696f36aced4af928f0b25d989072479112d2ed929948e5596fb42b8b0",
+    "from": "0xc2be0f77ff7688437e276ab52f91d830185e5b83",
+    "recipient": "VAYGA4RVFRXFW4G6IYYEX7A7ZFQKQF5525FEQHY5",
+    "amount": 0.01,
+    "token": "BNB",
+    "status": "CONFIRMED",
+    "onChain": true,
+    "confirmations": 372,
+    "blockNumber": 144087004,
+    "autoDetected": false,
+    "siriusTxHash": "491023DE416F8CF860CEA619A72C83640F8AC17B346E8ECFC9EF2E11F90AC64D"
+  },
+  {
     "swapId": "SWAP-BSC-1795292097248",
     "timestamp": "2026-11-21T20:14:57.248Z",
     "network": "BSC_TESTNET",

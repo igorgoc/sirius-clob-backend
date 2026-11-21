@@ -1945,7 +1945,9 @@ async function syncAndGetAccountBalance(publicKeyOrAddr) {
   } else {
     try {
       const t2Client = require('./testnet2_client');
-      const userAddr = sdk.Address.createFromPublicKey(key, testnet2Config.NETWORK_TYPE).plain();
+      const userAddr = key.length === 64
+        ? sdk.Address.createFromPublicKey(key, testnet2Config.NETWORK_TYPE).plain()
+        : sdk.Address.createFromRawAddress(key).plain();
       const mosaics = await t2Client.getAccountOnChainBalances(userAddr);
       const xpxHex = (testnet2Config.XPX_MOSAIC_ID || '13BFC518E40549D7').toLowerCase();
       const usdtHex = (testnet2Config.USDT_MOSAIC_ID || '4430AEFEF7E15D0C').toLowerCase();
