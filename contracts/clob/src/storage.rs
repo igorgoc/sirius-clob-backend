@@ -20,7 +20,7 @@ pub const TESTNET2_XPX_MOSAIC_ID: u64 = 0x13BFC518E40549D7;
 pub const TESTNET2_USDT_MOSAIC_ID: u64 = 0x4430AEFEF7E15D0C;
 pub const TESTNET2_BNB_MOSAIC_ID: u64 = 0x3CC1D3CE7447B6F9;
 
-pub const MAINNET_XPX_MOSAIC_ID: u64 = 0x402B2F579FA859B8;
+pub const MAINNET_XPX_MOSAIC_ID: u64 = 0x402B2F579FAEBC59; // Official Sirius Mainnet Genesis XPX Mosaic ID
 pub const MAINNET_USDT_MOSAIC_ID: u64 = 0x7525381A171D1E44;
 pub const MAINNET_BNB_MOSAIC_ID: u64 = 0x1E5C5FADEC7B34DD;
 pub const XPX_NAMESPACE_ID: u64 = 0xBFFB42A19116BDF6;
@@ -30,7 +30,7 @@ pub fn canonicalize_mosaic_id(id: u64) -> Option<u64> {
         Some(XPX_MOSAIC_ID)
     } else if id == USDT_MOSAIC_ID || id == TESTNET2_USDT_MOSAIC_ID || id == MAINNET_USDT_MOSAIC_ID {
         Some(USDT_MOSAIC_ID)
-    } else if id == BNB_MOSAIC_ID || id == TESTNET2_BNB_MOSAIC_ID {
+    } else if id == BNB_MOSAIC_ID || id == TESTNET2_BNB_MOSAIC_ID || id == MAINNET_BNB_MOSAIC_ID {
         Some(BNB_MOSAIC_ID)
     } else {
         None

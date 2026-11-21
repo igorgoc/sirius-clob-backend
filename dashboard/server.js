@@ -1170,6 +1170,51 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // SiriusCLOB DEX Endpoint: Public Network & Exchange Configuration
+  if ((pathname === '/api/clob/config' || pathname === '/api/clob/info') && req.method === 'GET') {
+    const configData = {
+      ok: true,
+      network: l1Config.NETWORK_ENV,
+      networkName: l1Config.NETWORK_NAME,
+      networkType: l1Config.NETWORK_TYPE,
+      generationHash: l1Config.GENERATION_HASH,
+      nodeUrl: l1Config.NODE_URL,
+      vaultAddress: l1Config.VAULT_ADDRESS,
+      supercontractAddress: l1Config.SUPERCONTRACT_ADDRESS,
+      feeCollectorAddress: l1Config.FEE_COLLECTOR_ADDRESS,
+      explorerBaseUrl: l1Config.EXPLORER_BASE_URL,
+      faucetEnabled: Boolean(l1Config.FAUCET_ENABLED),
+      confirmationDepth: l1Config.CONFIRMATION_DEPTH,
+      pairs: [
+        {
+          symbol: 'XPX/USDT',
+          baseSymbol: 'XPX',
+          quoteSymbol: 'USDT',
+          baseMosaicId: l1Config.XPX_MOSAIC_ID,
+          quoteMosaicId: l1Config.USDT_MOSAIC_ID,
+          priceDecimals: 6,
+          amountDecimals: 6,
+          tickSize: 0.000001,
+          minOrderAmount: 1,
+        },
+        {
+          symbol: 'XPX/BNB',
+          baseSymbol: 'XPX',
+          quoteSymbol: 'BNB',
+          baseMosaicId: l1Config.XPX_MOSAIC_ID,
+          quoteMosaicId: l1Config.BNB_MOSAIC_ID,
+          priceDecimals: 8,
+          amountDecimals: 6,
+          tickSize: 0.00000001,
+          minOrderAmount: 1,
+        },
+      ],
+    };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(configData));
+    return;
+  }
+
   // SiriusCLOB DEX Endpoint: Live Depth Snapshot
   if (pathname === '/api/clob/depth' && req.method === 'GET') {
     const market = sanitizeMarket(parsedUrl.searchParams.get('pair') || parsedUrl.searchParams.get('market') || parsedUrl.searchParams.get('symbol'));

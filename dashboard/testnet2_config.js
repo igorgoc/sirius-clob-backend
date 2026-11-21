@@ -1,7 +1,22 @@
 /**
- * Sirius Testnet 2 Configuration for Standalone CLOB Relayer
+ * Sirius Network Configuration for Standalone CLOB Relayer
+ * Supports seamless switching between Sirius Testnet 2 (168) and Sirius Mainnet (184).
  */
 const path = require('path');
+
+let Address = null;
+try {
+  Address = require('tsjs-xpx-chain-sdk').Address;
+} catch (_) {}
+
+function deriveAddress(pubKeyHex, netType, fallback) {
+  if (Address && pubKeyHex && pubKeyHex.length === 64) {
+    try {
+      return Address.createFromPublicKey(pubKeyHex, netType).plain();
+    } catch (_) {}
+  }
+  return fallback;
+}
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const STATE_DIR = process.env.CLOB_STATE_DIR || path.join(ROOT_DIR, 'cluster');
@@ -23,28 +38,46 @@ const NETWORK_PROFILES = {
     USDT_MOSAIC_ID: '4430AEFEF7E15D0C', // Canonical Testnet 2 USDT Mosaic ID (owned by Treasury VC46DF...)
     BNB_MOSAIC_ID: '3CC1D3CE7447B6F9',  // Canonical Testnet 2 BNB Mosaic ID (owned by Treasury VC46DF...)
     EXPLORER_BASE_URL: 'https://proximax-foundry.github.io/web-explorer-vuejs/#',
+    CONFIRMATION_DEPTH: 1,
+    FAUCET_ENABLED: true,
   },
   mainnet: {
     NETWORK_NAME: 'mainnet',
-    NODE_URL: 'https://betelgeuse.xpxsirius.io:3000',
+    NODE_URL: 'https://betelgeuse.xpxsirius.io',
     FALLBACK_NODE_URLS: [
-      'https://betelgeuse.xpxsirius.io:3000',
-      'https://arcturus.xpxsirius.io:3000',
-      'https://aldebaran.xpxsirius.io:3000',
+      'https://betelgeuse.xpxsirius.io',
+      'https://arcturus.xpxsirius.io',
+      'https://aldebaran.xpxsirius.io',
     ],
     NETWORK_TYPE: 184, // 0xB8 NetworkType.MAIN_NET
     GENERATION_HASH: '10540AD3A1BF46B1A05D8B1CF0252BC9FB2E0B53CFD748262B0CE341CEAFEB6B',
-    XPX_MOSAIC_ID: '402B2F579FA859B8',
+    XPX_MOSAIC_ID: '402B2F579FAEBC59', // Official Sirius Mainnet Genesis XPX Mosaic ID (prx.xpx)
     XPX_NAMESPACE_ID: 'bffb42a19116bdf6',
-    USDT_MOSAIC_ID: '7525381A171D1E44',
-    BNB_MOSAIC_ID: '1E5C5FADEC7B34DD',
+    USDT_MOSAIC_ID: '7525381A171D1E44', // Mainnet Wrapped USDT
+    BNB_MOSAIC_ID: '1E5C5FADEC7B34DD',  // Mainnet Wrapped BNB
     EXPLORER_BASE_URL: 'https://explorer.xpxsirius.io/#',
+    CONFIRMATION_DEPTH: 2,
+    FAUCET_ENABLED: false, // Faucet permanently disabled on Mainnet
   },
 };
 
 const activeEnv = (process.env.SIRIUS_NETWORK || 'testnet2').toLowerCase();
 const profile = NETWORK_PROFILES[activeEnv] || NETWORK_PROFILES.testnet2;
 const networkType = Number(process.env.SIRIUS_NETWORK_TYPE || profile.NETWORK_TYPE);
+
+const SUPERCONTRACT_PUBKEY = process.env.SIRIUS_SUPERCONTRACT_PUBKEY || 'c589bfef210489d3a1bf46b1a05d8b1cf0252bc9fb2e0b53cfd748262b0ce341';
+const SUPERCONTRACT_ADDRESS = deriveAddress(
+  SUPERCONTRACT_PUBKEY,
+  networkType,
+  networkType === 184 ? 'XAEKLE3WB6XJLFW75JGJJ7Y3DVQWCWX775NQNWPP' : 'VAEKLE3WB6XJLFW75JGJJ7Y3DVQWCWX774DDSJ2F'
+);
+
+const FEE_COLLECTOR_PUBKEY = process.env.SIRIUS_FEE_COLLECTOR_PUBKEY || '04EF8D54AAEFBC4746257723FD1EFB7B37F30452DE8BD022F5FB3CABC5246A64';
+const FEE_COLLECTOR_ADDRESS = process.env.SIRIUS_FEE_COLLECTOR_ADDRESS || deriveAddress(
+  FEE_COLLECTOR_PUBKEY,
+  networkType,
+  networkType === 184 ? 'XB3QOFNGGL7DENKPBW2RO3OVIXLOVLQ5F537V4JZ' : 'VB3QOFNGGL7DENKPBW2RO3OVIXLOVLQ5F5WLG4XE'
+);
 
 module.exports = {
   NETWORK_ENV: activeEnv,
@@ -58,6 +91,8 @@ module.exports = {
   GENERATION_HASH: process.env.SIRIUS_GENERATION_HASH || profile.GENERATION_HASH,
   DOMAIN_SEPARATOR: process.env.SIRIUS_DOMAIN_SEPARATOR || `${networkType}:SiriusCLOB-v1`,
   EXPLORER_BASE_URL: process.env.SIRIUS_EXPLORER_URL || profile.EXPLORER_BASE_URL,
+  CONFIRMATION_DEPTH: Number(process.env.SIRIUS_CONFIRMATION_DEPTH || profile.CONFIRMATION_DEPTH || 1),
+  FAUCET_ENABLED: process.env.SIRIUS_FAUCET_ENABLED !== undefined ? process.env.SIRIUS_FAUCET_ENABLED === 'true' : profile.FAUCET_ENABLED,
 
   // Canonical Network Mosaics
   XPX_MOSAIC_ID: (process.env.SIRIUS_XPX_MOSAIC_ID || profile.XPX_MOSAIC_ID).toUpperCase(),
@@ -79,20 +114,20 @@ module.exports = {
   PROCESSED_DEPOSITS_FILE: path.join(STATE_DIR, 'processed_deposits.json'),
   WITHDRAWALS_FILE: path.join(STATE_DIR, 'withdrawals.json'),
   ADMIN_KEYS_FILE: path.join(STATE_DIR, 'admin_keys.json'),
-  // Autonomous SuperContract L1 Escrow Account (Derived from contract key c589bfef...)
-  // NO PRIVATE KEY EXISTS — Controlled strictly by 3-node WASM consensus
-  SUPERCONTRACT_PUBKEY: 'c589bfef210489d3a1bf46b1a05d8b1cf0252bc9fb2e0b53cfd748262b0ce341',
-  SUPERCONTRACT_ADDRESS: 'VAEKLE3WB6XJLFW75JGJJ7Y3DVQWCWX774DDSJ2F',
+
+  // Autonomous SuperContract L1 Escrow Account
+  SUPERCONTRACT_PUBKEY,
+  SUPERCONTRACT_ADDRESS,
 
   // Canonical on-chain deposit & escrow target
-  VAULT_ADDRESS: process.env.SIRIUS_VAULT_ADDRESS || 'VAEKLE3WB6XJLFW75JGJJ7Y3DVQWCWX774DDSJ2F',
-  LEGACY_VAULT_ADDRESS: 'VAAUXFYQ424I6V3JDVWCBWGWHRTIJGTSX4B2TLSV',
+  VAULT_ADDRESS: process.env.SIRIUS_VAULT_ADDRESS || SUPERCONTRACT_ADDRESS,
+  LEGACY_VAULT_ADDRESS: process.env.SIRIUS_LEGACY_VAULT_ADDRESS || 'VAAUXFYQ424I6V3JDVWCBWGWHRTIJGTSX4B2TLSV',
   VAULT_KEY_FILE: path.join(STATE_DIR, 'vault_account.json'),
   TREASURY_KEY_FILE: path.join(STATE_DIR, 'treasury_account.json'),
-  TREASURY_ADDRESS: 'VC46DFR25R5EWJWR32E4TFOYC57VXFNPKAASJTLV',
+  TREASURY_ADDRESS: process.env.SIRIUS_TREASURY_ADDRESS || 'VC46DFR25R5EWJWR32E4TFOYC57VXFNPKAASJTLV',
   FEE_COLLECTOR_FILE: path.join(STATE_DIR, 'fee_collector_account.json'),
-  FEE_COLLECTOR_ADDRESS: process.env.SIRIUS_FEE_COLLECTOR_ADDRESS || 'VB3QOFNGGL7DENKPBW2RO3OVIXLOVLQ5F5WLG4XE',
-  FEE_COLLECTOR_PUBKEY: '04EF8D54AAEFBC4746257723FD1EFB7B37F30452DE8BD022F5FB3CABC5246A64',
+  FEE_COLLECTOR_ADDRESS,
+  FEE_COLLECTOR_PUBKEY,
 
   // Standalone matching engine WASM binary
   WASM_PATH: path.join(ROOT_DIR, 'contracts/clob/target/wasm32-unknown-unknown/release/sirius_clob.wasm'),

@@ -28,7 +28,13 @@ sleep 2
 
 # Export default network config
 export SIRIUS_NETWORK="${SIRIUS_NETWORK:-testnet2}"
-export SIRIUS_NODE_URL="${SIRIUS_NODE_URL:-https://api-2.testnet2.xpxsirius.io}"
+if [ -z "$SIRIUS_NODE_URL" ]; then
+    if [ "$SIRIUS_NETWORK" = "mainnet" ]; then
+        export SIRIUS_NODE_URL="https://betelgeuse.xpxsirius.io"
+    else
+        export SIRIUS_NODE_URL="https://api-2.testnet2.xpxsirius.io"
+    fi
+fi
 
 echo "Starting CLOB Relayer API on port ${PORT:-8088}..."
 exec node dashboard/server.js

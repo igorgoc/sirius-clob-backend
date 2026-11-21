@@ -345,9 +345,13 @@ async function broadcastVaultTransfer(vaultAccount, recipientAddressStr, mosaicI
 }
 
 /**
- * Load or initialize Exchange Vault account (never overwrites an existing key file)
+ * Load or initialize Exchange Vault account (supports env var, file, or safe initialization)
  */
 function getOrInitVaultAccount() {
+  if (process.env.SIRIUS_VAULT_PRIVATE_KEY && /^[0-9a-fA-F]{64}$/.test(process.env.SIRIUS_VAULT_PRIVATE_KEY.trim())) {
+    return Account.createFromPrivateKey(process.env.SIRIUS_VAULT_PRIVATE_KEY.trim(), config.NETWORK_TYPE, 1);
+  }
+
   if (fs.existsSync(config.VAULT_KEY_FILE)) {
     const raw = fs.readFileSync(config.VAULT_KEY_FILE, 'utf8');
     const data = JSON.parse(raw);
@@ -357,7 +361,7 @@ function getOrInitVaultAccount() {
     return Account.createFromPrivateKey(data.privateKey, config.NETWORK_TYPE, 1);
   }
 
-  // Generate fresh vault account ONLY if no vault_account.json exists
+  // Generate fresh vault account ONLY if no vault_account.json exists and not configured via env
   const newVault = Account.generateNewAccount(config.NETWORK_TYPE);
   const payload = {
     address: newVault.address.plain(),
@@ -373,9 +377,13 @@ function getOrInitVaultAccount() {
 }
 
 /**
- * Load Treasury account from cluster/treasury_account.json
+ * Load Treasury account from env var or cluster/treasury_account.json
  */
 function getOrInitTreasuryAccount() {
+  if (process.env.SIRIUS_TREASURY_PRIVATE_KEY && /^[0-9a-fA-F]{64}$/.test(process.env.SIRIUS_TREASURY_PRIVATE_KEY.trim())) {
+    return Account.createFromPrivateKey(process.env.SIRIUS_TREASURY_PRIVATE_KEY.trim(), config.NETWORK_TYPE, 1);
+  }
+
   const treasuryFile = config.TREASURY_KEY_FILE || path.join(config.STATE_DIR, 'treasury_account.json');
   if (fs.existsSync(treasuryFile)) {
     const raw = fs.readFileSync(treasuryFile, 'utf8');
@@ -388,9 +396,13 @@ function getOrInitTreasuryAccount() {
 }
 
 /**
- * Load Fee Collector account from cluster/fee_collector_account.json
+ * Load Fee Collector account from env var or cluster/fee_collector_account.json
  */
 function getOrInitFeeCollectorAccount() {
+  if (process.env.SIRIUS_FEE_COLLECTOR_PRIVATE_KEY && /^[0-9a-fA-F]{64}$/.test(process.env.SIRIUS_FEE_COLLECTOR_PRIVATE_KEY.trim())) {
+    return Account.createFromPrivateKey(process.env.SIRIUS_FEE_COLLECTOR_PRIVATE_KEY.trim(), config.NETWORK_TYPE, 1);
+  }
+
   const feeFile = config.FEE_COLLECTOR_FILE || path.join(config.STATE_DIR, 'fee_collector_account.json');
   if (fs.existsSync(feeFile)) {
     const raw = fs.readFileSync(feeFile, 'utf8');
