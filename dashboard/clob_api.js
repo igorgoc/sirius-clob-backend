@@ -955,8 +955,10 @@ function verifyAdminRequest(body, expectedAction) {
   verifyEd25519Signature(callerKey, msg, signature);
 
   const authorized = getAuthorizedAdminKeys();
-  const isMainnet = String(testnet2Config.NETWORK_ENV || '').toLowerCase() === 'mainnet';
-  if (isMainnet && action !== 'BATCH_FLUSH' && authorized.size > 0 && !authorized.has(callerKey.toLowerCase())) {
+  if (authorized.size === 0) {
+    throw new Error('Unauthorized: No administrative public keys are configured on the exchange');
+  }
+  if (!authorized.has(callerKey.toLowerCase())) {
     throw new Error(`Unauthorized: Public key ${callerKey} is not an authorized exchange administrator`);
   }
 
@@ -3820,6 +3822,9 @@ async function _cancelAllOrdersUnlocked(cancelAllReq) {
  * Faucet Claim: Broadcasts real on-chain Sirius Testnet 2 transfer of XPX (gas) + USDT (collateral)
  */
 async function claimFaucet(publicKey, addressOverride = null) {
+  if (String(testnet2Config.NETWORK_ENV || '').toLowerCase() === 'mainnet') {
+    throw new Error('Faucet claims are permanently disabled on Mainnet');
+  }
   const callerKey = normalizeKey(publicKey).toLowerCase();
   let recipientAddress = addressOverride;
 
@@ -3922,7 +3927,9 @@ async function claimFaucet(publicKey, addressOverride = null) {
  */
 async function depositTokens(depositReq, options = {}) {
   const callerKey = normalizeKey(depositReq.publicKey || depositReq.callerPublicKey);
-  const mosaicId = String(depositReq.mosaicId || depositReq.mosaic_id || XPX_MOSAIC_ID);
+  return withAccountLock(callerKey, async () => {
+    checkAndEnforceCircuitBreaker('Token Deposit');
+    const mosaicId = String(depositReq.mosaicId || depositReq.mosaic_id || XPX_MOSAIC_ID);
   const confirmationDepth = depositReq.confirmationDepth !== undefined ? Number(depositReq.confirmationDepth) : 1;
 
   let txHash = depositReq.txHash || depositReq.depositTxHash;
@@ -4062,16 +4069,17 @@ async function depositTokens(depositReq, options = {}) {
 
   invalidateVaultBalanceCache(finalMosaicId);
 
-  return {
-    ok: true,
-    success: true,
-    mosaicId: finalMosaicId,
-    txHash,
-    amount: formatAtomicUnits(onChainAmountAtomic, 6),
-    amountAtomic: onChainAmountAtomic.toString(),
-    gasConsumed: ret.execution_gas_consumed,
-    balances: getAccountBalance(callerKey),
-  };
+    return {
+      ok: true,
+      success: true,
+      mosaicId: finalMosaicId,
+      txHash,
+      amount: formatAtomicUnits(onChainAmountAtomic, 6),
+      amountAtomic: onChainAmountAtomic.toString(),
+      gasConsumed: ret.execution_gas_consumed,
+      balances: getAccountBalance(callerKey),
+    };
+  });
 }
 
 async function resumeBroadcastAndConfirm(record, withdrawReq = {}) {

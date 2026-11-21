@@ -1,3 +1,8 @@
 node_modules
 *.log
 .DS_Store
+*.key
+*.db*
+cluster/*.key
+contracts/clob/target
+

@@ -6,8 +6,10 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+const net = require('net');
 module.paths.push(path.resolve(__dirname, '../../web-wallet-vuejs/node_modules'));
-const { exec, spawn } = require('child_process');
+const { exec, execFile, spawn } = require('child_process');
 const clobApi = require('./clob_api');
 const swapApi = require('./swap_api');
 const { defaultBatchSettlerTestnet2: defaultBatchSettler } = require('./batch_settler_testnet2');
@@ -17,6 +19,76 @@ const l1Client = require('./testnet2_client');
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8088;
 const ROOT_DIR = path.resolve(__dirname, '..');
 const CLUSTER_DIR = path.join(ROOT_DIR, 'cluster');
+const ADMIN_SECRET_FILE = path.join(CLUSTER_DIR, 'admin_secret.key');
+let clusterAdminKey = process.env.CLOB_ADMIN_KEY || '';
+
+function getOrInitAdminKey() {
+  if (clusterAdminKey && clusterAdminKey.trim()) {
+    return clusterAdminKey.trim();
+  }
+  try {
+    if (fs.existsSync(ADMIN_SECRET_FILE)) {
+      const existing = fs.readFileSync(ADMIN_SECRET_FILE, 'utf8').trim();
+      if (existing.length >= 32) {
+        clusterAdminKey = existing;
+        return clusterAdminKey;
+      }
+    }
+    const generated = crypto.randomBytes(32).toString('hex');
+    fs.mkdirSync(path.dirname(ADMIN_SECRET_FILE), { recursive: true });
+    fs.writeFileSync(ADMIN_SECRET_FILE, generated, { mode: 0o600 });
+    clusterAdminKey = generated;
+    console.log('[SECURITY] Generated new persistent cluster admin key in cluster/admin_secret.key');
+    return clusterAdminKey;
+  } catch (err) {
+    console.error('[SECURITY] Error initializing admin key:', err.message);
+    return clusterAdminKey;
+  }
+}
+
+// Log admin key status at startup (without leaking full key if configured via env)
+const initialAdminKey = getOrInitAdminKey();
+if (process.env.CLOB_ADMIN_KEY) {
+  console.log('[SECURITY] CLOB Admin Key initialized from environment variable CLOB_ADMIN_KEY');
+} else {
+  console.log(`[SECURITY] CLOB Admin Key initialized: ${initialAdminKey.slice(0, 8)}...${initialAdminKey.slice(-6)} (Saved to cluster/admin_secret.key)`);
+}
+
+function verifyAdminAuth(req, body = null, expectedAction = null) {
+  const secretKey = getOrInitAdminKey();
+
+  // 1. Check Bearer Token or X-Admin-Key header or body.adminKey
+  const authHeader = req.headers['authorization'] || '';
+  const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  const xAdminKey = (req.headers['x-admin-key'] || '').trim();
+  const candidateSecret = bearerToken || xAdminKey || (body && body.adminKey ? String(body.adminKey).trim() : '');
+
+  if (secretKey && candidateSecret) {
+    try {
+      const bufExpected = Buffer.from(secretKey);
+      const bufCandidate = Buffer.from(candidateSecret);
+      if (bufExpected.length === bufCandidate.length && crypto.timingSafeEqual(bufExpected, bufCandidate)) {
+        return { authorized: true, method: 'ADMIN_SECRET' };
+      }
+    } catch (_) {}
+  }
+
+  // 2. Check Catapult Ed25519 Cryptographic Signature
+  if (body && (body.signature || body.callerPublicKey || body.publicKey)) {
+    try {
+      const action = expectedAction || body.action;
+      const verifyRes = clobApi.verifyAdminRequest(body, action);
+      return { authorized: true, method: 'ED25519_SIGNATURE', callerKey: verifyRes.callerKey };
+    } catch (sigErr) {
+      return { authorized: false, error: sigErr.message };
+    }
+  }
+
+  return {
+    authorized: false,
+    error: 'Authentication required: Valid X-Admin-Key header or signed Ed25519 administrative payload required'
+  };
+}
 const TRADE_TIMESTAMPS_FILE = path.join(CLUSTER_DIR, 'trade_timestamps.json');
 const tradeTimestamps = new Map();
 
@@ -378,30 +450,45 @@ function ansiToHtml(str) {
   return html;
 }
 
-function isLocalhostRequest(req) {
-  // In cloud deployments (Render, VPS), enable full cockpit telemetry
-  if (process.env.ALLOW_PUBLIC_COCKPIT !== 'false') {
-    return true;
+function getClientIp(req) {
+  // If cf-connecting-ip is provided, validate it is a legitimate IP address
+  const cfIp = req.headers['cf-connecting-ip'];
+  if (cfIp && typeof cfIp === 'string') {
+    const trimmed = cfIp.trim();
+    if (net.isIP(trimmed)) {
+      return trimmed;
+    }
   }
-  // If request contains Cloudflare tunnel or external proxy headers, it is NOT direct localhost
-  if (req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']) {
+  const xForwardedFor = req.headers['x-forwarded-for'];
+  if (xForwardedFor && typeof xForwardedFor === 'string') {
+    const parts = xForwardedFor.split(',');
+    // First IP in X-Forwarded-For is the originating client IP
+    for (const part of parts) {
+      const candidate = part.trim();
+      if (net.isIP(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  const remote = (req.socket && req.socket.remoteAddress) || (req.connection && req.connection.remoteAddress) || '127.0.0.1';
+  return remote.replace(/^::ffff:/, '');
+}
+
+function isDirectLocalhost(req) {
+  // If request contains Cloudflare or external proxy headers, it is NOT direct localhost
+  if (req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.headers['forwarded']) {
     return false;
   }
   const remote = (req.socket && req.socket.remoteAddress) || (req.connection && req.connection.remoteAddress) || '';
-  return remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1' || remote === 'localhost';
+  const clean = remote.replace(/^::ffff:/, '');
+  return clean === '127.0.0.1' || clean === '::1' || clean === 'localhost';
 }
 
-function getClientIp(req) {
-  // Cloudflare authentic client IP takes highest precedence
-  if (req.headers['cf-connecting-ip']) {
-    return req.headers['cf-connecting-ip'].trim();
+function isTelemetryAllowed(req) {
+  if (process.env.ALLOW_PUBLIC_COCKPIT !== 'false') {
+    return true;
   }
-  const xForwardedFor = req.headers['x-forwarded-for'];
-  if (xForwardedFor) {
-    const parts = xForwardedFor.split(',');
-    return parts[parts.length - 1].trim();
-  }
-  return (req.socket && req.socket.remoteAddress) || (req.connection && req.connection.remoteAddress) || '127.0.0.1';
+  return isDirectLocalhost(req);
 }
 
 // In-Memory Sliding Window Rate Limiter
@@ -451,11 +538,21 @@ const server = http.createServer((req, res) => {
   const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
   const pathname = parsedUrl.pathname;
   const clientIp = getClientIp(req);
+  const isDirectLocal = isDirectLocalhost(req);
 
-  // CORS headers
+  // Hardened Security & CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-Admin-Key');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'self' 'unsafe-inline' https:; font-src 'self' https: data:; img-src 'self' data: https:; connect-src 'self' https: wss:;"
+  );
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
@@ -493,7 +590,7 @@ const server = http.createServer((req, res) => {
     pathname === '/api/clob/emergency-unlock' ||
     pathname === '/api/clob/deposit'
   ) {
-    const ipLimit = (clientIp === '127.0.0.1' || clientIp === '::1' || clientIp === 'localhost') ? 2400 : 60;
+    const ipLimit = isDirectLocal ? 2400 : 60;
     const rate = apiRateLimiter.check(`clob:${clientIp}`, ipLimit, 60000);
     if (!rate.allowed) {
       res.writeHead(429, {
@@ -528,7 +625,7 @@ const server = http.createServer((req, res) => {
 
   // 4. CLOB General Market & Account Read Queries: 300 requests per minute (60,000 ms)
   if (pathname.startsWith('/api/clob/') && req.method === 'GET') {
-    const readLimit = (clientIp === '127.0.0.1' || clientIp === '::1' || clientIp === 'localhost') ? 3600 : 300;
+    const readLimit = isDirectLocal ? 3600 : 300;
     const rate = apiRateLimiter.check(`clob_read:${clientIp}`, readLimit, 60000);
     if (!rate.allowed) {
       res.writeHead(429, {
@@ -552,9 +649,9 @@ const server = http.createServer((req, res) => {
   }
 
   if (pathname === '/api/logs') {
-    if (!isLocalhostRequest(req)) {
+    if (!isTelemetryAllowed(req)) {
       res.writeHead(403, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: 'Forbidden: Log inspection is restricted to localhost operator' }));
+      res.end(JSON.stringify({ ok: false, error: 'Forbidden: Log inspection is restricted to authorized operators' }));
       return;
     }
     const node = sanitizeLogNode(parsedUrl.searchParams.get('node'));
@@ -567,9 +664,9 @@ const server = http.createServer((req, res) => {
 
   // SSE Stream for Real-Time Logs
   if (pathname === '/api/logs/stream') {
-    if (!isLocalhostRequest(req)) {
+    if (!isTelemetryAllowed(req)) {
       res.writeHead(403, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: 'Forbidden: Log streaming is restricted to localhost operator' }));
+      res.end(JSON.stringify({ ok: false, error: 'Forbidden: Log streaming is restricted to authorized operators' }));
       return;
     }
     res.writeHead(200, {
@@ -610,64 +707,131 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  function executeSandboxAction(subcmd, res) {
-    if (!isLocalhostRequest(req)) {
-      res.writeHead(403, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: 'Forbidden: Admin actions are strictly restricted to direct localhost' }));
-      return;
-    }
-    exec(`${path.join(ROOT_DIR, 'services.sh')} ${subcmd}`, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ success: !err, output: stdout + (stderr || '') }));
-    });
-  }
-
-  // Admin Action: Emergency Halt Exchange (Trip Circuit Breaker)
+  // Admin Action: Emergency Halt Exchange (Trip Circuit Breaker, Admin Protected)
   if (pathname === '/api/action/emergency-halt' && req.method === 'POST') {
-    if (!isLocalhostRequest(req)) {
-      res.writeHead(403, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: 'Forbidden: Admin actions are strictly restricted to direct localhost' }));
-      return;
-    }
-    const breaker = clobApi.tripCircuitBreaker('Manual emergency halt triggered by administrator from Cockpit Dashboard');
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ success: true, message: '🚨 EMERGENCY HALT ENGAGED: Exchange order intake, matching, and withdrawals frozen immediately.', circuitBreaker: breaker }));
+    parseJsonBody(req).catch(() => ({})).then((body) => {
+      const auth = verifyAdminAuth(req, body, 'EMERGENCY_HALT');
+      if (!auth.authorized) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, success: false, error: auth.error }));
+        return;
+      }
+      const reason = (body && body.reason) || 'Manual emergency halt triggered by administrator from Cockpit Dashboard';
+      const breaker = clobApi.tripCircuitBreaker(reason);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        ok: true,
+        message: '🚨 EMERGENCY HALT ENGAGED: Exchange order intake, matching, and withdrawals frozen immediately.',
+        circuitBreaker: breaker
+      }));
+    });
     return;
   }
 
-  // Admin Action: Resume Trading (Reset Circuit Breaker)
+  // Admin Action: Resume Trading (Reset Circuit Breaker, Admin Protected)
   if (pathname === '/api/action/resume-trading' && req.method === 'POST') {
-    if (!isLocalhostRequest(req)) {
-      res.writeHead(403, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: 'Forbidden: Admin actions are strictly restricted to direct localhost' }));
-      return;
-    }
-    const breaker = clobApi.resetCircuitBreaker();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ success: true, message: '🟢 TRADING RESUMED: Circuit breaker reset to active state.', circuitBreaker: breaker }));
+    parseJsonBody(req).catch(() => ({})).then((body) => {
+      const auth = verifyAdminAuth(req, body, 'RESUME_TRADING');
+      if (!auth.authorized) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, success: false, error: auth.error }));
+        return;
+      }
+      const breaker = clobApi.resetCircuitBreaker();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        ok: true,
+        message: '🟢 TRADING RESUMED: Circuit breaker reset to active state.',
+        circuitBreaker: breaker
+      }));
+    });
     return;
   }
 
-  // Admin Action: Restart All Services Cleanly
+  // Admin Action: Restart All Services Cleanly (Admin Protected)
   if (pathname === '/api/action/restart' && req.method === 'POST') {
-    return executeSandboxAction('restart', res);
+    parseJsonBody(req).catch(() => ({})).then((body) => {
+      const auth = verifyAdminAuth(req, body, 'RESTART');
+      if (!auth.authorized) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, success: false, error: auth.error }));
+        return;
+      }
+      const servicesSh = path.join(ROOT_DIR, 'services.sh');
+      if (fs.existsSync(servicesSh)) {
+        exec(`${servicesSh} restart`, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: !err, output: stdout + (stderr || '') }));
+        });
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          success: true,
+          ok: true,
+          message: 'Cloud container restart initiated: Container will reboot cleanly in 1 second.'
+        }));
+        setTimeout(() => {
+          console.log('[ADMIN] Graceful container restart initiated by administrator');
+          process.exit(0);
+        }, 1000);
+      }
+    });
+    return;
   }
 
-  // Admin Action: Start Services
+  // Admin Action: Start Services (Admin Protected)
   if (pathname === '/api/action/start' && req.method === 'POST') {
-    return executeSandboxAction('start', res);
+    parseJsonBody(req).catch(() => ({})).then((body) => {
+      const auth = verifyAdminAuth(req, body, 'START');
+      if (!auth.authorized) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, success: false, error: auth.error }));
+        return;
+      }
+      const servicesSh = path.join(ROOT_DIR, 'services.sh');
+      if (fs.existsSync(servicesSh)) {
+        exec(`${servicesSh} start`, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: !err, output: stdout + (stderr || '') }));
+        });
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, message: 'All cloud services are running and managed by container orchestrator.' }));
+      }
+    });
+    return;
   }
 
-  // Admin Action: Stop Services
+  // Admin Action: Stop Services (Admin Protected)
   if (pathname === '/api/action/stop' && req.method === 'POST') {
-    return executeSandboxAction('stop', res);
+    parseJsonBody(req).catch(() => ({})).then((body) => {
+      const auth = verifyAdminAuth(req, body, 'STOP');
+      if (!auth.authorized) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, success: false, error: auth.error }));
+        return;
+      }
+      const servicesSh = path.join(ROOT_DIR, 'services.sh');
+      if (fs.existsSync(servicesSh)) {
+        exec(`${servicesSh} stop`, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: !err, output: stdout + (stderr || '') }));
+        });
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'Direct service stoppage is disabled in cloud container environments. Use restart or platform console.' }));
+      }
+    });
+    return;
   }
 
   // Admin Overview Data Endpoint (Real-time live telemetry for Cockpit)
   if (pathname === '/api/admin/overview' && req.method === 'GET') {
-    if (!isLocalhostRequest(req)) {
+    if (!isTelemetryAllowed(req)) {
       res.writeHead(403, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: 'Forbidden: Admin telemetry is restricted to localhost operator' }));
+      res.end(JSON.stringify({ ok: false, error: 'Forbidden: Admin telemetry is restricted to authorized operators' }));
       return;
     }
     (async () => {
@@ -716,11 +880,13 @@ const server = http.createServer((req, res) => {
     parseJsonBody(req)
       .then(async (body) => {
         try {
-          const action = String((body && body.action) || '').toUpperCase();
-          if (action === 'CIRCUIT_BREAKER_RESET' || action === 'RESET_CIRCUIT_BREAKER') {
-            clobApi.verifyAdminRequest(body, action);
-          } else {
-            clobApi.verifyAdminRequest(body, 'RESET_CIRCUIT_BREAKER');
+          const action = String((body && body.action) || 'RESET_CIRCUIT_BREAKER').toUpperCase();
+          const expected = (action === 'CIRCUIT_BREAKER_RESET' || action === 'RESET_CIRCUIT_BREAKER') ? action : 'RESET_CIRCUIT_BREAKER';
+          const auth = verifyAdminAuth(req, body, expected);
+          if (!auth.authorized) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, success: false, error: auth.error }));
+            return;
           }
           const resetBreaker = clobApi.resetCircuitBreaker();
           res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -755,18 +921,32 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // SiriusCLOB DEX Endpoint: Run 3-Node E2E Verification
+  // SiriusCLOB DEX Endpoint: Run 3-Node E2E Verification (Admin Protected)
   if (pathname === '/api/clob/test-e2e' && req.method === 'POST') {
-    exec(`node ${path.join(ROOT_DIR, 'scripts/test_clob_e2e.js')}`, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        ok: !err,
-        success: !err,
-        summary: stdout.split('\n').filter(l => l.includes('Criterion') || l.includes('|') || l.includes('✅')).join('\n'),
-        output: stdout,
-        stdout,
-        stderr: err ? err.message : null
-      }));
+    parseJsonBody(req).catch(() => ({})).then((body) => {
+      const auth = verifyAdminAuth(req, body, 'TEST_E2E');
+      if (!auth.authorized) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, success: false, error: auth.error }));
+        return;
+      }
+      const testScript = path.join(ROOT_DIR, 'scripts/test_clob_e2e.js');
+      if (!fs.existsSync(testScript)) {
+        res.writeHead(501, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, success: false, error: 'E2E test suite script is not installed in production cloud container.' }));
+        return;
+      }
+      execFile('node', [testScript], { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: !err,
+          success: !err,
+          summary: stdout.split('\n').filter(l => l.includes('Criterion') || l.includes('|') || l.includes('✅')).join('\n'),
+          output: stdout,
+          stdout,
+          stderr: err ? err.message : null
+        }));
+      });
     });
     return;
   }
@@ -819,7 +999,12 @@ const server = http.createServer((req, res) => {
     parseJsonBody(req)
       .then(async (body) => {
         try {
-          clobApi.verifyAdminRequest(body, 'MM_START');
+          const auth = verifyAdminAuth(req, body, 'MM_START');
+          if (!auth.authorized) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, success: false, error: auth.error }));
+            return;
+          }
           const mmPidFile = path.join(CLUSTER_DIR, 'mm.pid');
           if (fs.existsSync(mmPidFile)) {
             try {
@@ -860,7 +1045,12 @@ const server = http.createServer((req, res) => {
     parseJsonBody(req)
       .then(async (body) => {
         try {
-          clobApi.verifyAdminRequest(body, 'MM_STOP');
+          const auth = verifyAdminAuth(req, body, 'MM_STOP');
+          if (!auth.authorized) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, success: false, error: auth.error }));
+            return;
+          }
           const mmPidFile = path.join(CLUSTER_DIR, 'mm.pid');
           let stoppedPid = null;
           if (fs.existsSync(mmPidFile)) {
@@ -900,8 +1090,13 @@ const server = http.createServer((req, res) => {
     parseJsonBody(req)
       .then(async (body) => {
         try {
-          clobApi.verifyAdminRequest(body, 'MM_STEP');
-          exec(`node ${path.join(ROOT_DIR, 'scripts/clob_market_maker.js')} --step`, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+          const auth = verifyAdminAuth(req, body, 'MM_STEP');
+          if (!auth.authorized) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, success: false, error: auth.error }));
+            return;
+          }
+          execFile('node', [path.join(ROOT_DIR, 'scripts/clob_market_maker.js'), '--step'], { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({
               ok: !err,
@@ -1305,12 +1500,10 @@ const server = http.createServer((req, res) => {
   if (pathname === '/api/clob/batch/flush' && req.method === 'POST') {
     parseJsonBody(req)
       .then(async (body) => {
-        try {
-          clobApi.verifyAdminRequest(body, 'BATCH_FLUSH');
-        } catch (adminErr) {
-          const status = adminErr.message.includes('Unauthorized') ? 403 : (adminErr.message.includes('Authentication required') ? 401 : 400);
-          res.writeHead(status, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, success: false, error: adminErr.message }));
+        const auth = verifyAdminAuth(req, body, 'BATCH_FLUSH');
+        if (!auth.authorized) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, success: false, error: auth.error }));
           return;
         }
 
@@ -1935,7 +2128,10 @@ function getDashboardHtml() {
         </div>
       </div>
       <div style="display: flex; align-items: center; gap: 14px;">
-        <button class="btn-secondary" style="font-size: 12px;" onclick="window.open('http://' + window.location.hostname + ':3030/#/clob-exchange', '_blank')">
+        <button id="btnAdminAuth" class="btn-secondary" style="font-size: 12px;" onclick="promptAdminKey()">
+          🔑 Admin Auth
+        </button>
+        <button class="btn-secondary" style="font-size: 12px;" onclick="openWebWallet()">
           🚀 Open Web Wallet Exchange UI ↗
         </button>
         <div id="liveClock" style="font-family: monospace; font-size: 13px; color: var(--text-muted);"></div>
@@ -2355,17 +2551,88 @@ function getDashboardHtml() {
       terminal.textContent = '';
     }
 
+    function openWebWallet() {
+      const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+      const target = isLocal
+        ? 'http://' + window.location.hostname + ':3030/#/clob-exchange'
+        : 'https://web-wallet-exchange.igorgoc.workers.dev/#/clob-exchange';
+      window.open(target, '_blank');
+    }
+
+    function updateAdminAuthBadge() {
+      const btn = document.getElementById('btnAdminAuth');
+      if (!btn) return;
+      const key = localStorage.getItem('clob_admin_key');
+      if (key && key.trim()) {
+        btn.textContent = '🛡️ Admin: Authenticated';
+        btn.style.color = '#34d399';
+        btn.style.borderColor = 'rgba(16, 185, 129, 0.4)';
+        btn.title = 'Click to change or clear Admin Key';
+      } else {
+        btn.textContent = '🔑 Admin Auth';
+        btn.style.color = '';
+        btn.style.borderColor = '';
+        btn.title = 'Click to set Admin Key';
+      }
+    }
+
+    function promptAdminKey() {
+      const current = localStorage.getItem('clob_admin_key') || '';
+      const entered = prompt(
+        '🔑 SiriusCLOB Admin Key Authentication\\n\\nEnter your cluster admin key (CLOB_ADMIN_KEY) to authorize operator controls:\\n(Leave blank to clear stored key)',
+        current ? '********' : ''
+      );
+      if (entered === null) return;
+      if (entered.trim() === '' || entered === '********') {
+        if (entered.trim() === '') {
+          localStorage.removeItem('clob_admin_key');
+          updateAdminAuthBadge();
+          alert('Admin key cleared.');
+        }
+        return;
+      }
+      localStorage.setItem('clob_admin_key', entered.trim());
+      updateAdminAuthBadge();
+      alert('Admin key saved.');
+    }
+
     async function triggerAction(endpoint, payload = null) {
       toast.style.display = 'block';
       toast.textContent = '⏳ Executing action...';
       try {
-        const opts = { method: 'POST' };
+        let adminKey = localStorage.getItem('clob_admin_key');
+        if (!adminKey) {
+          adminKey = prompt('🔑 Admin Authentication Required\\n\\nEnter the CLOB Admin Key to authorize this administrative action:');
+          if (adminKey && adminKey.trim()) {
+            adminKey = adminKey.trim();
+            localStorage.setItem('clob_admin_key', adminKey);
+            updateAdminAuthBadge();
+          } else {
+            toast.textContent = '❌ Action cancelled: Admin key required';
+            setTimeout(() => toast.style.display = 'none', 3000);
+            return;
+          }
+        }
+
+        const opts = {
+          method: 'POST',
+          headers: {
+            'X-Admin-Key': adminKey,
+          }
+        };
         if (payload) {
-          opts.headers = { 'Content-Type': 'application/json' };
+          opts.headers['Content-Type'] = 'application/json';
           opts.body = JSON.stringify(payload);
         }
         const res = await fetch(endpoint, opts);
         const data = await res.json();
+        if (res.status === 401 || res.status === 403) {
+          localStorage.removeItem('clob_admin_key');
+          updateAdminAuthBadge();
+          toast.textContent = '🔒 ' + (data.error || 'Admin authentication failed: Invalid admin key');
+          setTimeout(() => toast.style.display = 'none', 4000);
+          return;
+        }
         toast.textContent = data.success ? (data.message || '✅ Action completed successfully') : ('⚠️ ' + (data.error || 'Action failed'));
         if (data.output || data.message) {
           const ts = new Date().toLocaleTimeString();
@@ -2415,6 +2682,7 @@ function getDashboardHtml() {
     // Polling intervals
     setInterval(fetchOverview, 2500);
     setInterval(() => fetchLogs(false), 2500);
+    updateAdminAuthBadge();
     fetchOverview();
     fetchLogs(true);
   </script>
