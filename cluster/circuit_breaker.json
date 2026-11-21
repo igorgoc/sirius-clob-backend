@@ -1,5 +1,7 @@
 {
   "tripped": false,
   "reason": null,
-  "trippedAt": null
+  "trippedAt": null,
+  "lastCheckedAt": 1795292093156,
+  "lastStateRootHash": null
 }

@@ -767,7 +767,11 @@ const swapApi = {
       clobDb.saveBridgeSwapRecord(record);
 
       // Update local trading balance in CLOB
-      const targetKey = payload.publicKey || targetRecipient;
+      let targetKey = payload.publicKey || targetRecipient;
+      if (targetKey && targetKey.length !== 64 && typeof clobApi.resolvePublicKeyFromAddress === 'function') {
+        const resolved = clobApi.resolvePublicKeyFromAddress(targetKey);
+        if (resolved) targetKey = resolved;
+      }
       if (targetKey) {
         try {
           clobApi.updateAccountBalance(targetKey, (bal) => {
@@ -778,7 +782,9 @@ const swapApi = {
               bal.usdt = (bal.usdt || 0n) + atomicUnits;
             }
           }, { source: 'BRIDGE_DELIVERY' });
-        } catch (_) {}
+        } catch (err) {
+          console.warn('[Bridge Relayer] Could not update local trading balance:', err.message);
+        }
       }
 
       return {
