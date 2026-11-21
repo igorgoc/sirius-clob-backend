@@ -340,116 +340,119 @@ async function autoCreditTx(tx, blockNumber) {
   if (!tx || !tx.hash) return;
   const normHash = tx.hash.toLowerCase();
 
-  // SQLite Exactly-Once Check: Prevent double-credit across reloads
-  const existingSqlite = clobDb.getBridgeSwapRecord(normHash);
-  if (existingSqlite) {
-    return;
-  }
+  if (inFlightTxs.has(normHash)) return;
+  inFlightTxs.add(normHash);
 
-  const history = loadSwapHistory();
-  if (history.some((h) => (h.txnHash || '').toLowerCase() === normHash)) {
-    return;
-  }
-
-  // Verify transaction receipt status === '0x1' so reverted BSC txs are never credited
-  const receipt = await queryBscRpc('eth_getTransactionReceipt', [tx.hash]);
-  if (!receipt || receipt.status !== '0x1') {
-    return;
-  }
-
-  let tokenName = 'BNB';
-  let transferAmount = 0;
-
-  if (tx.to && tx.to.toLowerCase() === BRIDGE_SINK_ADDRESS.toLowerCase()) {
-    tokenName = 'BNB';
-    if (tx.value && tx.value !== '0x0') {
-      try {
-        transferAmount = Number(BigInt(tx.value)) / 1e18;
-      } catch (_) {}
+  try {
+    // SQLite Exactly-Once Check: Prevent double-credit across reloads
+    const existingSqlite = clobDb.getBridgeSwapRecord(normHash);
+    if (existingSqlite) {
+      return;
     }
-  } else if (tx.to && tx.to.toLowerCase() === BSC_TESTNET_USDT_CONTRACT.toLowerCase()) {
-    tokenName = 'USDT';
-    if (tx.input && tx.input.toLowerCase().startsWith('0xa9059cbb')) {
-      const recipientParam = '0x' + tx.input.slice(34, 74).toLowerCase();
-      if (recipientParam === BRIDGE_SINK_ADDRESS.toLowerCase()) {
+
+    const history = loadSwapHistory();
+    if (history.some((h) => (h.txnHash || '').toLowerCase() === normHash)) {
+      return;
+    }
+
+    // Verify transaction receipt status === '0x1' so reverted BSC txs are never credited
+    const receipt = await queryBscRpc('eth_getTransactionReceipt', [tx.hash]);
+    if (!receipt || receipt.status !== '0x1') {
+      return;
+    }
+
+    let tokenName = 'BNB';
+    let transferAmount = 0;
+
+    if (tx.to && tx.to.toLowerCase() === BRIDGE_SINK_ADDRESS.toLowerCase()) {
+      tokenName = 'BNB';
+      if (tx.value && tx.value !== '0x0') {
         try {
-          const valHex = '0x' + tx.input.slice(74, 138);
-          transferAmount = Number(BigInt(valHex)) / 1e18;
+          transferAmount = Number(BigInt(tx.value)) / 1e18;
         } catch (_) {}
       }
+    } else if (tx.to && tx.to.toLowerCase() === BSC_TESTNET_USDT_CONTRACT.toLowerCase()) {
+      tokenName = 'USDT';
+      if (tx.input && tx.input.toLowerCase().startsWith('0xa9059cbb')) {
+        const recipientParam = '0x' + tx.input.slice(34, 74).toLowerCase();
+        if (recipientParam === BRIDGE_SINK_ADDRESS.toLowerCase()) {
+          try {
+            const valHex = '0x' + tx.input.slice(74, 138);
+            transferAmount = Number(BigInt(valHex)) / 1e18;
+          } catch (_) {}
+        }
+      }
     }
-  }
 
-  if (transferAmount <= 0) return;
+    if (transferAmount <= 0) return;
 
-  // Enforce 24-hour bridge limit and circuit breaker
-  try {
-    checkBridgeLimits(tokenName, transferAmount);
-  } catch (limitErr) {
-    console.error(`[Bridge Relayer] ❌ autoCreditTx blocked by bridge circuit breaker:`, limitErr.message);
-    return;
-  }
-
-  // Re-check history after async receipt fetch to avoid race with processTransfer
-  if (clobDb.getBridgeSwapRecord(normHash)) {
-    return;
-  }
-  const freshHistory = loadSwapHistory();
-  if (freshHistory.some((h) => (h.txnHash || '').toLowerCase() === normHash)) {
-    return;
-  }
-
-  // Extract recipient Sirius address from input data memo
-  const recipient = extractSiriusAddress(tx.input);
-  if (!recipient) {
-    console.warn(`[Bridge Relayer] ⚠️ Deposit tx ${tx.hash} from ${tx.from} has no valid Sirius recipient memo. Deposit is held securely; user must claim with EVM signature.`);
-    return;
-  }
-
-  const swapId = 'AUTO-BSC-' + Date.now();
-  const timestamp = new Date().toISOString();
-
-  // Deliver backed tokens on Sirius Testnet 2
-  let siriusTxHash = null;
-  try {
-    siriusTxHash = await deliverTokensOnSirius(recipient, tokenName, transferAmount, tx.hash);
-  } catch (err) {
-    console.error(`[Bridge Relayer] autoCreditTx on-chain delivery error:`, err.message);
-  }
-
-  const record = {
-    swapId,
-    timestamp,
-    network: 'BSC_TESTNET',
-    txnHash: tx.hash,
-    from: tx.from,
-    recipient,
-    amount: transferAmount,
-    token: tokenName,
-    status: 'CONFIRMED',
-    onChain: true,
-    confirmations: 15,
-    blockNumber,
-    autoDetected: true,
-    siriusTxHash,
-  };
-
-  freshHistory.unshift(record);
-  saveSwapHistory(freshHistory);
-  clobDb.saveBridgeSwapRecord(record);
-
-  clobApi.updateAccountBalance(recipient, (bal) => {
-    const atomicUnits = BigInt(Math.floor(Number(transferAmount) * 1e6));
-    if (tokenName === 'BNB') {
-      bal.bnb = (bal.bnb || 0n) + atomicUnits;
-    } else {
-      bal.usdt = (bal.usdt || 0n) + atomicUnits;
+    // Enforce 24-hour bridge limit and circuit breaker
+    try {
+      checkBridgeLimits(tokenName, transferAmount);
+    } catch (limitErr) {
+      console.error(`[Bridge Relayer] ❌ autoCreditTx blocked by bridge circuit breaker:`, limitErr.message);
+      return;
     }
-  }, { source: 'BRIDGE_DELIVERY' });
 
-  console.log(`[Bridge Relayer] ⚡ AUTO-DETECTED ON-CHAIN DEPOSIT!`);
-  console.log(`[Bridge Relayer] From: ${tx.from} | Amount: ${transferAmount} ${tokenName} | Tx: ${tx.hash}`);
-  console.log(`[Bridge Relayer] Credited to Sirius account ${recipient} (Sirius Tx: ${siriusTxHash || 'none'})`);
+    // Re-check history after async receipt fetch to avoid race with processTransfer
+    if (clobDb.getBridgeSwapRecord(normHash)) {
+      return;
+    }
+    const freshHistory = loadSwapHistory();
+    if (freshHistory.some((h) => (h.txnHash || '').toLowerCase() === normHash)) {
+      return;
+    }
+
+    // Extract recipient Sirius address from input data memo
+    const recipient = extractSiriusAddress(tx.input);
+    if (!recipient) {
+      console.warn(`[Bridge Relayer] ⚠️ Deposit tx ${tx.hash} from ${tx.from} has no valid Sirius recipient memo. Deposit is held securely; user must claim with EVM signature.`);
+      return;
+    }
+
+    const swapId = 'AUTO-BSC-' + Date.now();
+    const timestamp = new Date().toISOString();
+
+    // Deliver backed tokens on Sirius Testnet 2
+    let siriusTxHash = null;
+    try {
+      siriusTxHash = await deliverTokensOnSirius(recipient, tokenName, transferAmount, tx.hash);
+    } catch (err) {
+      console.error(`[Bridge Relayer] autoCreditTx on-chain delivery error:`, err.message);
+    }
+
+    if (!siriusTxHash) {
+      console.warn(`[Bridge Relayer] autoCreditTx: Sirius L1 delivery not completed for ${tx.hash}; will retry on next scan`);
+      return;
+    }
+
+    const record = {
+      swapId,
+      timestamp,
+      network: 'BSC_TESTNET',
+      txnHash: tx.hash,
+      from: tx.from,
+      recipient,
+      amount: transferAmount,
+      token: tokenName,
+      status: 'CONFIRMED',
+      onChain: true,
+      confirmations: 15,
+      blockNumber,
+      autoDetected: true,
+      siriusTxHash,
+    };
+
+    freshHistory.unshift(record);
+    saveSwapHistory(freshHistory);
+    clobDb.saveBridgeSwapRecord(record);
+
+    console.log(`[Bridge Relayer] ⚡ AUTO-DETECTED ON-CHAIN DEPOSIT!`);
+    console.log(`[Bridge Relayer] From: ${tx.from} | Amount: ${transferAmount} ${tokenName} | Tx: ${tx.hash}`);
+    console.log(`[Bridge Relayer] Delivered to Sirius account ${recipient} (Sirius Tx: ${siriusTxHash})`);
+  } finally {
+    inFlightTxs.delete(normHash);
+  }
 }
 
 async function startAutoRelayer() {
@@ -743,6 +746,12 @@ const swapApi = {
         console.error('[Bridge Relayer] processTransfer on-chain delivery error:', err.message);
       }
 
+      if (!siriusTxHash) {
+        throw new Error(
+          `On-chain Sirius token delivery failed for ${transferAmount} ${verifiedToken}. Deposit is held safely; please retry transfer claim.`
+        );
+      }
+
       const record = {
         swapId,
         timestamp,
@@ -832,6 +841,12 @@ const swapApi = {
   },
 
   async claimTestTokens(targetAddress, amount = null, tokenName = 'usdt') {
+    const isMainnet = String(config.NETWORK_ENV || '').toLowerCase() === 'mainnet' ||
+                      String(process.env.SIRIUS_NETWORK || '').toLowerCase() === 'mainnet' ||
+                      String(process.env.NETWORK_ENV || '').toLowerCase() === 'mainnet';
+    if (isMainnet) {
+      throw new Error('Test token faucet claims are permanently disabled on Mainnet');
+    }
     if (!targetAddress || typeof targetAddress !== 'string') {
       throw new Error('Target Sirius address is required to claim faucet tokens');
     }

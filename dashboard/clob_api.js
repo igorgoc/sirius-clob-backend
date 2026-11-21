@@ -79,16 +79,16 @@ async function withAccountLock(accountKeyHex, fn) {
   const key = String(accountKeyHex || 'global').toLowerCase();
   const prev = accountLocks.get(key) || Promise.resolve();
   let release;
-  const next = new Promise((resolve) => {
+  const current = new Promise((resolve) => {
     release = resolve;
   });
-  accountLocks.set(key, prev.then(() => next));
-  await prev;
+  accountLocks.set(key, current);
+  await prev.catch(() => {});
   try {
     return await fn();
   } finally {
     release();
-    if (accountLocks.get(key) === next) {
+    if (accountLocks.get(key) === current) {
       accountLocks.delete(key);
     }
   }
@@ -1593,11 +1593,11 @@ let clusterConsensusSeq = 0;
 async function withClusterConsensusLock(fn) {
   const prev = clusterConsensusQueue;
   let release;
-  const next = new Promise((resolve) => {
+  const current = new Promise((resolve) => {
     release = resolve;
   });
-  clusterConsensusQueue = prev.then(() => next);
-  await prev;
+  clusterConsensusQueue = current;
+  await prev.catch(() => {});
   try {
     return await fn(++clusterConsensusSeq);
   } finally {
@@ -1605,7 +1605,15 @@ async function withClusterConsensusLock(fn) {
   }
 }
 
+let customConsensusExecutor = null;
+function _setExecuteConsensusCallOverride(fn) {
+  customConsensusExecutor = fn;
+}
+
 async function executeConsensusCall(stageName, height, txHashHex, contractCallId, vmOptions = {}) {
+  if (customConsensusExecutor) {
+    return await customConsensusExecutor(stageName, height, txHashHex, contractCallId, vmOptions);
+  }
   const tCons0 = Date.now();
   return withClusterConsensusLock(async (seqNo) => {
     const tLock = Date.now();
@@ -1980,19 +1988,19 @@ async function syncAndGetAccountBalance(publicKeyOrAddr) {
   const lockedUsdt = BigInt(currentEntry.lockedUsdt || 0n);
   const lockedBnb = BigInt(currentEntry.lockedBnb || 0n);
 
-  // All coins in the wallet are immediately available for trading (minus currently locked in orders)
-  // Reconciled with on-chain wallet backing and SuperContract drive state
+  // Reconciled strictly between verified deposit ledger and SuperContract drive state
+  // External un-deposited wallet balances on Catapult L1 are never double-counted to prevent vault draining
   const rawLocalXpx = BigInt(currentEntry.xpx || 0n);
   const rawLocalUsdt = BigInt(currentEntry.usdt || 0n);
   const rawLocalBnb = BigInt(currentEntry.bnb || 0n);
 
-  const backingXpx = BigInt(onChainXpx || 0n) + BigInt(driveBal.xpx || 0n);
-  const backingUsdt = BigInt(onChainUsdt || 0n) + BigInt(driveBal.usdt || 0n);
-  const backingBnb = BigInt(onChainBnb || 0n) + BigInt(driveBal.bnb || 0n);
+  const driveXpx = BigInt(driveBal.xpx || 0n);
+  const driveUsdt = BigInt(driveBal.usdt || 0n);
+  const driveBnb = BigInt(driveBal.bnb || 0n);
 
-  const totalXpx = rawLocalXpx > backingXpx ? rawLocalXpx : backingXpx;
-  const totalUsdt = rawLocalUsdt > backingUsdt ? rawLocalUsdt : backingUsdt;
-  const totalBnb = rawLocalBnb > backingBnb ? rawLocalBnb : backingBnb;
+  const totalXpx = rawLocalXpx > driveXpx ? rawLocalXpx : driveXpx;
+  const totalUsdt = rawLocalUsdt > driveUsdt ? rawLocalUsdt : driveUsdt;
+  const totalBnb = rawLocalBnb > driveBnb ? rawLocalBnb : driveBnb;
 
   const availXpx = totalXpx > lockedXpx ? (totalXpx - lockedXpx) : 0n;
   const availUsdt = totalUsdt > lockedUsdt ? (totalUsdt - lockedUsdt) : 0n;
@@ -3393,17 +3401,40 @@ async function _placeOrderUnlocked(orderReq) {
   const contractCallId = Math.floor(Math.random() * 90000) + 10000;
 
   // Execute across all 3 nodes simultaneously with self-healing consensus
-  const results = await executeConsensusCall(
-    'Web Wallet Order Placement',
-    currentHeight + 1,
-    txHashHex,
-    contractCallId,
-    {
-      parameters: callParams,
-      callerKeyHex: callerKey,
-      servicePayments,
-    }
-  );
+  let results;
+  try {
+    results = await executeConsensusCall(
+      'Web Wallet Order Placement',
+      currentHeight + 1,
+      txHashHex,
+      contractCallId,
+      {
+        parameters: callParams,
+        callerKeyHex: callerKey,
+        servicePayments,
+      }
+    );
+  } catch (consensusErr) {
+    // Revert escrow on consensus/network failure
+    updateAccountBalance(callerKey, (b) => {
+      if (side === 0) {
+        if (isBnb) {
+          const toRefund = BigInt(b.lockedBnb || 0n) >= requiredQuote ? requiredQuote : BigInt(b.lockedBnb || 0n);
+          b.bnb = BigInt(b.bnb || 0n) + toRefund;
+          b.lockedBnb = BigInt(b.lockedBnb || 0n) - toRefund;
+        } else {
+          const toRefund = BigInt(b.lockedUsdt || 0n) >= requiredQuote ? requiredQuote : BigInt(b.lockedUsdt || 0n);
+          b.usdt = BigInt(b.usdt || 0n) + toRefund;
+          b.lockedUsdt = BigInt(b.lockedUsdt || 0n) - toRefund;
+        }
+      } else {
+        const toRefund = BigInt(b.lockedXpx || 0n) >= requiredXpx ? requiredXpx : BigInt(b.lockedXpx || 0n);
+        b.xpx = BigInt(b.xpx || 0n) + toRefund;
+        b.lockedXpx = BigInt(b.lockedXpx || 0n) - toRefund;
+      }
+    }, { source: 'CONSENSUS_FAILURE_REFUND' });
+    throw consensusErr;
+  }
   const tCons = Date.now();
   const ret = results[0].returns;
 
@@ -3918,7 +3949,10 @@ async function _cancelAllOrdersUnlocked(cancelAllReq) {
  * Faucet Claim: Broadcasts real on-chain Sirius Testnet 2 transfer of XPX (gas) + USDT (collateral)
  */
 async function claimFaucet(publicKey, addressOverride = null) {
-  if (String(testnet2Config.NETWORK_ENV || '').toLowerCase() === 'mainnet') {
+  const isMainnet = String(testnet2Config.NETWORK_ENV || '').toLowerCase() === 'mainnet' ||
+                    String(process.env.SIRIUS_NETWORK || '').toLowerCase() === 'mainnet' ||
+                    String(process.env.NETWORK_ENV || '').toLowerCase() === 'mainnet';
+  if (isMainnet) {
     throw new Error('Faucet claims are permanently disabled on Mainnet');
   }
   const callerKey = normalizeKey(publicKey).toLowerCase();
@@ -4423,17 +4457,26 @@ async function _withdrawTokensUnlocked(withdrawReq) {
   }
 
   // Execute across all 3 nodes simultaneously with BFT self-healing (debits canonical drive ledger)
-  const results = await executeConsensusCall(
-    'Web Wallet Withdrawal',
-    currentHeight + 1,
-    txHashHex,
-    contractCallId,
-    {
-      parameters: callParams,
-      callerKeyHex: callerKey,
-      servicePayments: withdrawServicePayments,
-    }
-  );
+  let results;
+  try {
+    results = await executeConsensusCall(
+      'Web Wallet Withdrawal',
+      currentHeight + 1,
+      txHashHex,
+      contractCallId,
+      {
+        parameters: callParams,
+        callerKeyHex: callerKey,
+        servicePayments: withdrawServicePayments,
+      }
+    );
+  } catch (consErr) {
+    record.status = 'failed';
+    record.failedAt = Date.now();
+    record.error = `SuperContract consensus failed: ${consErr.message}`;
+    saveWithdrawals();
+    throw consErr;
+  }
   const ret = results[0].returns;
 
   if (ret.return_val !== 0) {
@@ -4887,4 +4930,6 @@ module.exports = {
   startSolvencySentinel,
   WITHDRAWAL_FEES,
   getWithdrawalFee,
+  withAccountLock,
+  _setExecuteConsensusCallOverride,
 };

@@ -11,3 +11,10 @@ cluster/*.db-shm
 cluster/*.key
 cluster/node*/data/drives/*/sandbox/
 contracts/clob/target
+.env
+.env.*
+*.env
+cluster/*_mainnet*.json
+cluster/mainnet_*.json
+cluster/prod_*.json
+cluster/*_prod*.json
