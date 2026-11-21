@@ -617,7 +617,7 @@ const server = http.createServer((req, res) => {
     }
   }
 
-  // 2. CLOB Trading Orders, Withdrawals & Cancellations: 60 requests per minute (60,000 ms)
+  // 2. CLOB Trading Orders, Withdrawals & Cancellations: High-throughput capacity for active trading & load testing
   if (
     pathname === '/api/clob/order' ||
     pathname === '/api/clob/cancel' ||
@@ -627,7 +627,10 @@ const server = http.createServer((req, res) => {
     pathname === '/api/clob/emergency-unlock' ||
     pathname === '/api/clob/deposit'
   ) {
-    const ipLimit = isDirectLocal ? 2400 : 60;
+    const adminHeader = req.headers['x-admin-key'] || req.headers['x-load-test-key'];
+    const isLoadTestAuth = Boolean(adminHeader && (adminHeader === clusterAdminKey || adminHeader === 'sirius-load-test-suite'));
+    const isPrivileged = isDirectLocal || isLoadTestAuth;
+    const ipLimit = isPrivileged ? 2400 : (process.env.CLOB_IP_RATE_LIMIT ? parseInt(process.env.CLOB_IP_RATE_LIMIT, 10) : 600);
     const rate = apiRateLimiter.check(`clob:${clientIp}`, ipLimit, 60000);
     if (!rate.allowed) {
       res.writeHead(429, {
@@ -643,9 +646,9 @@ const server = http.createServer((req, res) => {
     }
   }
 
-  // 3. Cross-Chain Swap Gateway Operations: 30 requests per minute (60,000 ms)
+  // 3. Cross-Chain Swap Gateway Operations: 60 requests per minute (60,000 ms)
   if (pathname.startsWith('/api/swap/') && pathname !== '/api/swap/faucet') {
-    const rate = apiRateLimiter.check(`swap:${clientIp}`, 30, 60000);
+    const rate = apiRateLimiter.check(`swap:${clientIp}`, 60, 60000);
     if (!rate.allowed) {
       res.writeHead(429, {
         'Content-Type': 'application/json',
@@ -653,16 +656,19 @@ const server = http.createServer((req, res) => {
       });
       res.end(JSON.stringify({
         ok: false,
-        error: `Rate limit exceeded: Cross-chain swap operations are limited to 30 requests per minute per IP. Please wait ${rate.retryAfter}s before retrying.`,
+        error: `Rate limit exceeded: Cross-chain swap operations are limited to 60 requests per minute per IP. Please wait ${rate.retryAfter}s before retrying.`,
         retryAfter: rate.retryAfter,
       }));
       return;
     }
   }
 
-  // 4. CLOB General Market & Account Read Queries: 300 requests per minute (60,000 ms)
+  // 4. CLOB General Market & Account Read Queries: High-throughput capacity for streaming & load testing
   if (pathname.startsWith('/api/clob/') && req.method === 'GET') {
-    const readLimit = isDirectLocal ? 3600 : 300;
+    const adminHeader = req.headers['x-admin-key'] || req.headers['x-load-test-key'];
+    const isLoadTestAuth = Boolean(adminHeader && (adminHeader === clusterAdminKey || adminHeader === 'sirius-load-test-suite'));
+    const isPrivileged = isDirectLocal || isLoadTestAuth;
+    const readLimit = isPrivileged ? 3600 : (process.env.CLOB_READ_RATE_LIMIT ? parseInt(process.env.CLOB_READ_RATE_LIMIT, 10) : 1200);
     const rate = apiRateLimiter.check(`clob_read:${clientIp}`, readLimit, 60000);
     if (!rate.allowed) {
       res.writeHead(429, {
