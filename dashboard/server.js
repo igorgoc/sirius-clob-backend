@@ -139,6 +139,99 @@ function enrichTradeWithTimestamp(t, idx, totalLen, market = 'xpx_usdt') {
   };
 }
 
+let cachedPancakeOracle = null;
+let lastPancakeOracleFetch = 0;
+
+async function getPancakeSwapPriceCached() {
+  const now = Date.now();
+  if (cachedPancakeOracle && (now - lastPancakeOracleFetch < 15000)) {
+    return cachedPancakeOracle;
+  }
+
+  const pairAddress = '0x439B8E49F2b0d9C9824d5AB641D677511f362dA5';
+  try {
+    const { ethers } = require('ethers');
+    const provider = new ethers.JsonRpcProvider('https://bsc-dataseed.binance.org/', undefined, { staticNetwork: true });
+    const pairAbi = [
+      'function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)',
+      'function token0() external view returns (address)'
+    ];
+    const pair = new ethers.Contract(pairAddress, pairAbi, provider);
+
+    const [token0, reserves] = await Promise.all([
+      pair.token0(),
+      pair.getReserves()
+    ]);
+
+    const isXpx0 = token0.toLowerCase() === '0x6f3aaf802f57d045efdd2ac9c06d8879305542af'.toLowerCase();
+    const xpxReserve = isXpx0 ? Number(reserves[0]) / 1e6 : Number(reserves[1]) / 1e6;
+    const bnbReserve = isXpx0 ? Number(reserves[1]) / 1e18 : Number(reserves[0]) / 1e18;
+    const priceBnbPerXpx = bnbReserve / xpxReserve;
+
+    let bnbUsd = 550;
+    try {
+      const resDex = await fetch('https://api.dexscreener.com/latest/dex/pairs/bsc/' + pairAddress, { signal: AbortSignal.timeout(3000) }).then(r => r.json());
+      if (resDex && resDex.pair && resDex.pair.priceUsd) {
+        cachedPancakeOracle = {
+          ok: true,
+          source: 'PancakeSwap V2 (BSC On-Chain + DexScreener)',
+          pairAddress,
+          baseToken: 'XPX',
+          quoteToken: 'WBNB',
+          xpxReserve,
+          bnbReserve,
+          priceBnb: priceBnbPerXpx,
+          priceUsdt: parseFloat(resDex.pair.priceUsd),
+          liquidityUsd: resDex.pair.liquidity ? resDex.pair.liquidity.usd : (bnbReserve * bnbUsd * 2),
+          volume24hUsd: resDex.pair.volume ? resDex.pair.volume.h24 : 0,
+          priceChange24h: resDex.pair.priceChange ? resDex.pair.priceChange.h24 : 0,
+          timestamp: now
+        };
+        lastPancakeOracleFetch = now;
+        return cachedPancakeOracle;
+      }
+    } catch (_) {}
+
+    cachedPancakeOracle = {
+      ok: true,
+      source: 'PancakeSwap V2 (BSC On-Chain)',
+      pairAddress,
+      baseToken: 'XPX',
+      quoteToken: 'WBNB',
+      xpxReserve,
+      bnbReserve,
+      priceBnb: priceBnbPerXpx,
+      priceUsdt: priceBnbPerXpx * bnbUsd,
+      timestamp: now
+    };
+    lastPancakeOracleFetch = now;
+    return cachedPancakeOracle;
+  } catch (err) {
+    try {
+      const resDex = await fetch('https://api.dexscreener.com/latest/dex/pairs/bsc/' + pairAddress, { signal: AbortSignal.timeout(4000) }).then(r => r.json());
+      if (resDex && resDex.pair) {
+        const p = resDex.pair;
+        cachedPancakeOracle = {
+          ok: true,
+          source: 'DexScreener API (PancakeSwap V2 Failover)',
+          pairAddress: p.pairAddress,
+          baseToken: 'XPX',
+          quoteToken: 'WBNB',
+          priceBnb: parseFloat(p.priceNative || '0'),
+          priceUsdt: parseFloat(p.priceUsd || '0'),
+          liquidityUsd: p.liquidity ? p.liquidity.usd : 0,
+          volume24hUsd: p.volume ? p.volume.h24 : 0,
+          priceChange24h: p.priceChange ? p.priceChange.h24 : 0,
+          timestamp: now
+        };
+        lastPancakeOracleFetch = now;
+        return cachedPancakeOracle;
+      }
+    } catch (_) {}
+    throw err;
+  }
+}
+
 function parseJsonBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
@@ -1210,6 +1303,95 @@ const server = http.createServer((req, res) => {
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end('[]');
+    return;
+  }
+
+  // SiriusCLOB DEX Endpoint: Historical OHLCV Candles (from Replicator Drive Trades)
+  if (pathname === '/api/clob/candles' && req.method === 'GET') {
+    const market = sanitizeMarket(parsedUrl.searchParams.get('pair') || parsedUrl.searchParams.get('market'));
+    const intervalStr = (parsedUrl.searchParams.get('interval') || '15m').toLowerCase();
+    const intervalMinutes = intervalStr === '1m' ? 1 : (intervalStr === '5m' ? 5 : (intervalStr === '1h' ? 60 : (intervalStr === '1d' ? 1440 : 15)));
+    const intervalSec = intervalMinutes * 60;
+    const limit = Math.min(500, Math.max(10, parseInt(parsedUrl.searchParams.get('limit') || '200', 10)));
+
+    const DRIVE_KEY_HEX = 'bd1d100a98c34f62e170a8395b4498dc1e730286f5a12c489b37d01562f0cb23';
+    const tradesPath = path.join(CLUSTER_DIR, 'node1', 'data', 'drives', DRIVE_KEY_HEX, 'drive', 'markets', market, 'trades.json');
+
+    const defaultPrice = market === 'xpx_bnb' ? 0.00000840 : 0.006200;
+    const decimals = market === 'xpx_bnb' ? 8 : 6;
+
+    if (fs.existsSync(tradesPath)) {
+      try {
+        const raw = fs.readFileSync(tradesPath, 'utf8');
+        const rawTrades = JSON.parse(raw);
+        if (Array.isArray(rawTrades) && rawTrades.length > 0) {
+          const totalLen = rawTrades.length;
+          const enriched = rawTrades.map((t, idx) => {
+            const { timestamp } = enrichTradeWithTimestamp(t, idx, totalLen, market);
+            const price = Number(t.price || 0) / 1e8;
+            const amount = Number(t.base_amount || 0) / 1e6;
+            return { timestamp, price, amount };
+          }).sort((a, b) => a.timestamp - b.timestamp);
+
+          const buckets = new Map();
+          for (const t of enriched) {
+            const sec = Math.floor(t.timestamp / 1000);
+            const bucketKey = Math.floor(sec / intervalSec) * intervalSec;
+            if (!buckets.has(bucketKey)) {
+              buckets.set(bucketKey, {
+                time: bucketKey,
+                open: parseFloat(t.price.toFixed(decimals)),
+                high: parseFloat(t.price.toFixed(decimals)),
+                low: parseFloat(t.price.toFixed(decimals)),
+                close: parseFloat(t.price.toFixed(decimals)),
+                volume: parseFloat(t.amount.toFixed(2))
+              });
+            } else {
+              const b = buckets.get(bucketKey);
+              if (t.price > b.high) b.high = parseFloat(t.price.toFixed(decimals));
+              if (t.price < b.low) b.low = parseFloat(t.price.toFixed(decimals));
+              b.close = parseFloat(t.price.toFixed(decimals));
+              b.volume = parseFloat((b.volume + t.amount).toFixed(2));
+            }
+          }
+
+          let candles = Array.from(buckets.values()).sort((a, b) => a.time - b.time);
+          if (candles.length > limit) {
+            candles = candles.slice(-limit);
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, pair: market, interval: intervalStr, candles }));
+          return;
+        }
+      } catch (_) {}
+    }
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const bucketKey = Math.floor(nowSec / intervalSec) * intervalSec;
+    const fallbackCandle = {
+      time: bucketKey,
+      open: defaultPrice,
+      high: defaultPrice,
+      low: defaultPrice,
+      close: defaultPrice,
+      volume: 0
+    };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, pair: market, interval: intervalStr, candles: [fallbackCandle] }));
+    return;
+  }
+
+  // SiriusCLOB DEX Endpoint: PancakeSwap Real Spot Price Oracle (BSC On-Chain + DexScreener Fallback)
+  if (pathname === '/api/clob/oracle/pancakeswap' && req.method === 'GET') {
+    getPancakeSwapPriceCached()
+      .then((oracleData) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(oracleData));
+      })
+      .catch((e) => {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      });
     return;
   }
 
