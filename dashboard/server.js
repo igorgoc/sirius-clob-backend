@@ -11,6 +11,7 @@ const net = require('net');
 module.paths.push(path.resolve(__dirname, '../../web-wallet-vuejs/node_modules'));
 const { exec, execFile, spawn } = require('child_process');
 const clobApi = require('./clob_api');
+const clobDb = require('./clob_db');
 const swapApi = require('./swap_api');
 const { defaultBatchSettlerTestnet2: defaultBatchSettler } = require('./batch_settler_testnet2');
 const l1Config = require('./testnet2_config');
