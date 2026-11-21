@@ -1583,8 +1583,11 @@ async function withClusterConsensusLock(fn) {
 }
 
 async function executeConsensusCall(stageName, height, txHashHex, contractCallId, vmOptions = {}) {
+  const tCons0 = Date.now();
   return withClusterConsensusLock(async (seqNo) => {
+    const tLock = Date.now();
     ensureDriveSync();
+    const tSync = Date.now();
 
     const runPreparePhase = async () => {
       const settled = await Promise.allSettled(
@@ -1653,9 +1656,14 @@ async function executeConsensusCall(stageName, height, txHashHex, contractCallId
       }
     };
 
+    const tPrePrep = Date.now();
     let prepared = await runPreparePhase();
+    const tPostPrep = Date.now();
     try {
-      return finalizeTwoPhaseCommit(`${stageName}#seq${seqNo}`, prepared);
+      const finalized = finalizeTwoPhaseCommit(`${stageName}#seq${seqNo}`, prepared);
+      const tPostCommit = Date.now();
+      console.log(`[Consensus Profile] ${stageName}#seq${seqNo} | lockWait: ${tLock - tCons0}ms | ensureSync: ${tSync - tLock}ms | prepPhase: ${tPostPrep - tPrePrep}ms | commit: ${tPostCommit - tPostPrep}ms | total: ${tPostCommit - tCons0}ms`);
+      return finalized;
     } catch (err) {
       if (err.message && err.message.includes('Consensus divergence')) {
         console.warn(`[Self-Healing] Consensus divergence detected during ${stageName}#seq${seqNo}. Healing drives from 2/3 majority and retrying...`);
@@ -3090,6 +3098,7 @@ async function placeOrder(orderReq) {
 }
 
 async function _placeOrderUnlocked(orderReq) {
+  const tStart = Date.now();
   checkAndEnforceCircuitBreaker('Order Placement');
   const pair = (orderReq.pair || orderReq.market || 'XPX/USDT').toUpperCase().replace('_', '/');
   const pairParts = pair.split('/');
@@ -3154,6 +3163,7 @@ async function _placeOrderUnlocked(orderReq) {
   );
   verifyEd25519Signature(callerKey, orderMsg, orderReq.signature);
   checkAndRecordNonce(callerKey, orderReq.nonce, orderReq.expiry);
+  const tAuth = Date.now();
 
   // 1. Reconciliation check: Gateway cache == Canonical drive ledger per account/mosaic
   assertLedgerReconciliation(callerKey, baseMosaicId);
@@ -3168,8 +3178,10 @@ async function _placeOrderUnlocked(orderReq) {
     assertSolvencyReconciliation(baseMosaicId, true);
     assertSolvencyReconciliation(quoteMosaicId, true);
   }
+  const tSolv = Date.now();
 
   let userBal = await syncAndGetAccountBalance(callerKey);
+  const tBal = Date.now();
 
   const tickSize = isBnb ? 1n : 100n;
   let priceTicks = priceTicksRaw;
@@ -3305,6 +3317,7 @@ async function _placeOrderUnlocked(orderReq) {
       servicePayments,
     }
   );
+  const tCons = Date.now();
   const ret = results[0].returns;
 
   if (ret.return_val !== 0) {
@@ -3583,6 +3596,13 @@ async function _placeOrderUnlocked(orderReq) {
     payouts,
     settlementTxHash: onChainTxHash,
     balances: updatedBal,
+    latency: {
+      authMs: (typeof tAuth !== 'undefined' ? tAuth : Date.now()) - tStart,
+      solvMs: (typeof tSolv !== 'undefined' ? tSolv : Date.now()) - (typeof tAuth !== 'undefined' ? tAuth : tStart),
+      balMs: (typeof tBal !== 'undefined' ? tBal : Date.now()) - (typeof tSolv !== 'undefined' ? tSolv : tStart),
+      consensusMs: (typeof tCons !== 'undefined' ? tCons : Date.now()) - (typeof tBal !== 'undefined' ? tBal : tStart),
+      totalMs: Date.now() - tStart,
+    },
   };
 }
 
@@ -4009,6 +4029,7 @@ async function depositTokens(depositReq, options = {}) {
       servicePayments,
     }
   );
+  const tCons = Date.now();
   const ret = results[0].returns;
 
   if (ret.return_val !== 0) {

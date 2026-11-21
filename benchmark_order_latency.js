@@ -57,7 +57,8 @@ async function run() {
     ok: result.ok,
     orderId: result.orderId,
     status: result.status,
-    gasConsumed: result.gasConsumed
+    gasConsumed: result.gasConsumed,
+    serverLatency: result.latency,
   });
 
   // 3. Measure Order Cancellation
