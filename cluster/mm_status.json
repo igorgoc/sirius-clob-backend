@@ -2,12 +2,19 @@
   "running": false,
   "pid": null,
   "mode": "stopped",
-  "round": 267,
-  "totalTrades": 267,
-  "volumeXPX": 5340000000,
-  "volumeUSDT": 26946991,
-  "midPrice": 504560,
-  "spreadTicks": 2000,
+  "round": 2,
+  "totalTrades": 2,
+  "volumeXPX": 15000000,
+  "volumeUSDT": 375,
+  "volumeBNB": 2,
+  "markets": {
+    "xpx_usdt": {
+      "midPrice": 7700
+    },
+    "xpx_bnb": {
+      "midPrice": 15
+    }
+  },
   "lastAction": "Market Maker stopped",
-  "lastUpdate": 1795205013066
+  "lastUpdate": 1795287212135
 }

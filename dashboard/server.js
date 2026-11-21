@@ -139,98 +139,7 @@ function enrichTradeWithTimestamp(t, idx, totalLen, market = 'xpx_usdt') {
   };
 }
 
-let cachedPancakeOracle = null;
-let lastPancakeOracleFetch = 0;
-
-async function getPancakeSwapPriceCached() {
-  const now = Date.now();
-  if (cachedPancakeOracle && (now - lastPancakeOracleFetch < 15000)) {
-    return cachedPancakeOracle;
-  }
-
-  const pairAddress = '0x439B8E49F2b0d9C9824d5AB641D677511f362dA5';
-  try {
-    const { ethers } = require('ethers');
-    const provider = new ethers.JsonRpcProvider('https://bsc-dataseed.binance.org/', undefined, { staticNetwork: true });
-    const pairAbi = [
-      'function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)',
-      'function token0() external view returns (address)'
-    ];
-    const pair = new ethers.Contract(pairAddress, pairAbi, provider);
-
-    const [token0, reserves] = await Promise.all([
-      pair.token0(),
-      pair.getReserves()
-    ]);
-
-    const isXpx0 = token0.toLowerCase() === '0x6f3aaf802f57d045efdd2ac9c06d8879305542af'.toLowerCase();
-    const xpxReserve = isXpx0 ? Number(reserves[0]) / 1e6 : Number(reserves[1]) / 1e6;
-    const bnbReserve = isXpx0 ? Number(reserves[1]) / 1e18 : Number(reserves[0]) / 1e18;
-    const priceBnbPerXpx = bnbReserve / xpxReserve;
-
-    let bnbUsd = 550;
-    try {
-      const resDex = await fetch('https://api.dexscreener.com/latest/dex/pairs/bsc/' + pairAddress, { signal: AbortSignal.timeout(3000) }).then(r => r.json());
-      if (resDex && resDex.pair && resDex.pair.priceUsd) {
-        cachedPancakeOracle = {
-          ok: true,
-          source: 'PancakeSwap V2 (BSC On-Chain + DexScreener)',
-          pairAddress,
-          baseToken: 'XPX',
-          quoteToken: 'WBNB',
-          xpxReserve,
-          bnbReserve,
-          priceBnb: priceBnbPerXpx,
-          priceUsdt: parseFloat(resDex.pair.priceUsd),
-          liquidityUsd: resDex.pair.liquidity ? resDex.pair.liquidity.usd : (bnbReserve * bnbUsd * 2),
-          volume24hUsd: resDex.pair.volume ? resDex.pair.volume.h24 : 0,
-          priceChange24h: resDex.pair.priceChange ? resDex.pair.priceChange.h24 : 0,
-          timestamp: now
-        };
-        lastPancakeOracleFetch = now;
-        return cachedPancakeOracle;
-      }
-    } catch (_) {}
-
-    cachedPancakeOracle = {
-      ok: true,
-      source: 'PancakeSwap V2 (BSC On-Chain)',
-      pairAddress,
-      baseToken: 'XPX',
-      quoteToken: 'WBNB',
-      xpxReserve,
-      bnbReserve,
-      priceBnb: priceBnbPerXpx,
-      priceUsdt: priceBnbPerXpx * bnbUsd,
-      timestamp: now
-    };
-    lastPancakeOracleFetch = now;
-    return cachedPancakeOracle;
-  } catch (err) {
-    try {
-      const resDex = await fetch('https://api.dexscreener.com/latest/dex/pairs/bsc/' + pairAddress, { signal: AbortSignal.timeout(4000) }).then(r => r.json());
-      if (resDex && resDex.pair) {
-        const p = resDex.pair;
-        cachedPancakeOracle = {
-          ok: true,
-          source: 'DexScreener API (PancakeSwap V2 Failover)',
-          pairAddress: p.pairAddress,
-          baseToken: 'XPX',
-          quoteToken: 'WBNB',
-          priceBnb: parseFloat(p.priceNative || '0'),
-          priceUsdt: parseFloat(p.priceUsd || '0'),
-          liquidityUsd: p.liquidity ? p.liquidity.usd : 0,
-          volume24hUsd: p.volume ? p.volume.h24 : 0,
-          priceChange24h: p.priceChange ? p.priceChange.h24 : 0,
-          timestamp: now
-        };
-        lastPancakeOracleFetch = now;
-        return cachedPancakeOracle;
-      }
-    } catch (_) {}
-    throw err;
-  }
-}
+const { getPancakeSwapPriceCached, getCachedPancakeSwapPriceSync } = require('./pancakeswap_oracle');
 
 function parseJsonBody(req) {
   return new Promise((resolve, reject) => {
@@ -1317,7 +1226,12 @@ const server = http.createServer((req, res) => {
     const DRIVE_KEY_HEX = 'bd1d100a98c34f62e170a8395b4498dc1e730286f5a12c489b37d01562f0cb23';
     const tradesPath = path.join(CLUSTER_DIR, 'node1', 'data', 'drives', DRIVE_KEY_HEX, 'drive', 'markets', market, 'trades.json');
 
-    const defaultPrice = market === 'xpx_bnb' ? 0.00000840 : 0.006200;
+    const cachedOracle = getCachedPancakeSwapPriceSync();
+    let defaultPrice = market === 'xpx_bnb' ? 0.00000014 : 0.000076;
+    if (cachedOracle) {
+      if (market === 'xpx_bnb' && cachedOracle.priceBnb) defaultPrice = cachedOracle.priceBnb;
+      if (market === 'xpx_usdt' && cachedOracle.priceUsdt) defaultPrice = cachedOracle.priceUsdt;
+    }
     const decimals = market === 'xpx_bnb' ? 8 : 6;
 
     if (fs.existsSync(tradesPath)) {
@@ -3193,5 +3107,33 @@ server.listen(PORT, HOST, () => {
     });
   } catch (err) {
     console.warn('[Deposit Indexer] Could not start auto indexer:', err.message);
+  }
+
+  // Start autonomous PancakeSwap AMM Liquidity Mirror Market Maker
+  if (process.env.ENABLE_AUTONOMOUS_MM !== 'false') {
+    try {
+      const mmPidFile = path.join(CLUSTER_DIR, 'mm.pid');
+      let shouldStart = true;
+      if (fs.existsSync(mmPidFile)) {
+        try {
+          const oldPid = parseInt(fs.readFileSync(mmPidFile, 'utf8').trim(), 10);
+          process.kill(oldPid, 0);
+          shouldStart = false; // already running
+        } catch (_) {}
+      }
+      if (shouldStart) {
+        const logFile = fs.openSync(path.join(CLUSTER_DIR, 'mm.log'), 'a');
+        const child = spawn('node', [path.join(ROOT_DIR, 'scripts/clob_market_maker.js'), '--daemon'], {
+          detached: true,
+          stdio: ['ignore', logFile, logFile],
+          cwd: ROOT_DIR
+        });
+        child.unref();
+        fs.writeFileSync(mmPidFile, String(child.pid));
+        console.log(`[Market Maker] Autonomous PancakeSwap Liquidity Mirror started (PID ${child.pid})`);
+      }
+    } catch (err) {
+      console.warn('[Market Maker] Could not auto-start MM bot:', err.message);
+    }
   }
 });

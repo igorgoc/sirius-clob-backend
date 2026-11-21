@@ -9,4 +9,5 @@ cluster/*.pid
 cluster/*.db-wal
 cluster/*.db-shm
 cluster/*.key
+cluster/node*/data/drives/*/sandbox/
 contracts/clob/target
