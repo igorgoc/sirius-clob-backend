@@ -716,16 +716,20 @@ const swapApi = {
           throw new Error('Transaction has no embedded Sirius address memo; explicit recipient address required');
         }
         const normClaimRecipient = claimRecipient.replace(/-/g, '').trim().toUpperCase();
-        if (signature) {
-          const expectedMessage = `Claim Bridge Deposit ${normHash} to Sirius ${normClaimRecipient}`;
-          const recoveredSigner = verifyEvmSignature(expectedMessage, signature);
-          if (!recoveredSigner || recoveredSigner.toLowerCase() !== onChainResult.from.toLowerCase()) {
-            // Also try case-insensitive or raw hash variant
-            const altMsg = `Claim Bridge Deposit ${txnHash} to Sirius ${claimRecipient}`;
-            const altSigner = verifyEvmSignature(altMsg, signature);
-            if (!altSigner || altSigner.toLowerCase() !== onChainResult.from.toLowerCase()) {
-              throw new Error(`EVM signature verification failed: recovered ${recoveredSigner || 'null'} does not match on-chain sender ${onChainResult.from}`);
-            }
+        if (!signature) {
+          throw new Error(
+            `Authentication required: Transaction ${txnHash} does not contain an embedded Sirius recipient address memo. ` +
+            `To prevent deposit theft, an EVM signature from the sender wallet (${onChainResult.from}) is strictly required to claim this deposit.`
+          );
+        }
+        const expectedMessage = `Claim Bridge Deposit ${normHash} to Sirius ${normClaimRecipient}`;
+        const recoveredSigner = verifyEvmSignature(expectedMessage, signature);
+        if (!recoveredSigner || recoveredSigner.toLowerCase() !== onChainResult.from.toLowerCase()) {
+          // Also try case-insensitive or raw hash variant
+          const altMsg = `Claim Bridge Deposit ${txnHash} to Sirius ${claimRecipient}`;
+          const altSigner = verifyEvmSignature(altMsg, signature);
+          if (!altSigner || altSigner.toLowerCase() !== onChainResult.from.toLowerCase()) {
+            throw new Error(`EVM signature verification failed: recovered ${recoveredSigner || 'null'} does not match on-chain sender ${onChainResult.from}`);
           }
         }
         targetRecipient = normClaimRecipient;

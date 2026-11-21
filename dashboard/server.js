@@ -524,10 +524,17 @@ function isDirectLocalhost(req) {
 }
 
 function isTelemetryAllowed(req) {
-  if (process.env.ALLOW_PUBLIC_COCKPIT !== 'false') {
+  const adminHeader = req.headers['x-admin-key'] || '';
+  if (adminHeader && adminHeader.trim() === getOrInitAdminKey()) {
     return true;
   }
-  return isDirectLocalhost(req);
+  if (process.env.NODE_ENV === 'production') {
+    return false;
+  }
+  if (process.env.ALLOW_PUBLIC_COCKPIT === 'false') {
+    return isDirectLocalhost(req);
+  }
+  return true;
 }
 
 // In-Memory Sliding Window Rate Limiter
@@ -630,7 +637,10 @@ const server = http.createServer((req, res) => {
     pathname === '/api/clob/deposit'
   ) {
     const adminHeader = req.headers['x-admin-key'] || req.headers['x-load-test-key'];
-    const isLoadTestAuth = Boolean(adminHeader && (adminHeader === clusterAdminKey || adminHeader === 'sirius-load-test-suite'));
+    const isLoadTestAuth = Boolean(
+      adminHeader &&
+      (adminHeader === clusterAdminKey || (process.env.NODE_ENV !== 'production' && adminHeader === 'sirius-load-test-suite'))
+    );
     const isPrivileged = isDirectLocal || isLoadTestAuth;
     const ipLimit = isPrivileged ? 2400 : (process.env.CLOB_IP_RATE_LIMIT ? parseInt(process.env.CLOB_IP_RATE_LIMIT, 10) : 600);
     const rate = apiRateLimiter.check(`clob:${clientIp}`, ipLimit, 60000);
@@ -668,7 +678,10 @@ const server = http.createServer((req, res) => {
   // 4. CLOB General Market & Account Read Queries: High-throughput capacity for streaming & load testing
   if (pathname.startsWith('/api/clob/') && req.method === 'GET') {
     const adminHeader = req.headers['x-admin-key'] || req.headers['x-load-test-key'];
-    const isLoadTestAuth = Boolean(adminHeader && (adminHeader === clusterAdminKey || adminHeader === 'sirius-load-test-suite'));
+    const isLoadTestAuth = Boolean(
+      adminHeader &&
+      (adminHeader === clusterAdminKey || (process.env.NODE_ENV !== 'production' && adminHeader === 'sirius-load-test-suite'))
+    );
     const isPrivileged = isDirectLocal || isLoadTestAuth;
     const readLimit = isPrivileged ? 3600 : (process.env.CLOB_READ_RATE_LIMIT ? parseInt(process.env.CLOB_READ_RATE_LIMIT, 10) : 1200);
     const rate = apiRateLimiter.check(`clob_read:${clientIp}`, readLimit, 60000);
@@ -2652,6 +2665,15 @@ function getDashboardHtml() {
   </div>
 
   <script>
+    function esc(s) {
+      if (s === null || s === undefined) return '';
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
     let activeNode = 'exchange';
     let autoScroll = true;
     let lastLogByNode = {};
@@ -2795,12 +2817,12 @@ function getDashboardHtml() {
       if (d.recentTrades && d.recentTrades.length > 0) {
         tb.innerHTML = d.recentTrades.map(t => \`
           <tr>
-            <td style="color: var(--text-muted); font-variant-numeric: tabular-nums;" title="\${t.timestamp ? new Date(t.timestamp).toLocaleString() : ''}">\${t.time}</td>
-            <td style="font-weight: 700;">\${t.pair}</td>
-            <td class="\${t.side === 'Buy' ? 'badge-buy' : 'badge-sell'}">\${t.side.toUpperCase()}</td>
-            <td>$\${t.price}</td>
-            <td>\${t.amount} XPX</td>
-            <td style="color: var(--text-muted);">\${t.fee} XPX</td>
+            <td style="color: var(--text-muted); font-variant-numeric: tabular-nums;" title="\${esc(t.timestamp ? new Date(t.timestamp).toLocaleString() : '')}">\${esc(t.time)}</td>
+            <td style="font-weight: 700;">\${esc(t.pair)}</td>
+            <td class="\${t.side === 'Buy' ? 'badge-buy' : 'badge-sell'}">\${esc((t.side || '').toUpperCase())}</td>
+            <td>$\${esc(t.price)}</td>
+            <td>\${esc(t.amount)} XPX</td>
+            <td style="color: var(--text-muted);">\${esc(t.fee)} XPX</td>
           </tr>
         \`).join('');
       } else {
@@ -2836,16 +2858,16 @@ function getDashboardHtml() {
           if (d.fees.recent && d.fees.recent.length > 0) {
             fb.innerHTML = d.fees.recent.map(f => \`
               <tr>
-                <td style="color: var(--text-muted); font-variant-numeric: tabular-nums;" title="\${f.timestamp ? new Date(f.timestamp).toLocaleString() : ''}">\${f.time}</td>
+                <td style="color: var(--text-muted); font-variant-numeric: tabular-nums;" title="\${esc(f.timestamp ? new Date(f.timestamp).toLocaleString() : '')}">\${esc(f.time)}</td>
                 <td>
                   <span class="pill \${f.type === 'WITHDRAWAL' ? 'pill-purple' : (f.type === 'TRADE_TAKER' ? 'pill-blue' : 'pill-green')}" style="font-size: 10px;">
-                    \${f.type}
+                    \${esc(f.type)}
                   </span>
                 </td>
-                <td style="font-weight: 700;">\${f.mosaic}</td>
-                <td style="text-align: right; color: #38bdf8; font-weight: 700;">+\${f.amount} \${f.mosaic}</td>
-                <td style="color: var(--text-muted); font-family: monospace; font-size: 11px;">\${f.referenceId || '—'}</td>
-                <td style="color: var(--text-muted); font-family: monospace; font-size: 11px;">\${f.callerKey || 'Exchange'}</td>
+                <td style="font-weight: 700;">\${esc(f.mosaic)}</td>
+                <td style="text-align: right; color: #38bdf8; font-weight: 700;">+\${esc(f.amount)} \${esc(f.mosaic)}</td>
+                <td style="color: var(--text-muted); font-family: monospace; font-size: 11px;">\${esc(f.referenceId || '—')}</td>
+                <td style="color: var(--text-muted); font-family: monospace; font-size: 11px;">\${esc(f.callerKey || 'Exchange')}</td>
               </tr>
             \`).join('');
           } else {

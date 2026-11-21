@@ -4610,7 +4610,14 @@ function isXpxMosaic(hex) {
 }
 
 function creditVerifiedDeposit(deposit) {
-  const senderKey = normalizeKey(deposit.senderPublicKey);
+  let senderKey = normalizeKey(deposit.senderPublicKey || deposit.callerKey);
+  if (!senderKey || /^0+$/.test(senderKey)) {
+    if (deposit.senderAddress) {
+      senderKey = deposit.senderAddress.replace(/[- ]/g, '').toUpperCase();
+    } else if (deposit.callerKey) {
+      senderKey = normalizeKey(deposit.callerKey);
+    }
+  }
   const mosaicIdHex = (deposit.mosaicIdHex || '').toLowerCase().replace(/^0x/, '');
   const amount = BigInt(deposit.amountAtomic || 0n);
   const txHash = String(deposit.txHash || crypto.randomBytes(32).toString('hex')).toLowerCase();
@@ -4666,6 +4673,26 @@ async function emergencyUnlock(req) {
   if (!callerKey || !/^[0-9a-fA-F]{64}$/.test(callerKey)) {
     throw new Error('Invalid caller public key');
   }
+  return withAccountLock(callerKey, () => _emergencyUnlockUnlocked(req, callerKey));
+}
+
+async function _emergencyUnlockUnlocked(req, callerKey) {
+  // Cryptographic authentication: Require ed25519 signature over (EMERGENCY_UNLOCK, callerKey, nonce, expiry)
+  if (!req.signature) {
+    throw new Error('Missing ed25519 signature: Emergency unlock must be cryptographically signed by the account owner');
+  }
+  const nonce = req.nonce;
+  const expiry = req.expiry;
+  if (nonce === undefined || nonce === null || nonce === '') {
+    throw new Error('Missing nonce in emergency unlock request');
+  }
+  if (!expiry) {
+    throw new Error('Missing expiry timestamp in emergency unlock request');
+  }
+
+  const unlockMsg = `${DOMAIN_SEPARATOR}:EMERGENCY_UNLOCK:${callerKey}:${nonce}:${expiry}`;
+  verifyEd25519Signature(callerKey, unlockMsg, req.signature);
+  checkAndRecordNonce(callerKey, nonce, expiry);
 
   const currentHeight = getLatestCommittedHeight('node1');
   const txHashHex = crypto.randomBytes(32).toString('hex');
