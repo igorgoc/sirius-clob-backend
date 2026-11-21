@@ -4449,6 +4449,7 @@ function isXpxMosaic(hex) {
   }
   return (
     norm === '13bfc518e40549d7' ||
+    norm === '402b2f579faebc59' ||
     norm === '402b2f579fa859b8' ||
     (configuredXpx && norm === configuredXpx) ||
     norm === 'bffb42a19116bdf6' ||
@@ -4460,6 +4461,7 @@ function isXpxMosaic(hex) {
     norm === BigInt(XPX_MOSAIC_ID).toString(16).toLowerCase() ||
     (decAsHex && (
       decAsHex === '13bfc518e40549d7' ||
+      decAsHex === '402b2f579faebc59' ||
       decAsHex === '402b2f579fa859b8' ||
       (configuredXpx && decAsHex === configuredXpx) ||
       decAsHex === 'bffb42a19116bdf6' ||
@@ -4506,6 +4508,7 @@ function creditVerifiedDeposit(deposit) {
         mosaicIdHex === BNB_MOSAIC_ID.toLowerCase() ||
         mosaicIdHex === BigInt(BNB_MOSAIC_ID).toString(16).toLowerCase() ||
         mosaicIdHex === '3cc1d3ce7447b6f9' ||
+        mosaicIdHex === '1e5c5fadec7b34dd' ||
         mosaicIdHex === confBnb
       ) {
         b.bnb = (b.bnb || 0n) + amount;
