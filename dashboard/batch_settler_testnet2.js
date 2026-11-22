@@ -286,12 +286,19 @@ class BatchSettlerTestnet2 {
 
         // Broadcast to Sirius L1 via multi-node failover REST wrapper
         await testnetClient.announceSignedTransaction(signedTx);
-
-        // Verify node did not reject the transaction (e.g. Failure_Core_Insufficient_Balance)
-        await verifyTxAcceptedOnTestnet2(signedTx.hash);
-
         txHashes.push(signedTx.hash);
-        this.inFlightChunks.pop();
+
+        try {
+          // Verify node did not reject the transaction (e.g. Failure_Core_Insufficient_Balance)
+          await verifyTxAcceptedOnTestnet2(signedTx.hash, 10000);
+          this.inFlightChunks.pop();
+        } catch (vErr) {
+          if (vErr.message && vErr.message.includes('rejected')) {
+            this.inFlightChunks.pop();
+            throw vErr;
+          }
+          console.log(`[BatchSettler Testnet2] Tx ${signedTx.hash} broadcast to mempool (confirmation pending in next block)`);
+        }
       }
 
       console.log(`[BatchSettler Testnet2] Flushed ${rawCount} items (${netted.length} netted) -> Tx(s): ${txHashes.join(', ')}`);

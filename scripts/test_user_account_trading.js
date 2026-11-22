@@ -160,11 +160,11 @@ async function run() {
   console.log(`   XPX/USDT Best Bid: ${depthRes.data?.best_bid}, Best Ask: ${depthRes.data?.best_ask}`);
   console.log(`   Bids: ${depthRes.data?.bids?.length || 0} levels, Asks: ${depthRes.data?.asks?.length || 0} levels`);
 
-  // If orderbook is depleted, trigger reseed
-  if (!depthRes.data?.bids?.length || !depthRes.data?.asks?.length) {
-    console.log('   ⚠️ Depleted depth detected! Reseeding order book...');
-    const populate = require('./populate_live_orderbooks');
-    // populate will seed orders
+  // If orderbook is depleted, wait for market maker daemon
+  while (!depthRes.data?.bids?.length || !depthRes.data?.asks?.length) {
+    console.log('   ⚠️ Waiting for live market maker liquidity ladder...');
+    await new Promise((r) => setTimeout(r, 4000));
+    depthRes = await httpsGet(`${LIVE_API_BASE}/api/clob/depth?pair=XPX/USDT`);
   }
 
   // 3. Execute Market Sell 1 XPX
