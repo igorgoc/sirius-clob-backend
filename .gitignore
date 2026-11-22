@@ -18,3 +18,27 @@ cluster/*_mainnet*.json
 cluster/mainnet_*.json
 cluster/prod_*.json
 cluster/*_prod*.json
+
+# Sensitive accounts and keys
+cluster/*_account.json
+cluster/*_accounts.json
+cluster/*_security.json
+cluster/*_compliance.json
+cluster/nemesis_accounts.json
+cluster/admin_keys.json
+
+# Live exchange cluster state and databases
+cluster/*.db
+cluster/*.db-*
+cluster/clob_balances.json
+cluster/active_orders.json
+cluster/withdrawals.json
+cluster/trade_timestamps.json
+cluster/processed_deposits.json
+cluster/used_nonces.json
+cluster/circuit_breaker.json
+cluster/swap_history.json
+cluster/mm_status.json
+cluster/multisig_vault_governance.json
+cluster/node*/data/
+
