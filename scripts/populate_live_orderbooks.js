@@ -146,17 +146,16 @@ async function run() {
   }
 
   const bnbAsks = [
-    { price: '0.00000015', amount: '1.000000' },
-    { price: '0.00000016', amount: '1.000000' },
-    { price: '0.00000017', amount: '1.000000' },
-    { price: '0.00000018', amount: '1.000000' },
-    { price: '0.00000019', amount: '1.000000' },
+    { acc: testAccounts[3], price: '0.00000015', amount: '7.000000' },
+    { acc: testAccounts[4], price: '0.00000016', amount: '7.000000' },
+    { acc: testAccounts[17], price: '0.00000017', amount: '7.000000' },
+    { acc: testAccounts[19], price: '0.00000018', amount: '7.000000' },
+    { acc: testAccounts[0], price: '0.00000019', amount: '7.000000' },
   ];
 
   for (let i = 0; i < bnbAsks.length; i++) {
     const a = bnbAsks[i];
-    const seller = sellerAccs[i % sellerAccs.length];
-    const res = await placeLimitOrder(seller, 'XPX/BNB', 'sell', a.price, a.amount);
+    const res = await placeLimitOrder(a.acc, 'XPX/BNB', 'sell', a.price, a.amount);
     if (res.data && res.data.ok) {
       console.log(`  ✅ XPX/BNB Ask #${i + 1}: ${a.amount} XPX @ ${a.price} BNB (Order #${res.data.orderId})`);
     } else {
