@@ -529,13 +529,15 @@ function isTelemetryAllowed(req) {
   if (adminHeader && adminHeader.trim() === getOrInitAdminKey()) {
     return true;
   }
-  if (process.env.NODE_ENV === 'production') {
-    return false;
+  // Direct localhost connection allowed for local operator cockpit debugging
+  if (isDirectLocalhost(req)) {
+    return true;
   }
-  if (process.env.ALLOW_PUBLIC_COCKPIT === 'false') {
-    return isDirectLocalhost(req);
+  // Fail-closed by default: strictly disallow public access unless explicitly enabled
+  if (process.env.ALLOW_PUBLIC_COCKPIT === 'true') {
+    return true;
   }
-  return true;
+  return false;
 }
 
 // In-Memory Sliding Window Rate Limiter
@@ -1422,13 +1424,15 @@ const server = http.createServer((req, res) => {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(result));
         } catch (err) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, success: false, error: err.message }));
+          const status = err.statusCode || 400;
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, success: false, error: err.message, statusCode: status }));
         }
       })
       .catch((err) => {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, success: false, error: err.message }));
+        const status = err.statusCode || 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, success: false, error: err.message, statusCode: status }));
       });
     return;
   }
@@ -1442,13 +1446,15 @@ const server = http.createServer((req, res) => {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(result));
         } catch (err) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, success: false, error: err.message }));
+          const status = err.statusCode || 400;
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, success: false, error: err.message, statusCode: status }));
         }
       })
       .catch((err) => {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, success: false, error: err.message }));
+        const status = err.statusCode || 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, success: false, error: err.message, statusCode: status }));
       });
     return;
   }
@@ -1462,13 +1468,15 @@ const server = http.createServer((req, res) => {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(result));
         } catch (err) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, success: false, error: err.message }));
+          const status = err.statusCode || 400;
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, success: false, error: err.message, statusCode: status }));
         }
       })
       .catch((err) => {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, success: false, error: err.message }));
+        const status = err.statusCode || 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, success: false, error: err.message, statusCode: status }));
       });
     return;
   }

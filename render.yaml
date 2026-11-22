@@ -6,6 +6,8 @@ services:
     autoDeploy: true
     healthCheckPath: /api/clob/health
     envVars:
+      - key: NODE_ENV
+        value: production
       - key: SIRIUS_NETWORK
         value: testnet2
       - key: SIRIUS_NODE_URL

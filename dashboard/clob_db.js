@@ -112,6 +112,13 @@ function getDb(customPath = null) {
     );
     CREATE INDEX IF NOT EXISTS idx_collected_fees_mosaic ON collected_fees(mosaic);
     CREATE INDEX IF NOT EXISTS idx_collected_fees_created ON collected_fees(created_at);
+
+    CREATE TABLE IF NOT EXISTS faucet_claims (
+      recipient TEXT PRIMARY KEY,
+      last_claim_time INTEGER NOT NULL,
+      amount_xpx INTEGER NOT NULL,
+      claim_date TEXT NOT NULL
+    );
   `);
 
   // Automated schema migration to ensure CHECK constraints on pre-existing databases
@@ -744,6 +751,32 @@ function getCollectedFeesSummary(customDb = null) {
   };
 }
 
+function recordFaucetClaim(recipient, amountXpx, timestamp) {
+  const db = getDb();
+  const dateStr = new Date(timestamp).toDateString();
+  const stmt = db.prepare(`
+    INSERT INTO faucet_claims (recipient, last_claim_time, amount_xpx, claim_date)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(recipient) DO UPDATE SET
+      last_claim_time = excluded.last_claim_time,
+      amount_xpx = excluded.amount_xpx,
+      claim_date = excluded.claim_date
+  `);
+  stmt.run(recipient, timestamp, amountXpx, dateStr);
+}
+
+function getLastFaucetClaim(recipient) {
+  const db = getDb();
+  const row = db.prepare('SELECT last_claim_time FROM faucet_claims WHERE recipient = ?').get(recipient);
+  return row ? row.last_claim_time : 0;
+}
+
+function getDailyFaucetDisbursed(dateStr) {
+  const db = getDb();
+  const row = db.prepare('SELECT SUM(amount_xpx) as total FROM faucet_claims WHERE claim_date = ?').get(dateStr);
+  return (row && row.total) ? Number(row.total) : 0;
+}
+
 module.exports = {
   DB_FILE,
   getDb,
@@ -765,4 +798,7 @@ module.exports = {
   getBridgeRolling24hVolume,
   recordCollectedFee,
   getCollectedFeesSummary,
+  recordFaucetClaim,
+  getLastFaucetClaim,
+  getDailyFaucetDisbursed,
 };

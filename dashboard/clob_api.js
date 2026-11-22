@@ -912,6 +912,15 @@ function getAuthorizedAdminKeys() {
       if (k.trim()) adminKeys.add(k.trim().toLowerCase());
     }
   }
+  if (process.env.SIRIUS_ADMIN_KEY) {
+    adminKeys.add(process.env.SIRIUS_ADMIN_KEY.trim().toLowerCase());
+  }
+  if (process.env.SIRIUS_ADMIN_PUBLIC_KEY) {
+    adminKeys.add(process.env.SIRIUS_ADMIN_PUBLIC_KEY.trim().toLowerCase());
+  }
+  if (process.env.SIRIUS_TREASURY_PUBLIC_KEY) {
+    adminKeys.add(process.env.SIRIUS_TREASURY_PUBLIC_KEY.trim().toLowerCase());
+  }
 
   // 4. cluster/treasury_account.json
   const treasuryFile = path.join(CLUSTER_DIR, 'treasury_account.json');
@@ -1879,20 +1888,10 @@ function getAccountBalance(publicKey) {
     };
     saveBalances(localBalances);
   } else if (driveBal) {
-    // Only update locked escrow amounts from drive - NEVER wipe trading balance
+    // Only update locked escrow amounts from drive - NEVER ratchet or overwrite trading balances!
     localBalances[key].lockedXpx = driveBal.lockedXpx;
     localBalances[key].lockedUsdt = driveBal.lockedUsdt;
     localBalances[key].lockedBnb = driveBal.lockedBnb;
-    // If drive has explicit free balance higher than local, allow it
-    if (driveBal.xpx > BigInt(localBalances[key].xpx || 0n)) {
-      localBalances[key].xpx = driveBal.xpx;
-    }
-    if (driveBal.usdt > BigInt(localBalances[key].usdt || 0n)) {
-      localBalances[key].usdt = driveBal.usdt;
-    }
-    if (driveBal.bnb > BigInt(localBalances[key].bnb || 0n)) {
-      localBalances[key].bnb = driveBal.bnb;
-    }
     localBalances[key].lastUpdated = Date.now();
     saveBalances(localBalances);
   }
@@ -2023,21 +2022,11 @@ async function syncAndGetAccountBalance(publicKeyOrAddr) {
   if (deltaUsdt > 0n) rawLocalUsdt += deltaUsdt;
   if (deltaBnb > 0n) rawLocalBnb += deltaBnb;
 
-  // Bulletproof Re-anchoring Shield:
-  // Rule 1: XPX can only be below walletBackedXpx if user sold XPX (reflected by quote balance > on-chain quote)
-  const hasSoldXpx = (rawLocalUsdt > totalOnChainUsdt) || (rawLocalBnb > totalOnChainBnb);
-  if (!hasSoldXpx && rawLocalXpx < walletBackedXpx) {
+  // Fresh account initial anchoring: If an account has never traded and has 0 local balance, initialize to on-chain backing
+  const isFreshAccount = !currentEntry.hasTraded && (rawLocalXpx === 0n && rawLocalUsdt === 0n && rawLocalBnb === 0n);
+  if (isFreshAccount) {
     rawLocalXpx = walletBackedXpx;
-  }
-
-  // Rule 2: USDT can only be below walletBackedUsdt if user bought XPX (reflected by XPX balance > on-chain XPX)
-  const hasBoughtWithUsdt = (rawLocalXpx > totalOnChainXpx);
-  if (!hasBoughtWithUsdt && rawLocalUsdt < walletBackedUsdt) {
     rawLocalUsdt = walletBackedUsdt;
-  }
-
-  // Rule 3: BNB can only be below walletBackedBnb if user bought XPX with BNB
-  if (!hasBoughtWithUsdt && rawLocalBnb < walletBackedBnb) {
     rawLocalBnb = walletBackedBnb;
   }
 
@@ -2374,19 +2363,10 @@ function syncGatewayCacheFromDrive(publicKey) {
   }
 
   if (driveBal) {
-    // Sync locked escrow amounts from drive - NEVER wipe or overwrite trading balances!
+    // Sync locked escrow amounts from drive - NEVER ratchet or overwrite trading balances!
     localBalances[key].lockedXpx = driveBal.lockedXpx;
     localBalances[key].lockedUsdt = driveBal.lockedUsdt;
     localBalances[key].lockedBnb = driveBal.lockedBnb;
-    if (driveBal.xpx > BigInt(localBalances[key].xpx || 0n)) {
-      localBalances[key].xpx = driveBal.xpx;
-    }
-    if (driveBal.usdt > BigInt(localBalances[key].usdt || 0n)) {
-      localBalances[key].usdt = driveBal.usdt;
-    }
-    if (driveBal.bnb > BigInt(localBalances[key].bnb || 0n)) {
-      localBalances[key].bnb = driveBal.bnb;
-    }
     localBalances[key].lastUpdated = Date.now();
     saveBalances(localBalances);
   }
@@ -2409,6 +2389,10 @@ function syncAllGatewayBalancesFromDrive() {
     for (const e of data.entries) {
       const pubkeyHex = (e.pubkey_hex || '').toLowerCase();
       if (!pubkeyHex || pubkeyHex.length !== 64) continue;
+      const mosaicId = String(e.mosaic_id || '');
+      const free = BigInt(e.free_amount || '0');
+      const locked = BigInt(e.locked_amount || '0');
+
       if (!localBalances[pubkeyHex]) {
         localBalances[pubkeyHex] = {
           xpx: 0n,
@@ -2419,25 +2403,23 @@ function syncAllGatewayBalancesFromDrive() {
           lockedBnb: 0n,
           lastUpdated: Date.now(),
         };
-      }
-      const mosaicId = String(e.mosaic_id || '');
-      const free = BigInt(e.free_amount || '0');
-      const locked = BigInt(e.locked_amount || '0');
-
-      if (isXpxMosaic(mosaicId) || mosaicId.startsWith('992621222383397')) {
-        localBalances[pubkeyHex].lockedXpx = locked;
-        if (free > BigInt(localBalances[pubkeyHex].xpx || 0n)) {
+        if (isXpxMosaic(mosaicId) || mosaicId.startsWith('992621222383397')) {
           localBalances[pubkeyHex].xpx = free;
-        }
-      } else if (mosaicId === USDT_MOSAIC_ID || mosaicId.startsWith('1157755757097881')) {
-        localBalances[pubkeyHex].lockedUsdt = locked;
-        if (free > BigInt(localBalances[pubkeyHex].usdt || 0n)) {
+          localBalances[pubkeyHex].lockedXpx = locked;
+        } else if (mosaicId === USDT_MOSAIC_ID || mosaicId.startsWith('1157755757097881')) {
           localBalances[pubkeyHex].usdt = free;
-        }
-      } else if (mosaicId === BNB_MOSAIC_ID || mosaicId.startsWith('2187728719596696')) {
-        localBalances[pubkeyHex].lockedBnb = locked;
-        if (free > BigInt(localBalances[pubkeyHex].bnb || 0n)) {
+          localBalances[pubkeyHex].lockedUsdt = locked;
+        } else if (mosaicId === BNB_MOSAIC_ID || mosaicId.startsWith('2187728719596696')) {
           localBalances[pubkeyHex].bnb = free;
+          localBalances[pubkeyHex].lockedBnb = locked;
+        }
+      } else {
+        if (isXpxMosaic(mosaicId) || mosaicId.startsWith('992621222383397')) {
+          localBalances[pubkeyHex].lockedXpx = locked;
+        } else if (mosaicId === USDT_MOSAIC_ID || mosaicId.startsWith('1157755757097881')) {
+          localBalances[pubkeyHex].lockedUsdt = locked;
+        } else if (mosaicId === BNB_MOSAIC_ID || mosaicId.startsWith('2187728719596696')) {
+          localBalances[pubkeyHex].lockedBnb = locked;
         }
       }
     }
@@ -2494,6 +2476,15 @@ function getExcludedOperatorKeys() {
   const excluded = new Set([...adminKeys]);
   if (testnet2Config.FEE_COLLECTOR_PUBKEY) {
     excluded.add(testnet2Config.FEE_COLLECTOR_PUBKEY.toLowerCase());
+  }
+  if (process.env.SIRIUS_FEE_COLLECTOR_PUBLIC_KEY) {
+    excluded.add(process.env.SIRIUS_FEE_COLLECTOR_PUBLIC_KEY.trim().toLowerCase());
+  }
+  if (process.env.SIRIUS_TREASURY_PUBLIC_KEY) {
+    excluded.add(process.env.SIRIUS_TREASURY_PUBLIC_KEY.trim().toLowerCase());
+  }
+  if (process.env.SIRIUS_VAULT_PUBLIC_KEY) {
+    excluded.add(process.env.SIRIUS_VAULT_PUBLIC_KEY.trim().toLowerCase());
   }
   const feeCollectorFile = path.join(CLUSTER_DIR, 'fee_collector_account.json');
   if (fs.existsSync(feeCollectorFile)) {
@@ -3277,13 +3268,50 @@ async function _placeOrderUnlocked(orderReq) {
 
   const side = orderReq.side === 'sell' || orderReq.side === 1 ? 1 : 0;
   const orderType = orderReq.type === 'Market' || orderReq.orderType === 1 ? 1 : 0; // 0=Limit, 1=Market (IOC)
-  const defaultPrice = isBnb ? '0.00000834' : '0.005';
-  const priceInput = orderReq.price !== undefined && orderReq.price !== null ? orderReq.price : defaultPrice;
-  const amountInput = orderReq.amount || 0;
-
   const marketKey = isBnb ? 'xpx_bnb' : 'xpx_usdt';
-  const expectedOrderId = getMarketNextOrderId(marketKey);
+  const depth = getMarketDepthSnapshot(marketKey);
 
+  let defaultPrice;
+  if (isBnb) {
+    defaultPrice = '0.00000014';
+  } else if (depth && depth.best_bid && depth.best_ask) {
+    const midTicks = (BigInt(depth.best_bid) + BigInt(depth.best_ask)) / 2n;
+    defaultPrice = formatAtomicUnits(midTicks, 8);
+  } else if (depth && depth.best_bid) {
+    defaultPrice = formatAtomicUnits(BigInt(depth.best_bid), 8);
+  } else if (depth && depth.best_ask) {
+    defaultPrice = formatAtomicUnits(BigInt(depth.best_ask), 8);
+  } else {
+    defaultPrice = '0.000076';
+  }
+
+  const priceInput = orderReq.price !== undefined && orderReq.price !== null ? String(orderReq.price).trim() : defaultPrice;
+  const amountInput = String(orderReq.amount !== undefined && orderReq.amount !== null ? orderReq.amount : '').trim();
+
+  // Strict Validation: Reject scientific notation and invalid decimal strings (Finding M-2, M-3)
+  if (priceInput.includes('e') || priceInput.includes('E')) {
+    throw new Error('Invalid price format: scientific notation is not permitted');
+  }
+  if (amountInput.includes('e') || amountInput.includes('E')) {
+    throw new Error('Invalid amount format: scientific notation is not permitted');
+  }
+  if (!/^\d+(\.\d+)?$/.test(priceInput)) {
+    throw new Error('Invalid price format: must be a positive decimal number');
+  }
+  if (!/^\d+(\.\d+)?$/.test(amountInput)) {
+    throw new Error('Invalid amount format: must be a positive decimal number');
+  }
+
+  const priceDecs = (priceInput.split('.')[1] || '').length;
+  if (priceDecs > 8) {
+    throw new Error('Invalid price precision: maximum 8 decimal places supported');
+  }
+  const amountDecs = (amountInput.split('.')[1] || '').length;
+  if (amountDecs > 6) {
+    throw new Error('Invalid amount precision: maximum 6 decimal places supported');
+  }
+
+  const expectedOrderId = getMarketNextOrderId(marketKey);
   const priceTicksRaw = parseDecimalToBigInt(priceInput, 8); // PRICE_SCALE = 100_000_000n
   const amountAtomic = parseDecimalToBigInt(amountInput, 6);
   const MAX_U64 = 0xFFFFFFFFFFFFFFFFn;
@@ -3291,11 +3319,21 @@ async function _placeOrderUnlocked(orderReq) {
   if (amountAtomic <= 0n) {
     throw new Error('Invalid order amount: must be greater than zero');
   }
+  // Enforce minimum order size: 1 XPX (Finding M-5)
+  if (amountAtomic < 1_000_000n) {
+    throw new Error('Order amount below minimum: minimum order size is 1 XPX');
+  }
   if (amountAtomic > MAX_U64 || priceTicksRaw > MAX_U64) {
     throw new Error('Order amount or price exceeds maximum 64-bit integer limit');
   }
   if (orderType === 0 && priceTicksRaw <= 0n) {
     throw new Error('Invalid order price: must be greater than zero for Limit order');
+  }
+
+  const tickSize = isBnb ? 1n : 100n;
+  // Reject off-grid limit order prices (Finding M-4)
+  if (orderType === 0 && (priceTicksRaw % tickSize !== 0n)) {
+    throw new Error(`Invalid price tick: price must align to tick size grid of ${formatAtomicUnits(tickSize, 8)}`);
   }
 
   const callerKey = normalizeKey(orderReq.publicKey || orderReq.callerPublicKey);
@@ -3332,7 +3370,6 @@ async function _placeOrderUnlocked(orderReq) {
   let userBal = await syncAndGetAccountBalance(callerKey);
   const tBal = Date.now();
 
-  const tickSize = isBnb ? 1n : 100n;
   let priceTicks = priceTicksRaw;
 
   // 1. Dynamic Price Collar Protection (Fat-Finger & Flash-Crash Shield)
@@ -3544,9 +3581,13 @@ async function _placeOrderUnlocked(orderReq) {
             ? payloadBuf.subarray(64, 64 + msgLen).toString('utf8')
             : '';
 
-          // Track fill count based on actual trade fill base leg emitted by engine
+          // Track fill count based on actual trade fill base leg emitted by engine for this order
           if (messageStr.startsWith('SiriusCLOB: Trade Fill (Base)')) {
-            fillsCount++;
+            if (side === 0 && recipientPub.toLowerCase() === callerKey.toLowerCase()) {
+              fillsCount++;
+            } else if (side === 1 && recipientPub.toLowerCase() !== callerKey.toLowerCase()) {
+              fillsCount++;
+            }
           }
 
           // Extract fees directly from contract emitted transaction output
@@ -3624,13 +3665,18 @@ async function _placeOrderUnlocked(orderReq) {
           }
 
           if (mosaicId.toString(10) === XPX_MOSAIC_ID) {
-            // Gross base filled = net payout + taker fee (if taker is buyer and fee deducted from base)
-            takerBaseFilled += payoutAmount + (messageStr.includes(':TAKER_FEE=') ? legFee : 0n);
+            // Gross base filled = net payout + leg fee
+            if (side === 0 && recipientPub.toLowerCase() === callerKey.toLowerCase()) {
+              takerBaseFilled += payoutAmount + (messageStr.includes(':TAKER_FEE=') ? legFee : 0n);
+            } else if (side === 1 && recipientPub.toLowerCase() !== callerKey.toLowerCase()) {
+              takerBaseFilled += payoutAmount + (messageStr.includes(':MAKER_FEE=') ? legFee : 0n);
+            }
             // XPX Delivery: recipient receives bought XPX
             updateAccountBalance(recipientPub, (b) => {
               b.xpx = BigInt(b.xpx || 0n) + payoutAmount;
               const rem = BigInt(b.lockedXpx || 0n) - payoutAmount;
               b.lockedXpx = rem > 0n ? rem : 0n;
+              b.hasTraded = true;
             }, { source: 'MATCH_SETTLEMENT' });
           } else if (mosaicId.toString(10) === USDT_MOSAIC_ID) {
             // USDT Delivery: recipient receives quote payment or refund
@@ -3638,6 +3684,7 @@ async function _placeOrderUnlocked(orderReq) {
               b.usdt = BigInt(b.usdt || 0n) + payoutAmount;
               const rem = BigInt(b.lockedUsdt || 0n) - payoutAmount;
               b.lockedUsdt = rem > 0n ? rem : 0n;
+              b.hasTraded = true;
             }, { source: 'MATCH_SETTLEMENT' });
           } else if (mosaicId.toString(10) === BNB_MOSAIC_ID) {
             // BNB Delivery: recipient receives quote payment or refund
@@ -3645,6 +3692,7 @@ async function _placeOrderUnlocked(orderReq) {
               b.bnb = BigInt(b.bnb || 0n) + payoutAmount;
               const rem = BigInt(b.lockedBnb || 0n) - payoutAmount;
               b.lockedBnb = rem > 0n ? rem : 0n;
+              b.hasTraded = true;
             }, { source: 'MATCH_SETTLEMENT' });
           }
         }
@@ -3732,7 +3780,7 @@ async function _placeOrderUnlocked(orderReq) {
       remainingAmountAtomic: remainingAtomic.toString(),
       remainingAmount: formatAtomicUnits(remainingAtomic, 6),
       filled: `${clampedPct}%`,
-      status: isFilled ? 'Filled' : 'Open',
+      status: isFilled ? 'Filled' : (takerBaseFilled > 0n ? 'PartiallyFilled' : 'Open'),
       timestamp: Date.now(),
       expiry: orderReq.orderExpiry && Number(orderReq.orderExpiry) > 0
         ? Number(orderReq.orderExpiry)
@@ -3766,9 +3814,12 @@ async function _placeOrderUnlocked(orderReq) {
     amount: amountInput,
     priceTicks: Number(priceTicks),
     amountAtomic: Number(amountAtomic),
-    filled: orderType === 0 ? `${clampedPct}%` : '100%',
-    status: orderType === 0 ? (isFilled ? 'Filled' : 'Open') : 'Filled',
+    filled: `${clampedPct}%`,
+    status: orderType === 0
+      ? (isFilled ? 'Filled' : (takerBaseFilled > 0n ? 'PartiallyFilled' : 'Open'))
+      : (isFilled ? 'Filled' : (takerBaseFilled > 0n ? 'PartiallyFilled' : 'Cancelled')),
     remainingAmount: formatAtomicUnits(remainingAtomic, 6),
+    filledAmount: formatAtomicUnits(takerBaseFilled, 6),
     gasConsumed: ret.execution_gas_consumed,
     fillsCount,
     fee: totalFeeAtomic.toString(),
@@ -3806,6 +3857,20 @@ async function _cancelOrderUnlocked(cancelReq) {
   const callerKey = normalizeKey(cancelReq.publicKey || cancelReq.callerPublicKey);
   const pair = cancelReq.pair || cancelReq.market || 'XPX/USDT';
 
+  const existingOrder = activeOrders.get(orderId);
+  if (existingOrder) {
+    if (existingOrder.callerKey.toLowerCase() !== callerKey.toLowerCase()) {
+      const err = new Error(`Forbidden: Order #${orderId} belongs to a different account`);
+      err.statusCode = 403;
+      throw err;
+    }
+    if (existingOrder.status === 'Filled' || existingOrder.remainingAmountAtomic === '0') {
+      const err = new Error(`Not Found: Order #${orderId} is already completely filled or inactive`);
+      err.statusCode = 404;
+      throw err;
+    }
+  }
+
   // Cryptographic authentication: Require ed25519 signature over (pair, orderId, nonce, expiry)
   const cancelMsg = constructCancelMessage(
     pair,
@@ -3836,7 +3901,9 @@ async function _cancelOrderUnlocked(cancelReq) {
   const ret = results[0].returns;
 
   if (ret.return_val !== 0) {
-    throw new Error(`Order cancellation failed (Return code: ${ret.return_val})`);
+    const err = new Error(`Order cancellation rejected: Order #${orderId} was not found on active orderbook or already filled (Code: ${ret.return_val})`);
+    err.statusCode = 404;
+    throw err;
   }
 
   // Restore escrow into available balance from canonical drive ledger
@@ -4029,21 +4096,22 @@ async function claimFaucet(publicKey, addressOverride = null) {
 
   recipientAddress = recipientAddress.replace(/[- ]/g, '').toUpperCase();
 
-  // Rate limit: 1 claim per 5 minutes per recipient address
+  // Rate limit: 1 claim per 5 minutes (300,000 ms) per recipient address (backed by persistent SQLite)
   const now = Date.now();
   if (!global.faucetClaimsMap) global.faucetClaimsMap = new Map();
-  const lastClaim = global.faucetClaimsMap.get(recipientAddress) || 0;
-  if (now - lastClaim < 60000) {
-    const waitSec = Math.ceil((60000 - (now - lastClaim)) / 1000);
+  const dbLastClaim = clobDb.getLastFaucetClaim(recipientAddress);
+  const memLastClaim = global.faucetClaimsMap.get(recipientAddress) || 0;
+  const lastClaim = Math.max(dbLastClaim, memLastClaim);
+  if (now - lastClaim < 300000) {
+    const waitSec = Math.ceil((300000 - (now - lastClaim)) / 1000);
     throw new Error(`Faucet rate limit: Please wait ${waitSec}s before claiming again for ${recipientAddress}`);
   }
 
   // Global 24h Faucet Cap to protect Treasury reserves (max 5,000 XPX / 24h)
   const FAUCET_DAILY_CAP_XPX = 5000;
-  if (!global.faucetDisbursed24h || global.faucetDisbursed24h.date !== new Date().toDateString()) {
-    global.faucetDisbursed24h = { date: new Date().toDateString(), amountXpx: 0 };
-  }
-  if (global.faucetDisbursed24h.amountXpx + 50 > FAUCET_DAILY_CAP_XPX) {
+  const todayStr = new Date().toDateString();
+  const disbursedToday = clobDb.getDailyFaucetDisbursed(todayStr);
+  if (disbursedToday + 50 > FAUCET_DAILY_CAP_XPX) {
     throw new Error(`Daily faucet capacity reached (${FAUCET_DAILY_CAP_XPX} XPX/day). Please try again tomorrow.`);
   }
 
@@ -4080,7 +4148,7 @@ async function claimFaucet(publicKey, addressOverride = null) {
   await testnetClient.verifyTransactionAccepted(signedTx.hash);
 
   global.faucetClaimsMap.set(recipientAddress, now);
-  global.faucetDisbursed24h.amountXpx += amountXpx;
+  clobDb.recordFaucetClaim(recipientAddress, amountXpx, now);
 
   // Immediately credit CLOB internal trading ledger for instant zero-friction exchange trading
   const userPubKey = callerKey && callerKey.length === 64 ? callerKey : normalizeKey(faucetReq.publicKey || faucetReq.callerPublicKey);
