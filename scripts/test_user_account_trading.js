@@ -11,9 +11,42 @@ const client = require('../dashboard/testnet2_client');
 const LIVE_API_BASE = 'https://sirius-clob-backend.onrender.com';
 const USER_PRIV_KEY = 'E8A4B4CED34D6BAA397091A84376451D27D5030A63E95EDBC5139C4055B5D505';
 
+const NETWORK_ID = Number(config.NETWORK_TYPE || 168);
+const DOMAIN_SEPARATOR = `${NETWORK_ID}:SiriusCLOB-v1`;
+
+function canonicalizeDecimalString(val, maxDecimals = 8) {
+  if (val === undefined || val === null) return '0';
+  if (typeof val === 'string') return val.trim();
+  if (typeof val === 'number' && Number.isFinite(val)) {
+    const raw = String(val);
+    if (raw.includes('e') || raw.includes('E')) {
+      return val.toFixed(maxDecimals).replace(/\.?0+$/, '') || '0';
+    }
+    return raw;
+  }
+  return String(val);
+}
+
+function constructOrderMessage(pair, side, type, price, amount, nonce, expiry) {
+  const normPair = (pair || 'XPX/USDT').toUpperCase().replace('_', '/');
+  const normSide = side === 1 || String(side).toLowerCase() === 'sell' ? 'sell' : 'buy';
+  const normType = type === 1 || String(type).toLowerCase() === 'market' ? 'Market' : 'Limit';
+  const priceStr = canonicalizeDecimalString(price, 8);
+  const amountStr = canonicalizeDecimalString(amount, 6);
+  return `${DOMAIN_SEPARATOR}:ORDER:${normPair}:${normSide}:${normType}:${priceStr}:${amountStr}:${nonce}:${expiry}`;
+}
+
 function signOrder(privKey, order) {
-  const account = sdk.Account.createFromPrivateKey(privKey, config.NETWORK_TYPE, 1);
-  const msgStr = `${order.pair.toUpperCase()}:${String(order.side).toLowerCase()}:${String(order.type).toLowerCase()}:${String(order.price)}:${String(order.amount)}:${String(order.nonce)}:${String(order.expiry)}`;
+  const account = sdk.Account.createFromPrivateKey(privKey, NETWORK_ID, 1);
+  const msgStr = constructOrderMessage(
+    order.pair,
+    order.side,
+    order.type,
+    order.price,
+    order.amount,
+    order.nonce,
+    order.expiry
+  );
   return account.signData(msgStr);
 }
 

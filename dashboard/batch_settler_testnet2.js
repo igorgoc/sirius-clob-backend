@@ -60,6 +60,8 @@ class BatchSettlerTestnet2 {
     this.maxCapacity = maxCapacity;
     this.vaultAccount = null;
     this.isFlushing = false;
+    this.activeFlushPromise = null;
+    this.lastFlushResult = null;
   }
 
   getVault() {
@@ -169,20 +171,32 @@ class BatchSettlerTestnet2 {
    * Flush and broadcast Aggregate Complete Transaction(s) to Sirius L1
    */
   async flushBatch() {
-    if (this.isFlushing) {
-      throw new Error('Batch settlement flush is already in progress. Please wait for current batch confirmation.');
+    while (this.isFlushing && this.activeFlushPromise) {
+      try {
+        await this.activeFlushPromise;
+      } catch (_) {}
+      if (this.pendingQueue.length === 0 && this.inFlightChunks.length === 0) {
+        return this.lastFlushResult || { ok: true, empty: true, count: 0 };
+      }
     }
     if (this.pendingQueue.length === 0 && this.inFlightChunks.length === 0) {
       return { ok: true, empty: true, count: 0 };
     }
 
     this.isFlushing = true;
+    let flushPromiseResolve;
+    this.activeFlushPromise = new Promise((resolve) => {
+      flushPromiseResolve = resolve;
+    });
+
     const snapshot = [...this.pendingQueue];
     this.pendingQueue = [];
 
     const netted = this.getNettedPayoutsFromItems(snapshot);
     if (netted.length === 0 && this.inFlightChunks.length === 0) {
       this.isFlushing = false;
+      if (flushPromiseResolve) flushPromiseResolve();
+      this.activeFlushPromise = null;
       return { ok: true, empty: true, count: 0 };
     }
 
@@ -282,7 +296,7 @@ class BatchSettlerTestnet2 {
 
       console.log(`[BatchSettler Testnet2] Flushed ${rawCount} items (${netted.length} netted) -> Tx(s): ${txHashes.join(', ')}`);
 
-      return {
+      const res = {
         ok: true,
         batchId,
         txHash: txHashes[0],
@@ -292,6 +306,8 @@ class BatchSettlerTestnet2 {
         network: config.NETWORK_NAME || 'publicTest',
         endpoint: testnetClient.getActiveNodeUrl ? testnetClient.getActiveNodeUrl() : config.NODE_URL,
       };
+      this.lastFlushResult = res;
+      return res;
     } catch (err) {
       // Re-prepend ONLY the unsettled netted chunks so already-broadcast chunks are NEVER double-paid
       const unsettledNetted = netted.slice(nextUnsettledIndex);
@@ -302,6 +318,10 @@ class BatchSettlerTestnet2 {
       throw err;
     } finally {
       this.isFlushing = false;
+      if (flushPromiseResolve) {
+        flushPromiseResolve();
+      }
+      this.activeFlushPromise = null;
     }
   }
 

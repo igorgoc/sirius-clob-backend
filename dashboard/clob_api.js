@@ -3837,7 +3837,7 @@ async function _placeOrderUnlocked(orderReq) {
       if (fillsCount > 0) {
         try {
           const { defaultBatchSettlerTestnet2 } = require('./batch_settler_testnet2');
-          if (defaultBatchSettlerTestnet2 && defaultBatchSettlerTestnet2.getPendingCount() > 0) {
+          if (defaultBatchSettlerTestnet2) {
             const flushRes = await defaultBatchSettlerTestnet2.flushBatch();
             if (flushRes && flushRes.txHash) {
               onChainTxHash = flushRes.txHash;
