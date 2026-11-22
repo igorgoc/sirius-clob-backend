@@ -26,6 +26,7 @@ if (!String.prototype.replaceAll) {
 const {
   executeOnNodeVm,
   assert3NodeConsensus,
+  safeRmSync,
   NODES,
   DRIVE_KEY_HEX,
   ALICE_KEY_HEX,
@@ -1363,7 +1364,7 @@ function importNodeDriveSnapshot(targetNodeName, snapshotBundle) {
   const targetSandbox = path.join(CLUSTER_DIR, targetNodeName, 'data', 'drives', DRIVE_KEY_HEX, 'sandbox');
   const tmpMarkets = `${targetMarkets}.sync.${process.pid}.${Date.now()}`;
 
-  fs.rmSync(tmpMarkets, { recursive: true, force: true });
+  safeRmSync(tmpMarkets);
   fs.mkdirSync(tmpMarkets, { recursive: true });
   const resolvedTmpRoot = path.resolve(tmpMarkets);
   const resolvedTmpPrefix = resolvedTmpRoot.endsWith(path.sep) ? resolvedTmpRoot : resolvedTmpRoot + path.sep;
@@ -1396,21 +1397,21 @@ function importNodeDriveSnapshot(targetNodeName, snapshotBundle) {
       );
     }
 
-    fs.rmSync(targetSandbox, { recursive: true, force: true });
-    fs.rmSync(targetMarkets, { recursive: true, force: true });
+    safeRmSync(targetSandbox);
+    safeRmSync(targetMarkets);
     try {
       fs.renameSync(tmpMarkets, targetMarkets);
     } catch (renameErr) {
       if (renameErr.code === 'EXDEV' || renameErr.code === 'EPERM') {
         fs.cpSync(tmpMarkets, targetMarkets, { recursive: true, force: true });
-        fs.rmSync(tmpMarkets, { recursive: true, force: true });
+        safeRmSync(tmpMarkets);
       } else {
         throw renameErr;
       }
     }
     return { ok: true, node: targetNodeName, stateRootHash: stagedHash };
   } catch (err) {
-    fs.rmSync(tmpMarkets, { recursive: true, force: true });
+    safeRmSync(tmpMarkets);
     throw err;
   }
 }
@@ -1447,7 +1448,9 @@ function syncAllReplicatorDrivesFromNode1() {
     if (node === sourceNode) continue;
     try {
       importNodeDriveSnapshot(node, snapshot);
-    } catch (_) {}
+    } catch (err) {
+      console.warn(`[SyncReplicatorDrives] Failed to sync ${node} from ${sourceNode}:`, err.message);
+    }
   }
 }
 
