@@ -1867,27 +1867,33 @@ function getAccountBalance(publicKey) {
   const localBalances = loadBalances();
   const driveBal = getDriveBalances(key);
 
-  if (driveBal) {
+  if (!localBalances[key]) {
     localBalances[key] = {
-      xpx: driveBal.xpx,
-      usdt: driveBal.usdt,
-      bnb: driveBal.bnb,
-      lockedXpx: driveBal.lockedXpx,
-      lockedUsdt: driveBal.lockedUsdt,
-      lockedBnb: driveBal.lockedBnb,
+      xpx: driveBal ? driveBal.xpx : 0n,
+      usdt: driveBal ? driveBal.usdt : 0n,
+      bnb: driveBal ? driveBal.bnb : 0n,
+      lockedXpx: driveBal ? driveBal.lockedXpx : 0n,
+      lockedUsdt: driveBal ? driveBal.lockedUsdt : 0n,
+      lockedBnb: driveBal ? driveBal.lockedBnb : 0n,
       lastUpdated: Date.now(),
     };
     saveBalances(localBalances);
-  } else if (!localBalances[key]) {
-    localBalances[key] = {
-      xpx: 0n,
-      usdt: 0n,
-      bnb: 0n,
-      lockedXpx: 0n,
-      lockedUsdt: 0n,
-      lockedBnb: 0n,
-      lastUpdated: Date.now(),
-    };
+  } else if (driveBal) {
+    // Only update locked escrow amounts from drive - NEVER wipe trading balance
+    localBalances[key].lockedXpx = driveBal.lockedXpx;
+    localBalances[key].lockedUsdt = driveBal.lockedUsdt;
+    localBalances[key].lockedBnb = driveBal.lockedBnb;
+    // If drive has explicit free balance higher than local, allow it
+    if (driveBal.xpx > BigInt(localBalances[key].xpx || 0n)) {
+      localBalances[key].xpx = driveBal.xpx;
+    }
+    if (driveBal.usdt > BigInt(localBalances[key].usdt || 0n)) {
+      localBalances[key].usdt = driveBal.usdt;
+    }
+    if (driveBal.bnb > BigInt(localBalances[key].bnb || 0n)) {
+      localBalances[key].bnb = driveBal.bnb;
+    }
+    localBalances[key].lastUpdated = Date.now();
     saveBalances(localBalances);
   }
 
@@ -1974,8 +1980,7 @@ async function syncAndGetAccountBalance(publicKeyOrAddr) {
 
   // 3. Current drive balances and locked balances in open orders
   const balances = loadBalances();
-  const isNewAccount = !balances[key];
-  const currentEntry = balances[key] || {
+  let currentEntry = balances[key] || {
     xpx: 0n,
     usdt: 0n,
     bnb: 0n,
@@ -1985,49 +1990,68 @@ async function syncAndGetAccountBalance(publicKeyOrAddr) {
     lastOnChainXpx: onChainXpx,
     lastOnChainUsdt: onChainUsdt,
     lastOnChainBnb: onChainBnb,
+    lastUpdated: Date.now(),
   };
-  const driveBal = getDriveBalances(key) || { xpx: 0n, usdt: 0n, bnb: 0n };
+  const driveBal = getDriveBalances(key);
 
   const lockedXpx = BigInt(currentEntry.lockedXpx || 0n);
   const lockedUsdt = BigInt(currentEntry.lockedUsdt || 0n);
   const lockedBnb = BigInt(currentEntry.lockedBnb || 0n);
 
-  if (isNewAccount) {
-    // Initial onboarding: credit on-chain wallet balance plus any existing drive balance
-    currentEntry.xpx = BigInt(onChainXpx || 0n) + BigInt(driveBal.xpx || 0n);
-    currentEntry.usdt = BigInt(onChainUsdt || 0n) + BigInt(driveBal.usdt || 0n);
-    currentEntry.bnb = BigInt(onChainBnb || 0n) + BigInt(driveBal.bnb || 0n);
-    currentEntry.lastOnChainXpx = onChainXpx;
-    currentEntry.lastOnChainUsdt = onChainUsdt;
-    currentEntry.lastOnChainBnb = onChainBnb;
-  } else {
-    // Existing account: Check for newly arrived on-chain deposits (e.g. faucet, external transfer)
-    // and credit only the positive delta so executed trades are NEVER overwritten!
-    const lastXpx = BigInt(currentEntry.lastOnChainXpx !== undefined ? currentEntry.lastOnChainXpx : onChainXpx);
-    const lastUsdt = BigInt(currentEntry.lastOnChainUsdt !== undefined ? currentEntry.lastOnChainUsdt : onChainUsdt);
-    const lastBnb = BigInt(currentEntry.lastOnChainBnb !== undefined ? currentEntry.lastOnChainBnb : onChainBnb);
+  const totalOnChainXpx = BigInt(onChainXpx || 0n) + BigInt(driveBal ? driveBal.xpx : 0n);
+  const totalOnChainUsdt = BigInt(onChainUsdt || 0n) + BigInt(driveBal ? driveBal.usdt : 0n);
+  const totalOnChainBnb = BigInt(onChainBnb || 0n) + BigInt(driveBal ? driveBal.bnb : 0n);
 
-    const deltaXpx = onChainXpx > lastXpx ? (onChainXpx - lastXpx) : 0n;
-    const deltaUsdt = onChainUsdt > lastUsdt ? (onChainUsdt - lastUsdt) : 0n;
-    const deltaBnb = onChainBnb > lastBnb ? (onChainBnb - lastBnb) : 0n;
+  const walletBackedXpx = totalOnChainXpx > lockedXpx ? (totalOnChainXpx - lockedXpx) : 0n;
+  const walletBackedUsdt = totalOnChainUsdt > lockedUsdt ? (totalOnChainUsdt - lockedUsdt) : 0n;
+  const walletBackedBnb = totalOnChainBnb > lockedBnb ? (totalOnChainBnb - lockedBnb) : 0n;
 
-    if (deltaXpx > 0n) currentEntry.xpx = BigInt(currentEntry.xpx || 0n) + deltaXpx;
-    if (deltaUsdt > 0n) currentEntry.usdt = BigInt(currentEntry.usdt || 0n) + deltaUsdt;
-    if (deltaBnb > 0n) currentEntry.bnb = BigInt(currentEntry.bnb || 0n) + deltaBnb;
+  let rawLocalXpx = BigInt(currentEntry.xpx || 0n);
+  let rawLocalUsdt = BigInt(currentEntry.usdt || 0n);
+  let rawLocalBnb = BigInt(currentEntry.bnb || 0n);
 
-    currentEntry.lastOnChainXpx = onChainXpx;
-    currentEntry.lastOnChainUsdt = onChainUsdt;
-    currentEntry.lastOnChainBnb = onChainBnb;
+  // Check for newly arrived on-chain deposits (e.g. faucet, external transfer)
+  const lastXpx = BigInt(currentEntry.lastOnChainXpx !== undefined ? currentEntry.lastOnChainXpx : onChainXpx);
+  const lastUsdt = BigInt(currentEntry.lastOnChainUsdt !== undefined ? currentEntry.lastOnChainUsdt : onChainUsdt);
+  const lastBnb = BigInt(currentEntry.lastOnChainBnb !== undefined ? currentEntry.lastOnChainBnb : onChainBnb);
+
+  const deltaXpx = onChainXpx > lastXpx ? (onChainXpx - lastXpx) : 0n;
+  const deltaUsdt = onChainUsdt > lastUsdt ? (onChainUsdt - lastUsdt) : 0n;
+  const deltaBnb = onChainBnb > lastBnb ? (onChainBnb - lastBnb) : 0n;
+
+  if (deltaXpx > 0n) rawLocalXpx += deltaXpx;
+  if (deltaUsdt > 0n) rawLocalUsdt += deltaUsdt;
+  if (deltaBnb > 0n) rawLocalBnb += deltaBnb;
+
+  // Bulletproof Re-anchoring Shield:
+  // Rule 1: XPX can only be below walletBackedXpx if user sold XPX (reflected by quote balance > on-chain quote)
+  const hasSoldXpx = (rawLocalUsdt > totalOnChainUsdt) || (rawLocalBnb > totalOnChainBnb);
+  if (!hasSoldXpx && rawLocalXpx < walletBackedXpx) {
+    rawLocalXpx = walletBackedXpx;
   }
 
-  const rawLocalXpx = BigInt(currentEntry.xpx || 0n);
-  const rawLocalUsdt = BigInt(currentEntry.usdt || 0n);
-  const rawLocalBnb = BigInt(currentEntry.bnb || 0n);
+  // Rule 2: USDT can only be below walletBackedUsdt if user bought XPX (reflected by XPX balance > on-chain XPX)
+  const hasBoughtWithUsdt = (rawLocalXpx > totalOnChainXpx);
+  if (!hasBoughtWithUsdt && rawLocalUsdt < walletBackedUsdt) {
+    rawLocalUsdt = walletBackedUsdt;
+  }
 
+  // Rule 3: BNB can only be below walletBackedBnb if user bought XPX with BNB
+  if (!hasBoughtWithUsdt && rawLocalBnb < walletBackedBnb) {
+    rawLocalBnb = walletBackedBnb;
+  }
+
+  currentEntry.xpx = rawLocalXpx;
+  currentEntry.usdt = rawLocalUsdt;
+  currentEntry.bnb = rawLocalBnb;
   currentEntry.lockedXpx = lockedXpx;
   currentEntry.lockedUsdt = lockedUsdt;
   currentEntry.lockedBnb = lockedBnb;
+  currentEntry.lastOnChainXpx = onChainXpx;
+  currentEntry.lastOnChainUsdt = onChainUsdt;
+  currentEntry.lastOnChainBnb = onChainBnb;
   currentEntry.lastUpdated = Date.now();
+
   balances[key] = currentEntry;
   saveBalances(balances);
 
@@ -2335,28 +2359,37 @@ function syncGatewayCacheFromDrive(publicKey) {
   const driveBal = getDriveBalances(key);
   const localBalances = loadBalances();
 
-  if (driveBal) {
+  if (!localBalances[key]) {
     localBalances[key] = {
-      xpx: driveBal.xpx,
-      usdt: driveBal.usdt,
-      bnb: driveBal.bnb,
-      lockedXpx: driveBal.lockedXpx,
-      lockedUsdt: driveBal.lockedUsdt,
-      lockedBnb: driveBal.lockedBnb,
+      xpx: driveBal ? driveBal.xpx : 0n,
+      usdt: driveBal ? driveBal.usdt : 0n,
+      bnb: driveBal ? driveBal.bnb : 0n,
+      lockedXpx: driveBal ? driveBal.lockedXpx : 0n,
+      lockedUsdt: driveBal ? driveBal.lockedUsdt : 0n,
+      lockedBnb: driveBal ? driveBal.lockedBnb : 0n,
       lastUpdated: Date.now(),
     };
-  } else {
-    localBalances[key] = {
-      xpx: 0n,
-      usdt: 0n,
-      bnb: 0n,
-      lockedXpx: 0n,
-      lockedUsdt: 0n,
-      lockedBnb: 0n,
-      lastUpdated: Date.now(),
-    };
+    saveBalances(localBalances);
+    return localBalances[key];
   }
-  saveBalances(localBalances);
+
+  if (driveBal) {
+    // Sync locked escrow amounts from drive - NEVER wipe or overwrite trading balances!
+    localBalances[key].lockedXpx = driveBal.lockedXpx;
+    localBalances[key].lockedUsdt = driveBal.lockedUsdt;
+    localBalances[key].lockedBnb = driveBal.lockedBnb;
+    if (driveBal.xpx > BigInt(localBalances[key].xpx || 0n)) {
+      localBalances[key].xpx = driveBal.xpx;
+    }
+    if (driveBal.usdt > BigInt(localBalances[key].usdt || 0n)) {
+      localBalances[key].usdt = driveBal.usdt;
+    }
+    if (driveBal.bnb > BigInt(localBalances[key].bnb || 0n)) {
+      localBalances[key].bnb = driveBal.bnb;
+    }
+    localBalances[key].lastUpdated = Date.now();
+    saveBalances(localBalances);
+  }
   return localBalances[key];
 }
 
@@ -2392,14 +2425,20 @@ function syncAllGatewayBalancesFromDrive() {
       const locked = BigInt(e.locked_amount || '0');
 
       if (isXpxMosaic(mosaicId) || mosaicId.startsWith('992621222383397')) {
-        localBalances[pubkeyHex].xpx = free;
         localBalances[pubkeyHex].lockedXpx = locked;
+        if (free > BigInt(localBalances[pubkeyHex].xpx || 0n)) {
+          localBalances[pubkeyHex].xpx = free;
+        }
       } else if (mosaicId === USDT_MOSAIC_ID || mosaicId.startsWith('1157755757097881')) {
-        localBalances[pubkeyHex].usdt = free;
         localBalances[pubkeyHex].lockedUsdt = locked;
+        if (free > BigInt(localBalances[pubkeyHex].usdt || 0n)) {
+          localBalances[pubkeyHex].usdt = free;
+        }
       } else if (mosaicId === BNB_MOSAIC_ID || mosaicId.startsWith('2187728719596696')) {
-        localBalances[pubkeyHex].bnb = free;
         localBalances[pubkeyHex].lockedBnb = locked;
+        if (free > BigInt(localBalances[pubkeyHex].bnb || 0n)) {
+          localBalances[pubkeyHex].bnb = free;
+        }
       }
     }
     saveBalances(localBalances);
