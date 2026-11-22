@@ -79,6 +79,10 @@ function getDb(customPath = null) {
       locked_xpx TEXT NOT NULL DEFAULT '0' CHECK(CAST(locked_xpx AS INTEGER) >= 0 AND locked_xpx NOT LIKE '-%'),
       locked_usdt TEXT NOT NULL DEFAULT '0' CHECK(CAST(locked_usdt AS INTEGER) >= 0 AND locked_usdt NOT LIKE '-%'),
       locked_bnb TEXT NOT NULL DEFAULT '0' CHECK(CAST(locked_bnb AS INTEGER) >= 0 AND locked_bnb NOT LIKE '-%'),
+      has_traded INTEGER NOT NULL DEFAULT 0,
+      last_on_chain_xpx TEXT NOT NULL DEFAULT '0',
+      last_on_chain_usdt TEXT NOT NULL DEFAULT '0',
+      last_on_chain_bnb TEXT NOT NULL DEFAULT '0',
       updated_at INTEGER NOT NULL
     );
 
@@ -142,6 +146,19 @@ function getDb(customPath = null) {
       `);
     })();
   }
+
+  // Automated schema migration for trade persistence & on-chain delta tracking
+  try {
+    const balanceCols = db.prepare("PRAGMA table_info(account_balances)").all().map(c => c.name);
+    if (!balanceCols.includes('has_traded')) {
+      db.exec(`
+        ALTER TABLE account_balances ADD COLUMN has_traded INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE account_balances ADD COLUMN last_on_chain_xpx TEXT NOT NULL DEFAULT '0';
+        ALTER TABLE account_balances ADD COLUMN last_on_chain_usdt TEXT NOT NULL DEFAULT '0';
+        ALTER TABLE account_balances ADD COLUMN last_on_chain_bnb TEXT NOT NULL DEFAULT '0';
+      `);
+    }
+  } catch (_) {}
 
   const creditsTable = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='ledger_credits'").get();
   if (creditsTable && !creditsTable.sql.includes('CAST(amount AS INTEGER) > 0')) {
@@ -510,6 +527,10 @@ function getDbAccountBalance(callerKey, customDb = null) {
       lockedXpx: 0n,
       lockedUsdt: 0n,
       lockedBnb: 0n,
+      hasTraded: false,
+      lastOnChainXpx: 0n,
+      lastOnChainUsdt: 0n,
+      lastOnChainBnb: 0n,
     };
   }
   return {
@@ -519,6 +540,10 @@ function getDbAccountBalance(callerKey, customDb = null) {
     lockedXpx: BigInt(row.locked_xpx || '0'),
     lockedUsdt: BigInt(row.locked_usdt || '0'),
     lockedBnb: BigInt(row.locked_bnb || '0'),
+    hasTraded: Boolean(row.has_traded),
+    lastOnChainXpx: BigInt(row.last_on_chain_xpx || '0'),
+    lastOnChainUsdt: BigInt(row.last_on_chain_usdt || '0'),
+    lastOnChainBnb: BigInt(row.last_on_chain_bnb || '0'),
   };
 }
 
@@ -555,8 +580,11 @@ function updateDbAccountBalance(callerKey, updaterFn, options = {}, customDb = n
     }
 
     db.prepare(`
-      INSERT INTO account_balances (caller_key, xpx, usdt, bnb, locked_xpx, locked_usdt, locked_bnb, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO account_balances (
+        caller_key, xpx, usdt, bnb, locked_xpx, locked_usdt, locked_bnb,
+        has_traded, last_on_chain_xpx, last_on_chain_usdt, last_on_chain_bnb, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(caller_key) DO UPDATE SET
         xpx = excluded.xpx,
         usdt = excluded.usdt,
@@ -564,6 +592,10 @@ function updateDbAccountBalance(callerKey, updaterFn, options = {}, customDb = n
         locked_xpx = excluded.locked_xpx,
         locked_usdt = excluded.locked_usdt,
         locked_bnb = excluded.locked_bnb,
+        has_traded = excluded.has_traded,
+        last_on_chain_xpx = excluded.last_on_chain_xpx,
+        last_on_chain_usdt = excluded.last_on_chain_usdt,
+        last_on_chain_bnb = excluded.last_on_chain_bnb,
         updated_at = excluded.updated_at
     `).run(
       normKey,
@@ -573,6 +605,10 @@ function updateDbAccountBalance(callerKey, updaterFn, options = {}, customDb = n
       (modified.lockedXpx || 0n).toString(),
       (modified.lockedUsdt || 0n).toString(),
       (modified.lockedBnb || 0n).toString(),
+      modified.hasTraded ? 1 : 0,
+      (modified.lastOnChainXpx || 0n).toString(),
+      (modified.lastOnChainUsdt || 0n).toString(),
+      (modified.lastOnChainBnb || 0n).toString(),
       now
     );
   });

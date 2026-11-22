@@ -1892,6 +1892,10 @@ function loadBalances() {
         lockedXpx: BigInt(r.locked_xpx || '0'),
         lockedUsdt: BigInt(r.locked_usdt || '0'),
         lockedBnb: BigInt(r.locked_bnb || '0'),
+        hasTraded: Boolean(r.has_traded),
+        lastOnChainXpx: BigInt(r.last_on_chain_xpx || '0'),
+        lastOnChainUsdt: BigInt(r.last_on_chain_usdt || '0'),
+        lastOnChainBnb: BigInt(r.last_on_chain_bnb || '0'),
         lastUpdated: r.updated_at,
       };
     }
@@ -1909,6 +1913,10 @@ function loadBalances() {
             lockedXpx: BigInt(v.lockedXpx || 0),
             lockedUsdt: BigInt(v.lockedUsdt || 0),
             lockedBnb: BigInt(v.lockedBnb || 0),
+            hasTraded: Boolean(v.hasTraded),
+            lastOnChainXpx: BigInt(v.lastOnChainXpx || 0),
+            lastOnChainUsdt: BigInt(v.lastOnChainUsdt || 0),
+            lastOnChainBnb: BigInt(v.lastOnChainBnb || 0),
             lastUpdated: v.lastUpdated || Date.now(),
           };
         }
@@ -1922,8 +1930,11 @@ function saveBalances(balances) {
   try {
     const db = clobDb.getDb();
     const insertStmt = db.prepare(`
-      INSERT INTO account_balances (caller_key, xpx, usdt, bnb, locked_xpx, locked_usdt, locked_bnb, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO account_balances (
+        caller_key, xpx, usdt, bnb, locked_xpx, locked_usdt, locked_bnb,
+        has_traded, last_on_chain_xpx, last_on_chain_usdt, last_on_chain_bnb, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(caller_key) DO UPDATE SET
         xpx = excluded.xpx,
         usdt = excluded.usdt,
@@ -1931,6 +1942,10 @@ function saveBalances(balances) {
         locked_xpx = excluded.locked_xpx,
         locked_usdt = excluded.locked_usdt,
         locked_bnb = excluded.locked_bnb,
+        has_traded = excluded.has_traded,
+        last_on_chain_xpx = excluded.last_on_chain_xpx,
+        last_on_chain_usdt = excluded.last_on_chain_usdt,
+        last_on_chain_bnb = excluded.last_on_chain_bnb,
         updated_at = excluded.updated_at
     `);
     const updateAll = db.transaction(() => {
@@ -1944,6 +1959,10 @@ function saveBalances(balances) {
           (b.lockedXpx || 0n).toString(),
           (b.lockedUsdt || 0n).toString(),
           (b.lockedBnb || 0n).toString(),
+          b.hasTraded ? 1 : 0,
+          (b.lastOnChainXpx || 0n).toString(),
+          (b.lastOnChainUsdt || 0n).toString(),
+          (b.lastOnChainBnb || 0n).toString(),
           now
         );
       }
@@ -3899,6 +3918,7 @@ async function _placeOrderUnlocked(orderReq) {
     // Release caller escrow consumed by fills
     if (takerBaseFilled > 0n) {
       updateAccountBalance(callerKey, (b) => {
+        b.hasTraded = true;
         if (side === 0) {
           const quoteConsumed = (requiredQuote * takerBaseFilled + amountAtomic - 1n) / amountAtomic;
           if (isBnb) {
