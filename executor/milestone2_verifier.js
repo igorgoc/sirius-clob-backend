@@ -719,8 +719,12 @@ function assert3NodeConsensus(stageName, results, expectSuccessOrOpts = true) {
     }
   }
 
+  const nodeDetails = validResults
+    .map((r) => `${r.node}: ret=${r.returns?.return_val} root=${(r.stateRootHash || 'null').slice(0, 10)}`)
+    .join(', ');
+
   throw new Error(
-    `[${stageName}] Consensus divergence across nodes: no ${minQuorum}/${NODES.length} BFT quorum agreed on return_val + stateRootHash`
+    `[${stageName}] Consensus divergence across nodes: no ${minQuorum}/${NODES.length} BFT quorum agreed on return_val + stateRootHash (${nodeDetails})`
   );
 }
 

@@ -387,6 +387,7 @@ class ClobMarketMaker {
         } catch (_) {}
         fs.mkdirSync(mDir, { recursive: true });
       }
+      this.syncDriveReplicas();
 
       // 1. Seed Bids
       for (let i = 1; i <= m.levels; i++) {
