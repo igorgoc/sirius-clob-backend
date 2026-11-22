@@ -3257,4 +3257,23 @@ server.listen(PORT, HOST, () => {
       console.warn('[Market Maker] Could not auto-start MM bot:', err.message);
     }
   }
+
+  // Autonomous 24/7 Liquidity Watchdog: Guarantees order books are ALWAYS filled on both pairs
+  setInterval(() => {
+    try {
+      const usdtDepth = clobApi.getMarketDepthSnapshot('xpx_usdt');
+      const bnbDepth = clobApi.getMarketDepthSnapshot('xpx_bnb');
+      const usdtDepleted = !usdtDepth || !Array.isArray(usdtDepth.bids) || usdtDepth.bids.length < 2 || !Array.isArray(usdtDepth.asks) || usdtDepth.asks.length < 2;
+      const bnbDepleted = !bnbDepth || !Array.isArray(bnbDepth.bids) || bnbDepth.bids.length < 2 || !Array.isArray(bnbDepth.asks) || bnbDepth.asks.length < 2;
+      if (usdtDepleted || bnbDepleted) {
+        console.log('[LiquidityWatchdog] Depleted depth detected on order books! Triggering autonomous reseed step...');
+        execFile('node', [path.join(ROOT_DIR, 'scripts/clob_market_maker.js'), '--step'], { maxBuffer: 10 * 1024 * 1024 }, (err) => {
+          if (err) console.warn('[LiquidityWatchdog] Reseed step error:', err.message);
+          else console.log('[LiquidityWatchdog] Autonomous reseed step successfully completed.');
+        });
+      }
+    } catch (err) {
+      console.warn('[LiquidityWatchdog] Check error:', err.message);
+    }
+  }, 12000);
 });

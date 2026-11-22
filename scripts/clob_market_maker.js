@@ -262,19 +262,85 @@ class ClobMarketMaker {
       )
     );
 
-    assert3NodeConsensus(label, results);
-    return results[0].returns;
+    let consensus;
+    try {
+      consensus = assert3NodeConsensus(label, results, {
+        expectSuccess: true,
+        allowQuorum: true,
+      });
+      if (consensus && consensus.nonQuorum && consensus.nonQuorum.length > 0) {
+        this.syncDriveReplicas();
+      }
+    } catch (err) {
+      if (err.message && err.message.includes('Consensus divergence')) {
+        console.warn(`[MM Self-Healing] Consensus divergence in ${label}. Healing drives from node1 and retrying...`);
+        this.syncDriveReplicas();
+        const retryResults = await Promise.all(
+          NODES.map((n) =>
+            executeOnNodeVm(
+              n,
+              this.nodeWasmPaths[n.name],
+              'run',
+              height,
+              cryptoRandomHex(32),
+              ++this.txCounter,
+              this.nodeDrivePaths[n.name],
+              {
+                parameters: params,
+                callerKeyHex,
+                servicePayments,
+              }
+            )
+          )
+        );
+        consensus = assert3NodeConsensus(label, retryResults, {
+          expectSuccess: true,
+          allowQuorum: true,
+        });
+        return (consensus && consensus.quorum && consensus.quorum[0] && consensus.quorum[0].returns)
+          ? consensus.quorum[0].returns
+          : retryResults[0].returns;
+      }
+      throw err;
+    }
+    return (consensus && consensus.quorum && consensus.quorum[0] && consensus.quorum[0].returns)
+      ? consensus.quorum[0].returns
+      : results[0].returns;
   }
 
-  async seedMarketLadder(marketKey) {
+  async ensureMarketLadderDepth(marketKey) {
+    const m = this.markets[marketKey];
+    const driveDepthPath = path.join(this.nodeDrivePaths['node1'], 'drive', `markets/${marketKey}/depth.json`);
+    let needsSeeding = false;
+    if (!fs.existsSync(driveDepthPath)) {
+      needsSeeding = true;
+    } else {
+      try {
+        const existing = JSON.parse(fs.readFileSync(driveDepthPath, 'utf8'));
+        const bidsCount = Array.isArray(existing.bids) ? existing.bids.length : 0;
+        const asksCount = Array.isArray(existing.asks) ? existing.asks.length : 0;
+        if (bidsCount < 3 || asksCount < 3) {
+          console.log(`⚠️ [LiquidityGuard] ${m.symbol} depth degraded (bids: ${bidsCount}, asks: ${asksCount}). Auto-replenishing full ladder...`);
+          needsSeeding = true;
+        }
+      } catch (_) {
+        needsSeeding = true;
+      }
+    }
+    if (needsSeeding) {
+      await this.seedMarketLadder(marketKey, true);
+    }
+  }
+
+  async seedMarketLadder(marketKey, forceReseed = false) {
     const m = this.markets[marketKey];
     const driveDepthPath = path.join(this.nodeDrivePaths['node1'], 'drive', `markets/${marketKey}/depth.json`);
 
-    let needReseed = true;
-    if (fs.existsSync(driveDepthPath)) {
+    let needReseed = Boolean(forceReseed);
+    if (!needReseed && fs.existsSync(driveDepthPath)) {
       try {
         const existing = JSON.parse(fs.readFileSync(driveDepthPath, 'utf8'));
-        if (existing.bids && existing.bids.length >= 2 && existing.asks && existing.asks.length >= 2) {
+        if (existing.bids && existing.bids.length >= 3 && existing.asks && existing.asks.length >= 3) {
           const existingMid = Math.floor((existing.best_bid + existing.best_ask) / 2);
           // Check if existing book price deviates wildly (>25%) from PancakeSwap oracle price
           const priceDiffRatio = Math.abs(existingMid - m.currentMidPrice) / m.currentMidPrice;
@@ -284,9 +350,14 @@ class ClobMarketMaker {
             needReseed = false;
           } else {
             console.log(`⚠️ [${m.symbol}] Existing book price (${existingMid}) deviates ${(priceDiffRatio * 100).toFixed(1)}% from PancakeSwap (${m.currentMidPrice}). Purging stale book for fresh alignment...`);
+            needReseed = true;
           }
+        } else {
+          needReseed = true;
         }
-      } catch (_) {}
+      } catch (_) {
+        needReseed = true;
+      }
     }
 
     if (needReseed) {
@@ -360,6 +431,10 @@ class ClobMarketMaker {
   }
 
   async simulateTradingRound(roundNum) {
+    // 0. Continuous Liquidity Guard: Ensure both markets ALWAYS have healthy depth ladders
+    await this.ensureMarketLadderDepth('xpx_usdt');
+    await this.ensureMarketLadderDepth('xpx_bnb');
+
     // 1. Periodically check oracle for macro drift
     if (roundNum % 5 === 0) {
       await this.fetchOraclePrices(false);
