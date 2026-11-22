@@ -1702,9 +1702,17 @@ function checkAndEnforceCircuitBreaker(contextLabel = 'CLOB Operation') {
 // Initial replicator drive synchronization on start
 ensureDriveSync();
 
-// Global Cluster Consensus Sequencer Lock (prevents packet reordering / interleaving across WAN nodes)
+// Global Cluster Consensus Sequencer Lock (prevents packet reordering / interleaving across WAN nodes & child processes)
 let clusterConsensusQueue = Promise.resolve();
 let clusterConsensusSeq = 0;
+const CONSENSUS_LOCK_DIR = path.join(CLUSTER_DIR, 'consensus_ipc.lock');
+const CONSENSUS_LOCK_OWNER = path.join(CONSENSUS_LOCK_DIR, 'owner.json');
+
+// Cleanup any stale lock directory on boot
+try {
+  if (fs.existsSync(CONSENSUS_LOCK_OWNER)) fs.unlinkSync(CONSENSUS_LOCK_OWNER);
+  if (fs.existsSync(CONSENSUS_LOCK_DIR)) fs.rmdirSync(CONSENSUS_LOCK_DIR);
+} catch (_) {}
 
 async function withClusterConsensusLock(fn) {
   const prev = clusterConsensusQueue;
@@ -1714,9 +1722,46 @@ async function withClusterConsensusLock(fn) {
   });
   clusterConsensusQueue = current;
   await prev.catch(() => {});
+
+  // Inter-process directory mutex: prevents separate node processes (e.g. MM daemon and server) from clashing on VM execution
+  const lockStart = Date.now();
+  while (true) {
+    try {
+      fs.mkdirSync(CONSENSUS_LOCK_DIR);
+      try {
+        fs.writeFileSync(CONSENSUS_LOCK_OWNER, JSON.stringify({ pid: process.pid, time: Date.now() }));
+      } catch (_) {}
+      break;
+    } catch (e) {
+      if (e.code === 'EEXIST') {
+        try {
+          if (fs.existsSync(CONSENSUS_LOCK_OWNER)) {
+            const data = JSON.parse(fs.readFileSync(CONSENSUS_LOCK_OWNER, 'utf8'));
+            if (Date.now() - (data.time || 0) > 60000) {
+              try { fs.unlinkSync(CONSENSUS_LOCK_OWNER); } catch (_) {}
+              try { fs.rmdirSync(CONSENSUS_LOCK_DIR); } catch (_) {}
+              continue;
+            }
+          }
+        } catch (_) {}
+        if (Date.now() - lockStart > 60000) {
+          console.warn('[Consensus Lock] Lock acquisition timed out; clearing stale lock and proceeding');
+          try { fs.unlinkSync(CONSENSUS_LOCK_OWNER); } catch (_) {}
+          try { fs.rmdirSync(CONSENSUS_LOCK_DIR); } catch (_) {}
+          continue;
+        }
+        await new Promise((r) => setTimeout(r, 60));
+      } else {
+        break;
+      }
+    }
+  }
+
   try {
     return await fn(++clusterConsensusSeq);
   } finally {
+    try { fs.unlinkSync(CONSENSUS_LOCK_OWNER); } catch (_) {}
+    try { fs.rmdirSync(CONSENSUS_LOCK_DIR); } catch (_) {}
     release();
   }
 }
