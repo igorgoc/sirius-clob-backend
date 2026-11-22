@@ -590,9 +590,15 @@ const server = http.createServer((req, res) => {
   const isDirectLocal = isDirectLocalhost(req);
 
   // Hardened Security & CORS headers
+  const isAdminRoute = pathname.startsWith('/api/admin') || pathname.startsWith('/api/logs');
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-Admin-Key');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    isAdminRoute
+      ? 'Content-Type, Authorization, X-Requested-With, X-Admin-Key'
+      : 'Content-Type, Authorization, X-Requested-With'
+  );
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('X-XSS-Protection', '1; mode=block');
@@ -1204,6 +1210,8 @@ const server = http.createServer((req, res) => {
   // SiriusCLOB DEX Endpoint: Live Trade History (from Replicator Drive)
   if (pathname === '/api/clob/trades' && req.method === 'GET') {
     const market = sanitizeMarket(parsedUrl.searchParams.get('pair') || parsedUrl.searchParams.get('market'));
+    const limitParam = parseInt(parsedUrl.searchParams.get('limit') || '100', 10);
+    const limit = Math.min(500, Math.max(1, isNaN(limitParam) ? 100 : limitParam));
     const DRIVE_KEY_HEX = 'bd1d100a98c34f62e170a8395b4498dc1e730286f5a12c489b37d01562f0cb23';
     const tradesPath = path.join(CLUSTER_DIR, 'node1', 'data', 'drives', DRIVE_KEY_HEX, 'drive', 'markets', market, 'trades.json');
     if (fs.existsSync(tradesPath)) {
@@ -1220,8 +1228,9 @@ const server = http.createServer((req, res) => {
               time
             };
           });
+          const recentTrades = enriched.slice(-limit).reverse();
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(enriched));
+          res.end(JSON.stringify(recentTrades));
           return;
         }
       } catch (_) {}
