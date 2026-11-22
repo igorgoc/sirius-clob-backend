@@ -244,84 +244,20 @@ class ClobMarketMaker {
     const txHash = cryptoRandomHex(32);
     this.txCounter++;
 
-    const results = await Promise.all(
-      NODES.map((n) =>
-        executeOnNodeVm(
-          n,
-          this.nodeWasmPaths[n.name],
-          'run',
-          height,
-          txHash,
-          this.txCounter,
-          this.nodeDrivePaths[n.name],
-          {
-            parameters: params,
-            callerKeyHex,
-            servicePayments,
-          }
-        )
-      )
+    const clobApi = require('../dashboard/clob_api');
+    const results = await clobApi.executeConsensusCall(
+      label,
+      height,
+      txHash,
+      this.txCounter,
+      {
+        parameters: params,
+        callerKeyHex,
+        servicePayments,
+      }
     );
 
-    let consensus;
-    try {
-      consensus = assert3NodeConsensus(label, results, {
-        expectSuccess: true,
-        allowQuorum: true,
-      });
-      for (const q of consensus.quorum) {
-        if (typeof q.commit === 'function') q.commit();
-      }
-      for (const nq of consensus.nonQuorum) {
-        if (typeof nq.rollback === 'function') nq.rollback();
-      }
-      if (consensus.nonQuorum.length > 0) {
-        this.syncDriveReplicas();
-      }
-      return (consensus.quorum[0] && consensus.quorum[0].returns)
-        ? consensus.quorum[0].returns
-        : results[0].returns;
-    } catch (err) {
-      for (const r of results) {
-        if (r && typeof r.rollback === 'function') r.rollback();
-      }
-      if (err.message && err.message.includes('Consensus divergence')) {
-        console.warn(`[MM Self-Healing] Consensus divergence in ${label}. Healing drives from node1 and retrying...`);
-        this.syncDriveReplicas();
-        const retryResults = await Promise.all(
-          NODES.map((n) =>
-            executeOnNodeVm(
-              n,
-              this.nodeWasmPaths[n.name],
-              'run',
-              height,
-              cryptoRandomHex(32),
-              ++this.txCounter,
-              this.nodeDrivePaths[n.name],
-              {
-                parameters: params,
-                callerKeyHex,
-                servicePayments,
-              }
-            )
-          )
-        );
-        consensus = assert3NodeConsensus(label, retryResults, {
-          expectSuccess: true,
-          allowQuorum: true,
-        });
-        for (const q of consensus.quorum) {
-          if (typeof q.commit === 'function') q.commit();
-        }
-        for (const nq of consensus.nonQuorum) {
-          if (typeof nq.rollback === 'function') nq.rollback();
-        }
-        return (consensus.quorum[0] && consensus.quorum[0].returns)
-          ? consensus.quorum[0].returns
-          : retryResults[0].returns;
-      }
-      throw err;
-    }
+    return (results && results[0] && results[0].returns) ? results[0].returns : { success: true, return_val: 0 };
   }
 
   async ensureMarketLadderDepth(marketKey) {
