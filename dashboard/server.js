@@ -3259,15 +3259,33 @@ server.listen(PORT, HOST, () => {
   }
 
   // Autonomous 24/7 Liquidity Watchdog: Guarantees order books are ALWAYS filled on both pairs
+  let isWatchdogReseeding = false;
   setInterval(() => {
     try {
+      if (isWatchdogReseeding) return;
+      const mmPidFile = path.join(CLUSTER_DIR, 'mm.pid');
+      let isDaemonAlive = false;
+      if (fs.existsSync(mmPidFile)) {
+        try {
+          const pid = parseInt(fs.readFileSync(mmPidFile, 'utf8').trim(), 10);
+          process.kill(pid, 0);
+          isDaemonAlive = true;
+        } catch (_) {}
+      }
+      // If the autonomous MM bot is already running, it manages its own continuous depth!
+      if (isDaemonAlive) {
+        return;
+      }
+
       const usdtDepth = clobApi.getMarketDepthSnapshot('xpx_usdt');
       const bnbDepth = clobApi.getMarketDepthSnapshot('xpx_bnb');
       const usdtDepleted = !usdtDepth || !Array.isArray(usdtDepth.bids) || usdtDepth.bids.length < 2 || !Array.isArray(usdtDepth.asks) || usdtDepth.asks.length < 2;
       const bnbDepleted = !bnbDepth || !Array.isArray(bnbDepth.bids) || bnbDepth.bids.length < 2 || !Array.isArray(bnbDepth.asks) || bnbDepth.asks.length < 2;
       if (usdtDepleted || bnbDepleted) {
-        console.log('[LiquidityWatchdog] Depleted depth detected on order books! Triggering autonomous reseed step...');
+        console.log('[LiquidityWatchdog] Depleted depth detected and no MM active. Triggering autonomous reseed step...');
+        isWatchdogReseeding = true;
         execFile('node', [path.join(ROOT_DIR, 'scripts/clob_market_maker.js'), '--step'], { maxBuffer: 10 * 1024 * 1024 }, (err) => {
+          isWatchdogReseeding = false;
           if (err) console.warn('[LiquidityWatchdog] Reseed step error:', err.message);
           else console.log('[LiquidityWatchdog] Autonomous reseed step successfully completed.');
         });

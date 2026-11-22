@@ -153,7 +153,7 @@ class ClobMarketMaker {
         tickSize: 100, // $0.00000100
         spreadTicks: 200, // $0.00000200 spread
         tickStep: 100,
-        levels: 5,
+        levels: 3,
         lotSize: 10_000_000, // 10 XPX
         takerLot: 5_000_000, // 5 XPX
         currentMidPrice: 7600, // Baseline: $0.00007600
@@ -165,7 +165,7 @@ class ClobMarketMaker {
         tickSize: 1, // 0.00000001 BNB
         spreadTicks: 2, // 0.00000002 BNB spread
         tickStep: 1,
-        levels: 4,
+        levels: 3,
         lotSize: 15_000_000, // 15 XPX
         takerLot: 10_000_000, // 10 XPX
         currentMidPrice: 14, // Baseline: 0.00000014 BNB
@@ -482,6 +482,16 @@ class ClobMarketMaker {
   }
 
   async run(rounds = 5, delayMs = 3000) {
+    if (fs.existsSync(MM_PID_FILE)) {
+      try {
+        const existingPid = parseInt(fs.readFileSync(MM_PID_FILE, 'utf8').trim(), 10);
+        if (existingPid && existingPid !== process.pid) {
+          process.kill(existingPid, 0);
+          console.log(`⚠️ Another Market Maker instance (PID ${existingPid}) is currently running. Exiting cleanly.`);
+          return { success: true, message: 'Already running' };
+        }
+      } catch (_) {}
+    }
     fs.writeFileSync(MM_PID_FILE, String(process.pid));
 
     let r = 1;

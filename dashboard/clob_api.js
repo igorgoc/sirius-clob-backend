@@ -1745,6 +1745,7 @@ async function executeConsensusCall(stageName, height, txHashHex, contractCallId
             contractCallId,
             nodeDrivePaths[n.name],
             {
+              timeoutMs: 45000,
               ...vmOptions,
               deferCommit: true,
               simulatedLatencyMs: perNodeLatency,

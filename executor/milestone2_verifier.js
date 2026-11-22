@@ -364,7 +364,20 @@ class DriveSandboxOverlay {
 
   commitOverlay() {
     this.closeAllHandles();
-    copyDirRecursive(this.sandboxDir, this.driveDir);
+    // Mirror synchronization: remove deleted files from driveDir before copy
+    const mirrorSync = (srcDir, dstDir) => {
+      if (!fs.existsSync(dstDir)) fs.mkdirSync(dstDir, { recursive: true });
+      for (const entry of fs.readdirSync(dstDir, { withFileTypes: true })) {
+        if (entry.isSymbolicLink() || entry.name.endsWith('.wasm')) continue;
+        const dstPath = path.join(dstDir, entry.name);
+        const srcPath = path.join(srcDir, entry.name);
+        if (!fs.existsSync(srcPath)) {
+          safeRmSync(dstPath);
+        }
+      }
+      copyDirRecursive(srcDir, dstDir);
+    };
+    mirrorSync(this.sandboxDir, this.driveDir);
     safeRmSync(this.sandboxDir);
   }
 
@@ -489,7 +502,7 @@ function _executeOnNodeVmUnlocked(
     const stream = client.ExecuteCall(callMetadata);
     let hostCallsHandled = 0;
 
-    const timeoutMs = Number(options.timeoutMs || 15000);
+    const timeoutMs = Number(options.timeoutMs || 45000);
     const timeout = setTimeout(() => {
       if (!isCompleted) {
         isCompleted = true;
@@ -656,8 +669,11 @@ function assert3NodeConsensus(stageName, results, expectSuccessOrOpts = true) {
   );
 
   if (validResults.length < minQuorum) {
+    const details = (Array.isArray(results) ? results : [])
+      .map((r) => `${r.node}: err=${r.error ? r.error.message || r.error : 'none'}, ret=${r.returns?.return_val}, success=${r.returns?.success}`)
+      .join(', ');
     throw new Error(
-      `[${stageName}] Consensus divergence: insufficient BFT quorum (${validResults.length}/${NODES.length} valid, need ${minQuorum})`
+      `[${stageName}] Consensus divergence: insufficient BFT quorum (${validResults.length}/${NODES.length} valid, need ${minQuorum}) - [${details}]`
     );
   }
 
