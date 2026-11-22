@@ -67,6 +67,103 @@ const USDT_MOSAIC_ID = BigInt('0x10112CBA1E7B9037').toString(10);
 const BNB_MOSAIC_ID = BigInt('0x1E5C5FADEC7B34DD').toString(10);
 const PRICE_SCALE = 100_000_000n;
 
+// Universal Mosaic Matchers (Handles Canonical Internal, Testnet 2, Mainnet, and Raw Hex/Decimal representations)
+function isXpxMosaic(val) {
+  if (!val) return false;
+  const norm = String(val).toLowerCase().replace(/^0x/, '');
+  const configuredXpx = String(testnet2Config.XPX_MOSAIC_ID || '').toLowerCase().replace(/^0x/, '');
+  let decAsHex = '';
+  if (/^\d+$/.test(norm)) {
+    try {
+      decAsHex = BigInt(norm).toString(16).toLowerCase();
+    } catch (_) {}
+  }
+  return Boolean(
+    norm === '13bfc518e40549d7' ||
+    norm === '402b2f579faebc59' ||
+    norm === '402b2f579fa859b8' ||
+    (configuredXpx && norm === configuredXpx) ||
+    norm === 'bffb42a19116bdf6' ||
+    norm === '0dc67fbe1cad29e3' ||
+    norm === '992621222383397347' ||
+    norm === '1423067181077744087' ||
+    norm === '1423072717967804887' ||
+    norm === '1423071378129734103' ||
+    norm === '4623835697843813465' ||
+    norm === '13833734084227874294' ||
+    norm === 'xpx' ||
+    norm === 'sirius' ||
+    norm === XPX_MOSAIC_ID.toLowerCase() ||
+    norm === BigInt(XPX_MOSAIC_ID).toString(16).toLowerCase() ||
+    (decAsHex && (
+      decAsHex === '13bfc518e40549d7' ||
+      decAsHex === '402b2f579faebc59' ||
+      decAsHex === '402b2f579fa859b8' ||
+      (configuredXpx && decAsHex === configuredXpx) ||
+      decAsHex === 'bffb42a19116bdf6' ||
+      decAsHex === '0dc67fbe1cad29e3'
+    ))
+  );
+}
+
+function isUsdtMosaic(val) {
+  if (!val) return false;
+  const norm = String(val).toLowerCase().replace(/^0x/, '');
+  const configuredUsdt = String(testnet2Config.USDT_MOSAIC_ID || '').toLowerCase().replace(/^0x/, '');
+  let decAsHex = '';
+  if (/^\d+$/.test(norm)) {
+    try {
+      decAsHex = BigInt(norm).toString(16).toLowerCase();
+    } catch (_) {}
+  }
+  return Boolean(
+    norm === '10112cba1e7b9037' ||
+    norm === '4430aefef7e15d0c' ||
+    norm === '7525381a171d1e44' ||
+    (configuredUsdt && norm === configuredUsdt) ||
+    norm === '1157755757097881655' ||
+    norm === '4913615467364637964' ||
+    norm === '8441189441121164868' ||
+    norm === 'usdt' ||
+    norm === 'usd' ||
+    norm === USDT_MOSAIC_ID.toLowerCase() ||
+    norm === BigInt(USDT_MOSAIC_ID).toString(16).toLowerCase() ||
+    (decAsHex && (
+      decAsHex === '10112cba1e7b9037' ||
+      decAsHex === '4430aefef7e15d0c' ||
+      decAsHex === '7525381a171d1e44' ||
+      (configuredUsdt && decAsHex === configuredUsdt)
+    ))
+  );
+}
+
+function isBnbMosaic(val) {
+  if (!val) return false;
+  const norm = String(val).toLowerCase().replace(/^0x/, '');
+  const configuredBnb = String(testnet2Config.BNB_MOSAIC_ID || '').toLowerCase().replace(/^0x/, '');
+  let decAsHex = '';
+  if (/^\d+$/.test(norm)) {
+    try {
+      decAsHex = BigInt(norm).toString(16).toLowerCase();
+    } catch (_) {}
+  }
+  return Boolean(
+    norm === '1e5c5fadec7b34dd' ||
+    norm === '3cc1d3ce7447b6f9' ||
+    (configuredBnb && norm === configuredBnb) ||
+    norm === '2187728719596696797' ||
+    norm === '4377983656976694009' ||
+    norm === 'bnb' ||
+    norm === BNB_MOSAIC_ID.toLowerCase() ||
+    norm === BigInt(BNB_MOSAIC_ID).toString(16).toLowerCase() ||
+    (decAsHex && (
+      decAsHex === '1e5c5fadec7b34dd' ||
+      decAsHex === '3cc1d3ce7447b6f9' ||
+      (configuredBnb && decAsHex === configuredBnb)
+    ))
+  );
+}
+
 const ACTIVE_ORDERS_FILE = path.join(CLUSTER_DIR, 'active_orders.json');
 const activeOrders = new Map();
 let globalNextOrderId = 1000;
@@ -2022,12 +2119,13 @@ async function syncAndGetAccountBalance(publicKeyOrAddr) {
   if (deltaUsdt > 0n) rawLocalUsdt += deltaUsdt;
   if (deltaBnb > 0n) rawLocalBnb += deltaBnb;
 
-  // Fresh account initial anchoring: If an account has never traded and has 0 local balance, initialize to on-chain backing
-  const isFreshAccount = !currentEntry.hasTraded && (rawLocalXpx === 0n && rawLocalUsdt === 0n && rawLocalBnb === 0n);
-  if (isFreshAccount) {
-    rawLocalXpx = walletBackedXpx;
-    rawLocalUsdt = walletBackedUsdt;
-    rawLocalBnb = walletBackedBnb;
+  // Account initial anchoring & non-traded reconciliation:
+  // If an account has never executed an on-book trade fill and wallet backing exceeds local balance,
+  // heal local balance up to full on-chain backing (restores unspent aborted/unfilled order escrows).
+  if (!currentEntry.hasTraded) {
+    if (walletBackedXpx > rawLocalXpx) rawLocalXpx = walletBackedXpx;
+    if (walletBackedUsdt > rawLocalUsdt) rawLocalUsdt = walletBackedUsdt;
+    if (walletBackedBnb > rawLocalBnb) rawLocalBnb = walletBackedBnb;
   }
 
   currentEntry.xpx = rawLocalXpx;
@@ -3266,8 +3364,8 @@ async function _placeOrderUnlocked(orderReq) {
     );
   }
 
-  const side = orderReq.side === 'sell' || orderReq.side === 1 ? 1 : 0;
-  const orderType = orderReq.type === 'Market' || orderReq.orderType === 1 ? 1 : 0; // 0=Limit, 1=Market (IOC)
+  const side = String(orderReq.side).toLowerCase() === 'sell' || orderReq.side === 1 ? 1 : 0;
+  const orderType = String(orderReq.type).toLowerCase() === 'market' || String(orderReq.type).toLowerCase() === 'ioc' || orderReq.orderType === 1 || orderReq.type === 1 ? 1 : 0; // 0=Limit, 1=Market (IOC)
   const marketKey = isBnb ? 'xpx_bnb' : 'xpx_usdt';
   const depth = getMarketDepthSnapshot(marketKey);
 
@@ -3558,6 +3656,7 @@ async function _placeOrderUnlocked(orderReq) {
   let takerFeeAtomic = 0n;
   let makerFeeAtomic = 0n;
   let takerBaseFilled = 0n;
+  let takerQuoteFilled = 0n;
 
   // Process settlement & trade fills if any occurred
   if (emittedTx && Array.isArray(emittedTx.transactions) && emittedTx.transactions.length > 0) {
@@ -3580,6 +3679,9 @@ async function _placeOrderUnlocked(orderReq) {
           const messageStr = payloadBuf.length >= 64 + msgLen
             ? payloadBuf.subarray(64, 64 + msgLen).toString('utf8')
             : '';
+
+          const isRefund = messageStr.includes('Refund') || messageStr.includes('Escrow Refund');
+          const isTradeFill = messageStr.startsWith('SiriusCLOB: Trade Fill');
 
           // Track fill count based on actual trade fill base leg emitted by engine for this order
           if (messageStr.startsWith('SiriusCLOB: Trade Fill (Base)')) {
@@ -3609,11 +3711,12 @@ async function _placeOrderUnlocked(orderReq) {
             mosaicId: mosaicId.toString(10),
             mosaicHex,
             amount: payoutAmount.toString(),
+            isRefund,
           });
 
           // Queue trade fill payout to Testnet 2 batch settlement aggregator
           // Only queue real trade fills (not internal orderbook escrow refunds)
-          if (messageStr.startsWith('SiriusCLOB: Trade Fill')) {
+          if (isTradeFill) {
             try {
               const { defaultBatchSettlerTestnet2 } = require('./batch_settler_testnet2');
               if (defaultBatchSettlerTestnet2) {
@@ -3641,16 +3744,16 @@ async function _placeOrderUnlocked(orderReq) {
               const feeCollectorPub = (testnet2Config.FEE_COLLECTOR_PUBKEY || '04ef8d54aaefbc4746257723fd1efb7b37f30452de8bd022f5fb3cabc5246a64').toLowerCase();
               try {
                 updateAccountBalance(feeCollectorPub, (b) => {
-                  if (mosaicId.toString(10) === XPX_MOSAIC_ID) {
+                  if (isXpxMosaic(mosaicHex)) {
                     b.xpx = BigInt(b.xpx || 0n) + legFee;
-                  } else if (mosaicId.toString(10) === USDT_MOSAIC_ID) {
+                  } else if (isUsdtMosaic(mosaicHex)) {
                     b.usdt = BigInt(b.usdt || 0n) + legFee;
-                  } else if (mosaicId.toString(10) === BNB_MOSAIC_ID) {
+                  } else if (isBnbMosaic(mosaicHex)) {
                     b.bnb = BigInt(b.bnb || 0n) + legFee;
                   }
                 }, { source: 'MATCH_SETTLEMENT' });
 
-                const feeMos = (mosaicId.toString(10) === XPX_MOSAIC_ID) ? 'XPX' : ((mosaicId.toString(10) === USDT_MOSAIC_ID) ? 'USDT' : 'BNB');
+                const feeMos = isXpxMosaic(mosaicHex) ? 'XPX' : (isUsdtMosaic(mosaicHex) ? 'USDT' : 'BNB');
                 clobDb.recordCollectedFee({
                   feeType: messageStr.includes(':MAKER_FEE=') ? 'TRADE_MAKER' : 'TRADE_TAKER',
                   mosaic: feeMos,
@@ -3664,36 +3767,64 @@ async function _placeOrderUnlocked(orderReq) {
             }
           }
 
-          if (mosaicId.toString(10) === XPX_MOSAIC_ID) {
-            // Gross base filled = net payout + leg fee
-            if (side === 0 && recipientPub.toLowerCase() === callerKey.toLowerCase()) {
-              takerBaseFilled += payoutAmount + (messageStr.includes(':TAKER_FEE=') ? legFee : 0n);
-            } else if (side === 1 && recipientPub.toLowerCase() !== callerKey.toLowerCase()) {
-              takerBaseFilled += payoutAmount + (messageStr.includes(':MAKER_FEE=') ? legFee : 0n);
+          // Balance updates: Distinguish between Escrow Refunds and Trade Fill Payouts
+          if (isXpxMosaic(mosaicHex)) {
+            if (isRefund) {
+              // Internal Escrow Refund for XPX: Return payoutAmount to available balance and decrement locked
+              updateAccountBalance(recipientPub, (b) => {
+                b.xpx = BigInt(b.xpx || 0n) + payoutAmount;
+                const rem = BigInt(b.lockedXpx || 0n) - payoutAmount;
+                b.lockedXpx = rem > 0n ? rem : 0n;
+              }, { source: 'ESCROW_REFUND' });
+            } else {
+              // Gross base filled = net payout + leg fee
+              if (side === 0 && recipientPub.toLowerCase() === callerKey.toLowerCase()) {
+                takerBaseFilled += payoutAmount + (messageStr.includes(':TAKER_FEE=') ? legFee : 0n);
+              } else if (side === 1 && recipientPub.toLowerCase() !== callerKey.toLowerCase()) {
+                takerBaseFilled += payoutAmount + (messageStr.includes(':MAKER_FEE=') ? legFee : 0n);
+              }
+              // XPX Delivery: recipient receives bought XPX
+              updateAccountBalance(recipientPub, (b) => {
+                b.xpx = BigInt(b.xpx || 0n) + payoutAmount;
+                b.hasTraded = true;
+              }, { source: 'MATCH_SETTLEMENT' });
             }
-            // XPX Delivery: recipient receives bought XPX
-            updateAccountBalance(recipientPub, (b) => {
-              b.xpx = BigInt(b.xpx || 0n) + payoutAmount;
-              const rem = BigInt(b.lockedXpx || 0n) - payoutAmount;
-              b.lockedXpx = rem > 0n ? rem : 0n;
-              b.hasTraded = true;
-            }, { source: 'MATCH_SETTLEMENT' });
-          } else if (mosaicId.toString(10) === USDT_MOSAIC_ID) {
-            // USDT Delivery: recipient receives quote payment or refund
-            updateAccountBalance(recipientPub, (b) => {
-              b.usdt = BigInt(b.usdt || 0n) + payoutAmount;
-              const rem = BigInt(b.lockedUsdt || 0n) - payoutAmount;
-              b.lockedUsdt = rem > 0n ? rem : 0n;
-              b.hasTraded = true;
-            }, { source: 'MATCH_SETTLEMENT' });
-          } else if (mosaicId.toString(10) === BNB_MOSAIC_ID) {
-            // BNB Delivery: recipient receives quote payment or refund
-            updateAccountBalance(recipientPub, (b) => {
-              b.bnb = BigInt(b.bnb || 0n) + payoutAmount;
-              const rem = BigInt(b.lockedBnb || 0n) - payoutAmount;
-              b.lockedBnb = rem > 0n ? rem : 0n;
-              b.hasTraded = true;
-            }, { source: 'MATCH_SETTLEMENT' });
+          } else if (isUsdtMosaic(mosaicHex)) {
+            if (isRefund) {
+              // Internal Escrow Refund for USDT: Return payoutAmount to available balance and decrement locked
+              updateAccountBalance(recipientPub, (b) => {
+                b.usdt = BigInt(b.usdt || 0n) + payoutAmount;
+                const rem = BigInt(b.lockedUsdt || 0n) - payoutAmount;
+                b.lockedUsdt = rem > 0n ? rem : 0n;
+              }, { source: 'ESCROW_REFUND' });
+            } else {
+              if (side === 1 && recipientPub.toLowerCase() === callerKey.toLowerCase()) {
+                takerQuoteFilled += payoutAmount + (messageStr.includes(':TAKER_FEE=') ? legFee : 0n);
+              }
+              // USDT Delivery: recipient receives quote payment
+              updateAccountBalance(recipientPub, (b) => {
+                b.usdt = BigInt(b.usdt || 0n) + payoutAmount;
+                b.hasTraded = true;
+              }, { source: 'MATCH_SETTLEMENT' });
+            }
+          } else if (isBnbMosaic(mosaicHex)) {
+            if (isRefund) {
+              // Internal Escrow Refund for BNB: Return payoutAmount to available balance and decrement locked
+              updateAccountBalance(recipientPub, (b) => {
+                b.bnb = BigInt(b.bnb || 0n) + payoutAmount;
+                const rem = BigInt(b.lockedBnb || 0n) - payoutAmount;
+                b.lockedBnb = rem > 0n ? rem : 0n;
+              }, { source: 'ESCROW_REFUND' });
+            } else {
+              if (side === 1 && recipientPub.toLowerCase() === callerKey.toLowerCase()) {
+                takerQuoteFilled += payoutAmount + (messageStr.includes(':TAKER_FEE=') ? legFee : 0n);
+              }
+              // BNB Delivery: recipient receives quote payment
+              updateAccountBalance(recipientPub, (b) => {
+                b.bnb = BigInt(b.bnb || 0n) + payoutAmount;
+                b.hasTraded = true;
+              }, { source: 'MATCH_SETTLEMENT' });
+            }
           }
         }
       }
@@ -3701,21 +3832,24 @@ async function _placeOrderUnlocked(orderReq) {
       console.warn('On-chain settlement broadcast warning:', e.message);
     }
 
-    // Release caller escrow for the filled portion
-    updateAccountBalance(callerKey, (b) => {
-      if (side === 0) {
-        if (isBnb) {
-          const rem = BigInt(b.lockedBnb || 0n) - requiredQuote;
-          b.lockedBnb = rem > 0n ? rem : 0n;
+    // Release caller escrow consumed by fills
+    if (takerBaseFilled > 0n) {
+      updateAccountBalance(callerKey, (b) => {
+        if (side === 0) {
+          const quoteConsumed = (requiredQuote * takerBaseFilled + amountAtomic - 1n) / amountAtomic;
+          if (isBnb) {
+            const rem = BigInt(b.lockedBnb || 0n) - quoteConsumed;
+            b.lockedBnb = rem > 0n ? rem : 0n;
+          } else {
+            const rem = BigInt(b.lockedUsdt || 0n) - quoteConsumed;
+            b.lockedUsdt = rem > 0n ? rem : 0n;
+          }
         } else {
-          const rem = BigInt(b.lockedUsdt || 0n) - requiredQuote;
-          b.lockedUsdt = rem > 0n ? rem : 0n;
+          const rem = BigInt(b.lockedXpx || 0n) - takerBaseFilled;
+          b.lockedXpx = rem > 0n ? rem : 0n;
         }
-      } else {
-        const rem = BigInt(b.lockedXpx || 0n) - requiredXpx;
-        b.lockedXpx = rem > 0n ? rem : 0n;
-      }
-    });
+      });
+    }
 
     // Authoritative drive ledger reconciliation for all trade participants
     syncGatewayCacheFromDrive(callerKey);
@@ -3726,29 +3860,34 @@ async function _placeOrderUnlocked(orderReq) {
     }
   }
 
-  // For Market (IOC) orders:
-  // If the contract emitted transactions, the drive is authoritative and syncGatewayCacheFromDrive has already run.
-  // If the contract emitted NO transactions (e.g. unfilled or STP with no emitted tx), safely refund whatever remains in local locked escrow.
+  // Safety reconciliation for Market (IOC) orders:
+  // A Market (IOC) order never rests on the book. If any portion of the initial escrow remains in locked
+  // state (e.g. unfilled or partially filled order), immediately return it to the caller's available balance
+  // and clear locked balance to 0!
   if (orderType === 1) {
-    if (!emittedTx || !Array.isArray(emittedTx.transactions) || emittedTx.transactions.length === 0) {
-      updateAccountBalance(callerKey, (b) => {
-        if (side === 0) {
-          if (isBnb) {
-            const toRefund = BigInt(b.lockedBnb || 0n) >= requiredQuote ? requiredQuote : BigInt(b.lockedBnb || 0n);
-            b.bnb = BigInt(b.bnb || 0n) + toRefund;
-            b.lockedBnb = BigInt(b.lockedBnb || 0n) - toRefund;
-          } else {
-            const toRefund = BigInt(b.lockedUsdt || 0n) >= requiredQuote ? requiredQuote : BigInt(b.lockedUsdt || 0n);
-            b.usdt = BigInt(b.usdt || 0n) + toRefund;
-            b.lockedUsdt = BigInt(b.lockedUsdt || 0n) - toRefund;
+    updateAccountBalance(callerKey, (b) => {
+      if (side === 0) {
+        if (isBnb) {
+          const lockedRem = BigInt(b.lockedBnb || 0n);
+          if (lockedRem > 0n) {
+            b.bnb = BigInt(b.bnb || 0n) + lockedRem;
+            b.lockedBnb = 0n;
           }
         } else {
-          const toRefund = BigInt(b.lockedXpx || 0n) >= requiredXpx ? requiredXpx : BigInt(b.lockedXpx || 0n);
-          b.xpx = BigInt(b.xpx || 0n) + toRefund;
-          b.lockedXpx = BigInt(b.lockedXpx || 0n) - toRefund;
+          const lockedRem = BigInt(b.lockedUsdt || 0n);
+          if (lockedRem > 0n) {
+            b.usdt = BigInt(b.usdt || 0n) + lockedRem;
+            b.lockedUsdt = 0n;
+          }
         }
-      }, { source: 'ESCROW_REFUND' });
-    }
+      } else {
+        const lockedRem = BigInt(b.lockedXpx || 0n);
+        if (lockedRem > 0n) {
+          b.xpx = BigInt(b.xpx || 0n) + lockedRem;
+          b.lockedXpx = 0n;
+        }
+      }
+    }, { source: 'ESCROW_REFUND' });
     syncGatewayCacheFromDrive(callerKey);
   }
 
@@ -4812,37 +4951,6 @@ async function broadcastTransferOnChain(senderPrivHex, recipientAddrOrPubKey, mo
   }
 }
 
-function isXpxMosaic(hex) {
-  const norm = String(hex || '').toLowerCase().replace(/^0x/, '');
-  const configuredXpx = String(testnet2Config.XPX_MOSAIC_ID || '').toLowerCase().replace(/^0x/, '');
-  let decAsHex = '';
-  if (/^\d+$/.test(norm)) {
-    try {
-      decAsHex = BigInt(norm).toString(16).toLowerCase();
-    } catch (_) {}
-  }
-  return (
-    norm === '13bfc518e40549d7' ||
-    norm === '402b2f579faebc59' ||
-    norm === '402b2f579fa859b8' ||
-    (configuredXpx && norm === configuredXpx) ||
-    norm === 'bffb42a19116bdf6' ||
-    norm === '0dc67fbe1cad29e3' ||
-    norm === '992621222383397347' ||
-    norm === '1423072717967804887' ||
-    norm === '1423071378129734103' ||
-    norm === XPX_MOSAIC_ID.toLowerCase() ||
-    norm === BigInt(XPX_MOSAIC_ID).toString(16).toLowerCase() ||
-    (decAsHex && (
-      decAsHex === '13bfc518e40549d7' ||
-      decAsHex === '402b2f579faebc59' ||
-      decAsHex === '402b2f579fa859b8' ||
-      (configuredXpx && decAsHex === configuredXpx) ||
-      decAsHex === 'bffb42a19116bdf6' ||
-      decAsHex === '0dc67fbe1cad29e3'
-    ))
-  );
-}
 
 function creditVerifiedDeposit(deposit) {
   let senderKey = normalizeKey(deposit.senderPublicKey || deposit.callerKey);
@@ -5107,6 +5215,8 @@ module.exports = {
   getTestnet2LiabilitiesAtomic,
   syncAndGetAccountBalance,
   isXpxMosaic,
+  isUsdtMosaic,
+  isBnbMosaic,
   getMarketDepthSnapshot,
   resolvePublicKeyFromAddress,
   registerHeartbeat,
@@ -5123,5 +5233,7 @@ module.exports = {
   WITHDRAWAL_FEES,
   getWithdrawalFee,
   withAccountLock,
+  _placeOrderUnlocked,
   _setExecuteConsensusCallOverride,
+  setCustomConsensusExecutor: _setExecuteConsensusCallOverride,
 };

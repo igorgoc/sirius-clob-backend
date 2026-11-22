@@ -501,25 +501,37 @@ class ClobMarketMaker {
       });
 
       while (!stopped && (rounds === -1 || r <= rounds)) {
-        await this.simulateTradingRound(r);
+        try {
+          await this.simulateTradingRound(r);
 
-        writeStatus({
-          running: true,
-          pid: process.pid,
-          mode: rounds === -1 ? 'daemon' : (rounds === 1 ? 'step' : 'batch'),
-          round: r,
-          totalTrades: this.totalTradesExecuted,
-          volumeXPX: this.totalVolumeXPX,
-          volumeUSDT: this.totalVolumeUSDT,
-          volumeBNB: this.totalVolumeBNB,
-          oracle: this.oracleData,
-          markets: {
-            xpx_usdt: { midPrice: this.markets.xpx_usdt.currentMidPrice },
-            xpx_bnb: { midPrice: this.markets.xpx_bnb.currentMidPrice }
-          },
-          lastAction: `Round ${r}: Executed trade & replenished liquidity on ${r % 2 === 1 ? 'XPX/USDT' : 'XPX/BNB'}`,
-          lastUpdate: Date.now(),
-        });
+          writeStatus({
+            running: true,
+            pid: process.pid,
+            mode: rounds === -1 ? 'daemon' : (rounds === 1 ? 'step' : 'batch'),
+            round: r,
+            totalTrades: this.totalTradesExecuted,
+            volumeXPX: this.totalVolumeXPX,
+            volumeUSDT: this.totalVolumeUSDT,
+            volumeBNB: this.totalVolumeBNB,
+            oracle: this.oracleData,
+            markets: {
+              xpx_usdt: { midPrice: this.markets.xpx_usdt.currentMidPrice },
+              xpx_bnb: { midPrice: this.markets.xpx_bnb.currentMidPrice }
+            },
+            lastAction: `Round ${r}: Executed trade & replenished liquidity on ${r % 2 === 1 ? 'XPX/USDT' : 'XPX/BNB'}`,
+            lastUpdate: Date.now(),
+          });
+        } catch (roundErr) {
+          console.warn(`[Market Maker] Warning in round ${r}:`, roundErr.message);
+          writeStatus({
+            running: true,
+            pid: process.pid,
+            mode: rounds === -1 ? 'daemon' : (rounds === 1 ? 'step' : 'batch'),
+            round: r,
+            lastAction: `Round ${r} notice: ${roundErr.message}`,
+            lastUpdate: Date.now(),
+          });
+        }
 
         r++;
         if (!stopped && (rounds === -1 || r <= rounds)) {
