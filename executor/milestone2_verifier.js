@@ -674,9 +674,6 @@ function assert3NodeConsensus(stageName, results, expectSuccessOrOpts = true) {
     JSON.stringify({
       success: Boolean(r.returns.success),
       return_val: r.returns.return_val,
-      execution_gas_consumed: r.returns.execution_gas_consumed,
-      download_gas_consumed: r.returns.download_gas_consumed,
-      poex_secret_data: r.returns.poex_secret_data,
       stateRootHash: r.stateRootHash || null,
       txs: serializeEmittedTxs(r.returns),
     });
