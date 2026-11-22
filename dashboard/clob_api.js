@@ -672,8 +672,15 @@ function refundMismatchedDeposit(txHash, customAdminPrivKey = null) {
     throw new Error(`Deposit transaction ${normHash} not found or unconfirmed on local chain`);
   }
 
-  const accounts = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'));
-  const vaultAddress = accounts.contract.address.replace(/[- ]/g, '').toUpperCase();
+  let vaultAddress = (testnet2Config.SUPERCONTRACT_VAULT_ADDRESS || 'VDV43V46CVS6A7J2C7W223QNYB72D4566P76F7CA').replace(/[- ]/g, '').toUpperCase();
+  if (fs.existsSync(ACCOUNTS_FILE)) {
+    try {
+      const accounts = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'));
+      if (accounts && accounts.contract && accounts.contract.address) {
+        vaultAddress = accounts.contract.address.replace(/[- ]/g, '').toUpperCase();
+      }
+    } catch (_) {}
+  }
   const txRecipient = (txInfo.recipient || '').replace(/[- ]/g, '').toUpperCase();
   if (txRecipient !== vaultAddress) {
     throw new Error(`Transaction ${normHash} was not sent to vault (${vaultAddress}), got ${txRecipient}`);
@@ -3665,9 +3672,6 @@ async function _placeOrderUnlocked(orderReq) {
   // Process settlement & trade fills if any occurred
   if (emittedTx && Array.isArray(emittedTx.transactions) && emittedTx.transactions.length > 0) {
     try {
-      const accounts = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'));
-      const poexMsgHex = Buffer.from(`POEX:CLOB_TRADE:CALL=${contractCallId}`, 'utf8').toString('hex');
-
       // Construct payout specs for on-chain settlement
       const payoutSpecs = [];
       const memoHex = Buffer.from('CLOB_SETTLE', 'utf8').toString('hex');
@@ -3736,10 +3740,6 @@ async function _placeOrderUnlocked(orderReq) {
                     true
                   );
                 }
-
-                defaultBatchSettlerTestnet2.flushBatch().catch((err) => {
-                  console.warn('[BatchSettler] Match flush notice:', err.message);
-                });
               }
             } catch (_) {}
 
@@ -3830,6 +3830,21 @@ async function _placeOrderUnlocked(orderReq) {
               }, { source: 'MATCH_SETTLEMENT' });
             }
           }
+        }
+      }
+
+      // Flush batch settlement transaction to Sirius Testnet 2 L1
+      if (fillsCount > 0) {
+        try {
+          const { defaultBatchSettlerTestnet2 } = require('./batch_settler_testnet2');
+          if (defaultBatchSettlerTestnet2 && defaultBatchSettlerTestnet2.getPendingCount() > 0) {
+            const flushRes = await defaultBatchSettlerTestnet2.flushBatch();
+            if (flushRes && flushRes.txHash) {
+              onChainTxHash = flushRes.txHash;
+            }
+          }
+        } catch (flushErr) {
+          console.warn('[BatchSettler] Match flush notice:', flushErr.message);
         }
       }
     } catch (e) {

@@ -7,10 +7,15 @@ const https = require('https');
 const sdk = require('/Users/igorgoc/Projects/web-wallet-vuejs/node_modules/tsjs-xpx-chain-sdk');
 const config = require('../dashboard/testnet2_config');
 const client = require('../dashboard/testnet2_client');
-const clobApi = require('../dashboard/clob_api');
 
 const LIVE_API_BASE = 'https://sirius-clob-backend.onrender.com';
 const USER_PRIV_KEY = 'E8A4B4CED34D6BAA397091A84376451D27D5030A63E95EDBC5139C4055B5D505';
+
+function signOrder(privKey, order) {
+  const account = sdk.Account.createFromPrivateKey(privKey, config.NETWORK_TYPE, 1);
+  const msgStr = `${order.pair.toUpperCase()}:${String(order.side).toLowerCase()}:${String(order.type).toLowerCase()}:${String(order.price)}:${String(order.amount)}:${String(order.nonce)}:${String(order.expiry)}`;
+  return account.signData(msgStr);
+}
 
 function httpsPost(urlStr, data) {
   return new Promise((resolve, reject) => {
@@ -85,7 +90,7 @@ async function placeOrder(acc, pair, side, type, price, amount) {
     publicKey: acc.publicKey,
     allowWideCollar: true,
   };
-  orderReq.signature = clobApi.signOrderRequest(USER_PRIV_KEY, orderReq);
+  orderReq.signature = signOrder(USER_PRIV_KEY, orderReq);
   return httpsPost(`${LIVE_API_BASE}/api/clob/order`, orderReq);
 }
 
