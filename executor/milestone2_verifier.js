@@ -70,6 +70,27 @@ function copyDirRecursive(src, dest) {
   }
 }
 
+function safeRmSync(targetPath) {
+  if (!targetPath || !fs.existsSync(targetPath)) return;
+  try {
+    fs.rmSync(targetPath, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  } catch (err) {
+    try {
+      if (fs.existsSync(targetPath)) {
+        const stat = fs.statSync(targetPath);
+        if (stat.isDirectory()) {
+          for (const file of fs.readdirSync(targetPath)) {
+            safeRmSync(path.join(targetPath, file));
+          }
+          try { fs.rmdirSync(targetPath); } catch (_) {}
+        } else {
+          try { fs.unlinkSync(targetPath); } catch (_) {}
+        }
+      }
+    } catch (_) {}
+  }
+}
+
 function safeAtomicRename(src, dest) {
   try {
     fs.renameSync(src, dest);
@@ -78,12 +99,12 @@ function safeAtomicRename(src, dest) {
       if (fs.existsSync(src)) {
         const stat = fs.statSync(src);
         if (stat.isDirectory()) {
-          fs.rmSync(dest, { recursive: true, force: true });
+          safeRmSync(dest);
           copyDirRecursive(src, dest);
-          fs.rmSync(src, { recursive: true, force: true });
+          safeRmSync(src);
         } else {
           fs.copyFileSync(src, dest);
-          fs.unlinkSync(src);
+          try { fs.unlinkSync(src); } catch (_) {}
         }
       }
     } else {
@@ -108,7 +129,7 @@ class DriveSandboxOverlay {
     this.dirIterators = new Map(); // id -> { entries: [{name, depth}], index }
 
     // Reset sandbox overlay from committed drive state
-    fs.rmSync(this.sandboxDir, { recursive: true, force: true });
+    safeRmSync(this.sandboxDir);
     copyDirRecursive(this.driveDir, this.sandboxDir);
   }
 
@@ -286,7 +307,7 @@ class DriveSandboxOverlay {
         if (absPath === this.sandboxDir) {
           return { remove_filesystem_entry_return: { success: false } };
         }
-        fs.rmSync(absPath, { recursive: true, force: true });
+        safeRmSync(absPath);
         return { remove_filesystem_entry_return: { success: true } };
       } catch (e) {
         return { remove_filesystem_entry_return: { success: false } };
@@ -344,12 +365,12 @@ class DriveSandboxOverlay {
   commitOverlay() {
     this.closeAllHandles();
     copyDirRecursive(this.sandboxDir, this.driveDir);
-    fs.rmSync(this.sandboxDir, { recursive: true, force: true });
+    safeRmSync(this.sandboxDir);
   }
 
   rollbackOverlay() {
     this.closeAllHandles();
-    fs.rmSync(this.sandboxDir, { recursive: true, force: true });
+    safeRmSync(this.sandboxDir);
   }
 
   computeStateRootHash() {
