@@ -269,10 +269,22 @@ class ClobMarketMaker {
         expectSuccess: true,
         allowQuorum: true,
       });
-      if (consensus && consensus.nonQuorum && consensus.nonQuorum.length > 0) {
+      for (const q of consensus.quorum) {
+        if (typeof q.commit === 'function') q.commit();
+      }
+      for (const nq of consensus.nonQuorum) {
+        if (typeof nq.rollback === 'function') nq.rollback();
+      }
+      if (consensus.nonQuorum.length > 0) {
         this.syncDriveReplicas();
       }
+      return (consensus.quorum[0] && consensus.quorum[0].returns)
+        ? consensus.quorum[0].returns
+        : results[0].returns;
     } catch (err) {
+      for (const r of results) {
+        if (r && typeof r.rollback === 'function') r.rollback();
+      }
       if (err.message && err.message.includes('Consensus divergence')) {
         console.warn(`[MM Self-Healing] Consensus divergence in ${label}. Healing drives from node1 and retrying...`);
         this.syncDriveReplicas();
@@ -298,15 +310,18 @@ class ClobMarketMaker {
           expectSuccess: true,
           allowQuorum: true,
         });
-        return (consensus && consensus.quorum && consensus.quorum[0] && consensus.quorum[0].returns)
+        for (const q of consensus.quorum) {
+          if (typeof q.commit === 'function') q.commit();
+        }
+        for (const nq of consensus.nonQuorum) {
+          if (typeof nq.rollback === 'function') nq.rollback();
+        }
+        return (consensus.quorum[0] && consensus.quorum[0].returns)
           ? consensus.quorum[0].returns
           : retryResults[0].returns;
       }
       throw err;
     }
-    return (consensus && consensus.quorum && consensus.quorum[0] && consensus.quorum[0].returns)
-      ? consensus.quorum[0].returns
-      : results[0].returns;
   }
 
   async ensureMarketLadderDepth(marketKey) {
