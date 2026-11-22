@@ -1974,6 +1974,7 @@ async function syncAndGetAccountBalance(publicKeyOrAddr) {
 
   // 3. Current drive balances and locked balances in open orders
   const balances = loadBalances();
+  const isNewAccount = !balances[key];
   const currentEntry = balances[key] || {
     xpx: 0n,
     usdt: 0n,
@@ -1981,6 +1982,9 @@ async function syncAndGetAccountBalance(publicKeyOrAddr) {
     lockedXpx: 0n,
     lockedUsdt: 0n,
     lockedBnb: 0n,
+    lastOnChainXpx: onChainXpx,
+    lastOnChainUsdt: onChainUsdt,
+    lastOnChainBnb: onChainBnb,
   };
   const driveBal = getDriveBalances(key) || { xpx: 0n, usdt: 0n, bnb: 0n };
 
@@ -1988,27 +1992,38 @@ async function syncAndGetAccountBalance(publicKeyOrAddr) {
   const lockedUsdt = BigInt(currentEntry.lockedUsdt || 0n);
   const lockedBnb = BigInt(currentEntry.lockedBnb || 0n);
 
-  // All coins in the wallet are immediately available for trading (minus currently locked in orders)
-  // Reconciled with on-chain wallet backing and SuperContract drive state
+  if (isNewAccount) {
+    // Initial onboarding: credit on-chain wallet balance plus any existing drive balance
+    currentEntry.xpx = BigInt(onChainXpx || 0n) + BigInt(driveBal.xpx || 0n);
+    currentEntry.usdt = BigInt(onChainUsdt || 0n) + BigInt(driveBal.usdt || 0n);
+    currentEntry.bnb = BigInt(onChainBnb || 0n) + BigInt(driveBal.bnb || 0n);
+    currentEntry.lastOnChainXpx = onChainXpx;
+    currentEntry.lastOnChainUsdt = onChainUsdt;
+    currentEntry.lastOnChainBnb = onChainBnb;
+  } else {
+    // Existing account: Check for newly arrived on-chain deposits (e.g. faucet, external transfer)
+    // and credit only the positive delta so executed trades are NEVER overwritten!
+    const lastXpx = BigInt(currentEntry.lastOnChainXpx !== undefined ? currentEntry.lastOnChainXpx : onChainXpx);
+    const lastUsdt = BigInt(currentEntry.lastOnChainUsdt !== undefined ? currentEntry.lastOnChainUsdt : onChainUsdt);
+    const lastBnb = BigInt(currentEntry.lastOnChainBnb !== undefined ? currentEntry.lastOnChainBnb : onChainBnb);
+
+    const deltaXpx = onChainXpx > lastXpx ? (onChainXpx - lastXpx) : 0n;
+    const deltaUsdt = onChainUsdt > lastUsdt ? (onChainUsdt - lastUsdt) : 0n;
+    const deltaBnb = onChainBnb > lastBnb ? (onChainBnb - lastBnb) : 0n;
+
+    if (deltaXpx > 0n) currentEntry.xpx = BigInt(currentEntry.xpx || 0n) + deltaXpx;
+    if (deltaUsdt > 0n) currentEntry.usdt = BigInt(currentEntry.usdt || 0n) + deltaUsdt;
+    if (deltaBnb > 0n) currentEntry.bnb = BigInt(currentEntry.bnb || 0n) + deltaBnb;
+
+    currentEntry.lastOnChainXpx = onChainXpx;
+    currentEntry.lastOnChainUsdt = onChainUsdt;
+    currentEntry.lastOnChainBnb = onChainBnb;
+  }
+
   const rawLocalXpx = BigInt(currentEntry.xpx || 0n);
   const rawLocalUsdt = BigInt(currentEntry.usdt || 0n);
   const rawLocalBnb = BigInt(currentEntry.bnb || 0n);
 
-  const backingXpx = BigInt(onChainXpx || 0n) + BigInt(driveBal.xpx || 0n);
-  const backingUsdt = BigInt(onChainUsdt || 0n) + BigInt(driveBal.usdt || 0n);
-  const backingBnb = BigInt(onChainBnb || 0n) + BigInt(driveBal.bnb || 0n);
-
-  const totalXpx = rawLocalXpx > backingXpx ? rawLocalXpx : backingXpx;
-  const totalUsdt = rawLocalUsdt > backingUsdt ? rawLocalUsdt : backingUsdt;
-  const totalBnb = rawLocalBnb > backingBnb ? rawLocalBnb : backingBnb;
-
-  const availXpx = totalXpx > lockedXpx ? (totalXpx - lockedXpx) : 0n;
-  const availUsdt = totalUsdt > lockedUsdt ? (totalUsdt - lockedUsdt) : 0n;
-  const availBnb = totalBnb > lockedBnb ? (totalBnb - lockedBnb) : 0n;
-
-  currentEntry.xpx = availXpx;
-  currentEntry.usdt = availUsdt;
-  currentEntry.bnb = availBnb;
   currentEntry.lockedXpx = lockedXpx;
   currentEntry.lockedUsdt = lockedUsdt;
   currentEntry.lockedBnb = lockedBnb;
@@ -2017,13 +2032,13 @@ async function syncAndGetAccountBalance(publicKeyOrAddr) {
   saveBalances(balances);
 
   return {
-    xpx: availXpx,
-    usdt: availUsdt,
-    bnb: availBnb,
+    xpx: rawLocalXpx,
+    usdt: rawLocalUsdt,
+    bnb: rawLocalBnb,
     lockedXpx,
     lockedUsdt,
     lockedBnb,
-    lastUpdated: Date.now(),
+    lastUpdated: currentEntry.lastUpdated,
   };
 }
 
@@ -4559,12 +4574,15 @@ async function _withdrawTokensUnlocked(withdrawReq) {
     if (mosaicId === XPX_MOSAIC_ID) {
       const rem = BigInt(b.xpx || 0n) - amountAtomic;
       b.xpx = rem > 0n ? rem : 0n;
+      b.lastOnChainXpx = BigInt(b.lastOnChainXpx || 0n) + netPayoutAtomic;
     } else if (mosaicId === USDT_MOSAIC_ID) {
       const rem = BigInt(b.usdt || 0n) - amountAtomic;
       b.usdt = rem > 0n ? rem : 0n;
+      b.lastOnChainUsdt = BigInt(b.lastOnChainUsdt || 0n) + netPayoutAtomic;
     } else if (mosaicId === BNB_MOSAIC_ID) {
       const rem = BigInt(b.bnb || 0n) - amountAtomic;
       b.bnb = rem > 0n ? rem : 0n;
+      b.lastOnChainBnb = BigInt(b.lastOnChainBnb || 0n) + netPayoutAtomic;
     }
   });
 

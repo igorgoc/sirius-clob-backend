@@ -15,6 +15,7 @@ const clobDb = require('./clob_db');
 const swapApi = require('./swap_api');
 const { defaultBatchSettlerTestnet2: defaultBatchSettler } = require('./batch_settler_testnet2');
 const l1Config = require('./testnet2_config');
+const testnet2Config = l1Config;
 const l1Client = require('./testnet2_client');
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8088;
