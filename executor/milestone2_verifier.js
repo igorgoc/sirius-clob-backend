@@ -1063,6 +1063,7 @@ module.exports = {
   runMilestone2Verification,
   executeOnNodeVm,
   assert3NodeConsensus,
+  safeRmSync,
   NODES,
   DRIVE_KEY_HEX,
   CONTRACT_KEY_HEX,

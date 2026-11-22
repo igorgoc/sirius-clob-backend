@@ -15,6 +15,7 @@ const path = require('path');
 const {
   executeOnNodeVm,
   assert3NodeConsensus,
+  safeRmSync,
   NODES,
   DRIVE_KEY_HEX,
   ALICE_KEY_HEX,
@@ -363,12 +364,13 @@ class ClobMarketMaker {
     if (needReseed) {
       console.log(`🌊 [${m.symbol}] Seeding fresh ${m.levels}-level Bid & Ask ladder centered at PancakeSwap ($${(m.currentMidPrice / 1e8).toFixed(6)})...`);
 
-      // Clear stale market state on all nodes
+      // Clear stale market state on all nodes cleanly
       for (const node of NODES) {
         const mDir = path.join(CLUSTER_DIR, node.name, 'data', 'drives', DRIVE_KEY_HEX, 'drive', 'markets', marketKey);
+        try {
+          safeRmSync(mDir);
+        } catch (_) {}
         fs.mkdirSync(mDir, { recursive: true });
-        try { fs.unlinkSync(path.join(mDir, 'market_state.bin')); } catch (_) {}
-        try { fs.unlinkSync(path.join(mDir, 'depth.json')); } catch (_) {}
       }
 
       // 1. Seed Bids
@@ -421,12 +423,17 @@ class ClobMarketMaker {
   }
 
   syncDriveReplicas() {
-    const srcMarkets = path.join(this.nodeDrivePaths['node1'], 'drive', 'markets');
-    for (const targetNode of ['node2', 'node3']) {
-      try {
-        const dstMarkets = path.join(this.nodeDrivePaths[targetNode], 'drive', 'markets');
-        copyDirSync(srcMarkets, dstMarkets);
-      } catch (_) {}
+    try {
+      const { syncAllReplicatorDrivesFromNode1 } = require('../dashboard/clob_api');
+      syncAllReplicatorDrivesFromNode1();
+    } catch (_) {
+      const srcMarkets = path.join(this.nodeDrivePaths['node1'], 'drive', 'markets');
+      for (const targetNode of ['node2', 'node3']) {
+        try {
+          const dstMarkets = path.join(this.nodeDrivePaths[targetNode], 'drive', 'markets');
+          copyDirSync(srcMarkets, dstMarkets);
+        } catch (_) {}
+      }
     }
   }
 
