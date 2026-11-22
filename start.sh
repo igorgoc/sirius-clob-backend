@@ -36,5 +36,10 @@ if [ -z "$SIRIUS_NODE_URL" ]; then
     fi
 fi
 
+echo "Starting Market Maker Daemon..."
+mkdir -p cluster
+node scripts/clob_market_maker.js --daemon > cluster/mm.log 2>&1 &
+echo $! > cluster/mm.pid
+
 echo "Starting CLOB Relayer API on port ${PORT:-8088}..."
 exec node dashboard/server.js
