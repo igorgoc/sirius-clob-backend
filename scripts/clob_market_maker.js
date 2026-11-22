@@ -153,7 +153,7 @@ class ClobMarketMaker {
         tickSize: 100, // $0.00000100
         spreadTicks: 200, // $0.00000200 spread
         tickStep: 100,
-        levels: 3,
+        levels: 5,
         lotSize: 10_000_000, // 10 XPX
         takerLot: 5_000_000, // 5 XPX
         currentMidPrice: 7600, // Baseline: $0.00007600
@@ -165,7 +165,7 @@ class ClobMarketMaker {
         tickSize: 1, // 0.00000001 BNB
         spreadTicks: 2, // 0.00000002 BNB spread
         tickStep: 1,
-        levels: 3,
+        levels: 5,
         lotSize: 15_000_000, // 15 XPX
         takerLot: 10_000_000, // 10 XPX
         currentMidPrice: 14, // Baseline: 0.00000014 BNB
@@ -271,7 +271,7 @@ class ClobMarketMaker {
         const existing = JSON.parse(fs.readFileSync(driveDepthPath, 'utf8'));
         const bidsCount = Array.isArray(existing.bids) ? existing.bids.length : 0;
         const asksCount = Array.isArray(existing.asks) ? existing.asks.length : 0;
-        if (bidsCount < 3 || asksCount < 3) {
+        if (bidsCount < 2 || asksCount < 2) {
           console.log(`⚠️ [LiquidityGuard] ${m.symbol} depth degraded (bids: ${bidsCount}, asks: ${asksCount}). Auto-replenishing full ladder...`);
           needsSeeding = true;
         }
@@ -280,7 +280,7 @@ class ClobMarketMaker {
       }
     }
     if (needsSeeding) {
-      await this.seedMarketLadder(marketKey, true);
+      await this.seedMarketLadder(marketKey, false);
     }
   }
 
@@ -292,7 +292,7 @@ class ClobMarketMaker {
     if (!needReseed && fs.existsSync(driveDepthPath)) {
       try {
         const existing = JSON.parse(fs.readFileSync(driveDepthPath, 'utf8'));
-        if (existing.bids && existing.bids.length >= 3 && existing.asks && existing.asks.length >= 3) {
+        if (existing.bids && existing.bids.length >= 2 && existing.asks && existing.asks.length >= 2) {
           const existingMid = Math.floor((existing.best_bid + existing.best_ask) / 2);
           // Check if existing book price deviates wildly (>25%) from PancakeSwap oracle price
           const priceDiffRatio = Math.abs(existingMid - m.currentMidPrice) / m.currentMidPrice;
@@ -315,13 +315,15 @@ class ClobMarketMaker {
     if (needReseed) {
       console.log(`🌊 [${m.symbol}] Seeding fresh ${m.levels}-level Bid & Ask ladder centered at PancakeSwap ($${(m.currentMidPrice / 1e8).toFixed(6)})...`);
 
-      // Clear stale market state on all nodes cleanly
+      // Clear ONLY market_state.bin on all nodes if a clean book reset is needed.
+      // NEVER delete trades.json, trades.bin, or depth.json!
       for (const node of NODES) {
         const mDir = path.join(CLUSTER_DIR, node.name, 'data', 'drives', DRIVE_KEY_HEX, 'drive', 'markets', marketKey);
-        try {
-          safeRmSync(mDir);
-        } catch (_) {}
         fs.mkdirSync(mDir, { recursive: true });
+        try {
+          const stateBin = path.join(mDir, 'market_state.bin');
+          if (fs.existsSync(stateBin)) fs.unlinkSync(stateBin);
+        } catch (_) {}
       }
       this.syncDriveReplicas();
 

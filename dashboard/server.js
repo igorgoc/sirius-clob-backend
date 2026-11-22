@@ -140,6 +140,10 @@ function enrichTradeWithTimestamp(t, idx, totalLen, market = 'xpx_usdt') {
   };
 }
 
+// Resilient in-memory caches to guarantee order books & market trades are NEVER empty
+const lastValidDepth = {};
+const lastValidTrades = {};
+
 const { getPancakeSwapPriceCached, getCachedPancakeSwapPriceSync } = require('./pancakeswap_oracle');
 
 function parseJsonBody(req) {
@@ -1218,7 +1222,7 @@ const server = http.createServer((req, res) => {
       try {
         const raw = fs.readFileSync(tradesPath, 'utf8');
         const rawTrades = JSON.parse(raw);
-        if (Array.isArray(rawTrades)) {
+        if (Array.isArray(rawTrades) && rawTrades.length > 0) {
           const totalLen = rawTrades.length;
           const enriched = rawTrades.map((t, idx) => {
             const { timestamp, time } = enrichTradeWithTimestamp(t, idx, totalLen, market);
@@ -1229,11 +1233,18 @@ const server = http.createServer((req, res) => {
             };
           });
           const recentTrades = enriched.slice(-limit).reverse();
+          lastValidTrades[market] = recentTrades;
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(recentTrades));
           return;
         }
       } catch (_) {}
+    }
+    // Fallback to in-memory cached trades so trades list is NEVER empty
+    if (lastValidTrades[market] && lastValidTrades[market].length > 0) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(lastValidTrades[market]));
+      return;
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end('[]');
@@ -1387,10 +1398,20 @@ const server = http.createServer((req, res) => {
     if (fs.existsSync(depthPath)) {
       try {
         const data = fs.readFileSync(depthPath, 'utf8');
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(data);
-        return;
+        const parsed = JSON.parse(data);
+        if (parsed && Array.isArray(parsed.bids) && Array.isArray(parsed.asks) && (parsed.bids.length > 0 || parsed.asks.length > 0)) {
+          lastValidDepth[market] = data;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(data);
+          return;
+        }
       } catch (_) {}
+    }
+    // Fallback to in-memory cached depth so order book is NEVER empty
+    if (lastValidDepth[market]) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(lastValidDepth[market]);
+      return;
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
