@@ -642,6 +642,9 @@ async function discoverTradingAccountStatus(ownerPublicKeyOrAddress, existingLoc
   }
 
   let record = clobDb.getTradingAccountByOwner(ownerPublicKey || ownerAddress);
+  if (!record) {
+    record = clobDb.getTradingAccountByTradingKey(ownerPublicKey || ownerAddress);
+  }
 
   // If record is 'pending', check if confirmed on-chain
   if (record && record.status === 'pending') {
@@ -657,37 +660,62 @@ async function discoverTradingAccountStatus(ownerPublicKeyOrAddress, existingLoc
     } catch (_) {}
   }
 
-  // On-Chain L1 Self-Discovery (works even after wiped DB / fresh browser wallet restore!)
+  // On-Chain L1 Self-Discovery (works both when queried by Main Owner OR directly by Trading Account!)
   if (!record && ownerAddress) {
     try {
       const nodeUrl = testnetClient.getActiveNodeUrl();
-      const ownerMs = await testnetClient.fetchJson(`${nodeUrl}/account/${ownerAddress}/multisig`, 3500);
-      const multisigAccounts = (ownerMs && ownerMs.multisig && ownerMs.multisig.multisigAccounts) || [];
-      for (const candPub of multisigAccounts) {
-        const candAddr = Address.createFromPublicKey(candPub, config.NETWORK_TYPE).plain();
-        try {
-          const candMs = await testnetClient.fetchJson(`${nodeUrl}/account/${candAddr}/multisig`, 3500);
-          const cosigs = ((candMs && candMs.multisig && candMs.multisig.cosignatories) || []).map((c) =>
-            String(c).toUpperCase()
-          );
-          if (
-            candMs.multisig.minApproval === 2 &&
-            cosigs.includes(cfg.clusterPublicKey.toUpperCase())
-          ) {
-            const otherPk = cosigs.find((pk) => pk !== cfg.clusterPublicKey.toUpperCase()) || ownerPublicKey;
-            record = clobDb.saveTradingAccount({
-              tradingPublicKey: candPub.toLowerCase(),
-              tradingAddress: candAddr,
-              ownerPublicKey: otherPk ? otherPk.toLowerCase() : ownerPublicKey,
-              ownerAddress,
-              validatorClusterPublicKey: cfg.clusterPublicKey,
-              validatorClusterAddress: cfg.clusterAddress,
-              minApproval: 2,
-              status: 'active',
-            });
-            break;
-          }
-        } catch (_) {}
+      const inputMs = await testnetClient.fetchJson(`${nodeUrl}/account/${ownerAddress}/multisig`, 3500);
+      const msObj = inputMs && inputMs.multisig;
+      const inputCosigs = ((msObj && msObj.cosignatories) || []).map((c) => String(c).toUpperCase());
+
+      // Case 1: Queried directly with the 2-of-2 Trading Account address/publicKey
+      if (msObj && msObj.minApproval === 2 && inputCosigs.includes(cfg.clusterPublicKey.toUpperCase())) {
+        const realOwnerPk = inputCosigs.find((pk) => pk !== cfg.clusterPublicKey.toUpperCase());
+        const tradingPk = (msObj.account && String(msObj.account).length === 64 ? String(msObj.account) : ownerPublicKey) || '';
+        if (realOwnerPk && tradingPk) {
+          const realOwnerAddr = Address.createFromPublicKey(realOwnerPk, config.NETWORK_TYPE).plain();
+          record = clobDb.saveTradingAccount({
+            tradingPublicKey: tradingPk.toLowerCase(),
+            tradingAddress: ownerAddress,
+            ownerPublicKey: realOwnerPk.toLowerCase(),
+            ownerAddress: realOwnerAddr,
+            validatorClusterPublicKey: cfg.clusterPublicKey,
+            validatorClusterAddress: cfg.clusterAddress,
+            minApproval: 2,
+            status: 'active',
+          });
+        }
+      }
+
+      // Case 2: Queried with Main Owner address/publicKey -> inspect its multisigAccounts
+      if (!record) {
+        const multisigAccounts = (msObj && msObj.multisigAccounts) || [];
+        for (const candPub of multisigAccounts) {
+          const candAddr = Address.createFromPublicKey(candPub, config.NETWORK_TYPE).plain();
+          try {
+            const candMs = await testnetClient.fetchJson(`${nodeUrl}/account/${candAddr}/multisig`, 3500);
+            const cosigs = ((candMs && candMs.multisig && candMs.multisig.cosignatories) || []).map((c) =>
+              String(c).toUpperCase()
+            );
+            if (
+              candMs.multisig.minApproval === 2 &&
+              cosigs.includes(cfg.clusterPublicKey.toUpperCase())
+            ) {
+              const otherPk = cosigs.find((pk) => pk !== cfg.clusterPublicKey.toUpperCase()) || ownerPublicKey;
+              record = clobDb.saveTradingAccount({
+                tradingPublicKey: candPub.toLowerCase(),
+                tradingAddress: candAddr,
+                ownerPublicKey: otherPk ? otherPk.toLowerCase() : ownerPublicKey,
+                ownerAddress,
+                validatorClusterPublicKey: cfg.clusterPublicKey,
+                validatorClusterAddress: cfg.clusterAddress,
+                minApproval: 2,
+                status: 'active',
+              });
+              break;
+            }
+          } catch (_) {}
+        }
       }
     } catch (_) {}
   }
@@ -845,6 +873,18 @@ async function activateTradingAccount(reqBody) {
 
   if (!signedByInitiatorPayload || !tradingAccountCosig || !ownerPublicKey || !tradingAccountPublicKey) {
     throw new Error('Missing required fields: signedByInitiatorPayload, tradingAccountCosig, ownerPublicKey, tradingAccountPublicKey');
+  }
+
+  const existingStatus = await discoverTradingAccountStatus(ownerPublicKey);
+  if (
+    existingStatus &&
+    existingStatus.hasTradingAccount &&
+    existingStatus.tradingAccount &&
+    (existingStatus.status === 'active' || existingStatus.status === 'pending')
+  ) {
+    throw new Error(
+      `Account already has an ${existingStatus.status} Smart Trading Account (${existingStatus.tradingAccount.tradingAddress}).`
+    );
   }
 
   // Ensure Level 2 Validator Cluster is ready on-chain first

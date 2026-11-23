@@ -897,10 +897,14 @@ function saveTradingAccount(rec) {
   return getTradingAccountByTradingKey(rec.tradingPublicKey);
 }
 
-function getTradingAccountByTradingKey(tradingPublicKey) {
-  if (!tradingPublicKey) return null;
+function getTradingAccountByTradingKey(tradingKeyOrAddr) {
+  if (!tradingKeyOrAddr) return null;
   const db = getDb();
-  return db.prepare('SELECT * FROM trading_accounts WHERE trading_public_key = ?').get(String(tradingPublicKey).toLowerCase()) || null;
+  const norm = String(tradingKeyOrAddr).replace(/[- ]/g, '').trim();
+  if (norm.length === 64) {
+    return db.prepare('SELECT * FROM trading_accounts WHERE trading_public_key = ?').get(norm.toLowerCase()) || null;
+  }
+  return db.prepare('SELECT * FROM trading_accounts WHERE trading_address = ?').get(norm.toUpperCase()) || null;
 }
 
 function getTradingAccountByOwner(ownerKeyOrAddr) {

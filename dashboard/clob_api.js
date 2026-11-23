@@ -2114,9 +2114,15 @@ async function syncAndGetAccountBalance(publicKeyOrAddr) {
   }
 
   // Smart Trading Account (Solution 2 — Model A):
-  // If owner has an active 2-of-2 Co-Signed Trading Account, balances are strictly backed
-  // by the on-chain mosaics inside T_user (never mixing personal wallet coins!).
-  const tradingAcc = clobDb.getTradingAccountByOwner(key);
+  // Support querying by EITHER the Main Owner account OR its linked 2-of-2 Trading Account.
+  let tradingAcc = clobDb.getTradingAccountByOwner(key);
+  if (!tradingAcc) {
+    const byTrading = clobDb.getTradingAccountByTradingKey(key);
+    if (byTrading) {
+      tradingAcc = byTrading;
+      key = String(byTrading.owner_public_key || key).toLowerCase();
+    }
+  }
   if (tradingAcc && tradingAcc.status === 'active') {
     const existingLocal = loadBalances();
     const cur = existingLocal[key] || {
