@@ -13,6 +13,7 @@ const { exec, execFile, spawn } = require('child_process');
 const clobApi = require('./clob_api');
 const clobDb = require('./clob_db');
 const swapApi = require('./swap_api');
+const tradingCosigner = require('./trading_account_cosigner');
 const { defaultBatchSettlerTestnet2: defaultBatchSettler } = require('./batch_settler_testnet2');
 const l1Config = require('./testnet2_config');
 const testnet2Config = l1Config;
@@ -647,7 +648,10 @@ const server = http.createServer((req, res) => {
     pathname === '/api/clob/cancel/all' ||
     pathname === '/api/clob/withdraw' ||
     pathname === '/api/clob/emergency-unlock' ||
-    pathname === '/api/clob/deposit'
+    pathname === '/api/clob/deposit' ||
+    pathname === '/api/clob/account/activate-trading-account' ||
+    pathname === '/api/clob/trading-account/cosign-withdrawal' ||
+    pathname === '/api/clob/trading-account/cosign-settlement'
   ) {
     const adminHeader = req.headers['x-admin-key'] || req.headers['x-load-test-key'];
     const isLoadTestAuth = Boolean(
@@ -1662,6 +1666,124 @@ const server = http.createServer((req, res) => {
       .catch((err) => {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, success: false, error: err.message }));
+      });
+    return;
+  }
+
+  // === Solution 2 (Model A): Native Co-Signed Smart Trading Account Endpoints ===
+
+  // 1. Get Level-2 BFT Validator Cluster info & public keys
+  if (pathname === '/api/clob/validator-info' && req.method === 'GET') {
+    try {
+      const info = tradingCosigner.getValidatorClusterInfo();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(info));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: err.message }));
+    }
+    return;
+  }
+
+  // 2. Discover & query user Smart Trading Account status (SQLite + direct Sirius L1 multisig graph discovery)
+  if (pathname === '/api/clob/trading-account/status' && req.method === 'GET') {
+    const owner = parsedUrl.searchParams.get('ownerPublicKey') ||
+      parsedUrl.searchParams.get('publicKey') ||
+      parsedUrl.searchParams.get('ownerAddress') ||
+      parsedUrl.searchParams.get('address');
+    if (!owner) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'ownerPublicKey or ownerAddress query parameter required' }));
+      return;
+    }
+    tradingCosigner
+      .discoverTradingAccountStatus(owner)
+      .then((status) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(status));
+      })
+      .catch((err) => {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
+      });
+    return;
+  }
+
+  // 3. Activate Native 2-of-2 Co-Signed Smart Trading Account (ModifyMultisig + 2-of-3 BFT Validator Cosign)
+  if (pathname === '/api/clob/account/activate-trading-account' && req.method === 'POST') {
+    parseJsonBody(req)
+      .then(async (body) => {
+        try {
+          const result = await tradingCosigner.activateTradingAccount(body);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(result));
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+      })
+      .catch((err) => {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
+      });
+    return;
+  }
+
+  // 4. Co-sign non-custodial withdrawal from User's 2-of-2 Smart Trading Account
+  if (pathname === '/api/clob/trading-account/cosign-withdrawal' && req.method === 'POST') {
+    parseJsonBody(req)
+      .then(async (body) => {
+        try {
+          const result = await clobApi.cosignTradingAccountWithdrawal(body);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(result));
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+      })
+      .catch((err) => {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
+      });
+    return;
+  }
+
+  // 5. Query pending atomic settlements requiring User Cosigner-1 signature
+  if (pathname === '/api/clob/trading-account/pending-settlements' && req.method === 'GET') {
+    const ownerPub = parsedUrl.searchParams.get('ownerPublicKey') || parsedUrl.searchParams.get('publicKey');
+    if (!ownerPub) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'ownerPublicKey query parameter required' }));
+      return;
+    }
+    try {
+      const settlements = clobDb.getPendingSettlementsForOwner(ownerPub);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, settlements }));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: err.message }));
+    }
+    return;
+  }
+
+  // 6. Submit User Cosigner-1 signature for atomic trade settlement & trigger 2-of-3 BFT Validator broadcast
+  if (pathname === '/api/clob/trading-account/cosign-settlement' && req.method === 'POST') {
+    parseJsonBody(req)
+      .then(async (body) => {
+        try {
+          const result = await tradingCosigner.submitSettlementCosignature(body);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(result));
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+      })
+      .catch((err) => {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
       });
     return;
   }
@@ -3234,6 +3356,16 @@ server.listen(PORT, HOST, () => {
 
   // Start autonomous Sirius Testnet 2 batch settlement processor
   defaultBatchSettler.startPeriodic(15000, 1);
+
+  // Bootstrap Level-2 BFT Validator Cluster (2-of-3 Multisig) & start Smart Trading Account L1 Reconciler
+  setTimeout(() => {
+    tradingCosigner.ensureValidatorClusterOnChain().catch((err) => {
+      console.warn('[TradingCosigner] Level-2 cluster bootstrap notice:', err.message);
+    });
+  }, 3000);
+  setInterval(() => {
+    tradingCosigner.reconcileInFlightL1Txs().catch(() => {});
+  }, 8000);
 
   // Start autonomous Sirius Testnet 2 on-chain deposit indexer
   try {

@@ -123,6 +123,56 @@ function getDb(customPath = null) {
       amount_xpx INTEGER NOT NULL,
       claim_date TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS trading_accounts (
+      trading_public_key TEXT PRIMARY KEY,
+      trading_address TEXT UNIQUE NOT NULL,
+      owner_public_key TEXT NOT NULL,
+      owner_address TEXT NOT NULL,
+      validator_cluster_public_key TEXT NOT NULL,
+      validator_cluster_address TEXT NOT NULL,
+      min_approval INTEGER NOT NULL DEFAULT 2,
+      activation_tx_hash TEXT,
+      status TEXT NOT NULL CHECK(status IN ('pending', 'active', 'revoked')),
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_trading_accounts_owner_pk ON trading_accounts(owner_public_key);
+    CREATE INDEX IF NOT EXISTS idx_trading_accounts_owner_addr ON trading_accounts(owner_address);
+
+    CREATE TABLE IF NOT EXISTS trading_withdrawals (
+      withdrawal_id TEXT PRIMARY KEY,
+      owner_public_key TEXT NOT NULL,
+      trading_public_key TEXT NOT NULL,
+      mosaic TEXT NOT NULL,
+      mosaic_hex TEXT NOT NULL,
+      amount_atomic TEXT NOT NULL,
+      recipient_address TEXT NOT NULL,
+      tx_hash TEXT,
+      status TEXT NOT NULL CHECK(status IN ('pending', 'broadcast', 'confirmed', 'failed')),
+      block_height INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_trading_withdrawals_owner ON trading_withdrawals(owner_public_key, status);
+
+    CREATE TABLE IF NOT EXISTS trading_settlements (
+      settlement_id TEXT PRIMARY KEY,
+      order_id TEXT,
+      owner_public_key TEXT NOT NULL,
+      trading_public_key TEXT NOT NULL,
+      counterparty_key TEXT,
+      tx_hash TEXT,
+      aggregate_payload TEXT NOT NULL,
+      required_cosigners_json TEXT NOT NULL,
+      collected_cosigs_json TEXT NOT NULL,
+      transfers_json TEXT NOT NULL,
+      delta_json TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('pending_cosign', 'ready', 'broadcast', 'confirmed', 'failed')),
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_trading_settlements_owner ON trading_settlements(owner_public_key, status);
   `);
 
   // Automated schema migration to ensure CHECK constraints on pre-existing databases
@@ -813,6 +863,214 @@ function getDailyFaucetDisbursed(dateStr) {
   return (row && row.total) ? Number(row.total) : 0;
 }
 
+// === Smart Trading Account (Solution 2 Model A) Persistence Helpers ===
+
+function saveTradingAccount(rec) {
+  const db = getDb();
+  const now = Date.now();
+  db.prepare(`
+    INSERT INTO trading_accounts (
+      trading_public_key, trading_address, owner_public_key, owner_address,
+      validator_cluster_public_key, validator_cluster_address, min_approval,
+      activation_tx_hash, status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(trading_public_key) DO UPDATE SET
+      validator_cluster_public_key = excluded.validator_cluster_public_key,
+      validator_cluster_address = excluded.validator_cluster_address,
+      min_approval = excluded.min_approval,
+      activation_tx_hash = COALESCE(excluded.activation_tx_hash, trading_accounts.activation_tx_hash),
+      status = excluded.status,
+      updated_at = excluded.updated_at
+  `).run(
+    String(rec.tradingPublicKey).toLowerCase(),
+    String(rec.tradingAddress).replace(/[- ]/g, '').toUpperCase(),
+    String(rec.ownerPublicKey).toLowerCase(),
+    String(rec.ownerAddress).replace(/[- ]/g, '').toUpperCase(),
+    String(rec.validatorClusterPublicKey).toLowerCase(),
+    String(rec.validatorClusterAddress).replace(/[- ]/g, '').toUpperCase(),
+    Number(rec.minApproval || 2),
+    rec.activationTxHash || null,
+    rec.status || 'pending',
+    rec.createdAt || now,
+    now
+  );
+  return getTradingAccountByTradingKey(rec.tradingPublicKey);
+}
+
+function getTradingAccountByTradingKey(tradingPublicKey) {
+  if (!tradingPublicKey) return null;
+  const db = getDb();
+  return db.prepare('SELECT * FROM trading_accounts WHERE trading_public_key = ?').get(String(tradingPublicKey).toLowerCase()) || null;
+}
+
+function getTradingAccountByOwner(ownerKeyOrAddr) {
+  if (!ownerKeyOrAddr) return null;
+  const db = getDb();
+  const norm = String(ownerKeyOrAddr).replace(/[- ]/g, '').trim();
+  if (norm.length === 64) {
+    return db.prepare(
+      "SELECT * FROM trading_accounts WHERE owner_public_key = ? AND status IN ('active', 'pending') ORDER BY CASE WHEN status='active' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1"
+    ).get(norm.toLowerCase()) || null;
+  }
+  return db.prepare(
+    "SELECT * FROM trading_accounts WHERE owner_address = ? AND status IN ('active', 'pending') ORDER BY CASE WHEN status='active' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1"
+  ).get(norm.toUpperCase()) || null;
+}
+
+function getTradingAccountsByStatus(status) {
+  const db = getDb();
+  return db.prepare('SELECT * FROM trading_accounts WHERE status = ?').all(status);
+}
+
+function updateTradingAccountStatus(tradingPublicKey, status, activationTxHash = null) {
+  const db = getDb();
+  db.prepare(`
+    UPDATE trading_accounts
+    SET status = ?, activation_tx_hash = COALESCE(?, activation_tx_hash), updated_at = ?
+    WHERE trading_public_key = ?
+  `).run(status, activationTxHash, Date.now(), String(tradingPublicKey).toLowerCase());
+}
+
+function saveTradingWithdrawal(rec) {
+  const db = getDb();
+  const now = Date.now();
+  db.prepare(`
+    INSERT INTO trading_withdrawals (
+      withdrawal_id, owner_public_key, trading_public_key, mosaic, mosaic_hex,
+      amount_atomic, recipient_address, tx_hash, status, block_height, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(withdrawal_id) DO UPDATE SET
+      tx_hash = COALESCE(excluded.tx_hash, trading_withdrawals.tx_hash),
+      status = excluded.status,
+      block_height = COALESCE(excluded.block_height, trading_withdrawals.block_height),
+      updated_at = excluded.updated_at
+  `).run(
+    rec.withdrawalId,
+    String(rec.ownerPublicKey).toLowerCase(),
+    String(rec.tradingPublicKey).toLowerCase(),
+    rec.mosaic,
+    String(rec.mosaicHex).toUpperCase(),
+    String(rec.amountAtomic),
+    String(rec.recipientAddress).replace(/[- ]/g, '').toUpperCase(),
+    rec.txHash || null,
+    rec.status || 'pending',
+    rec.blockHeight || null,
+    rec.createdAt || now,
+    now
+  );
+}
+
+function getPendingTradingWithdrawals(ownerPublicKey) {
+  const db = getDb();
+  return db.prepare(
+    "SELECT * FROM trading_withdrawals WHERE owner_public_key = ? AND status IN ('pending', 'broadcast')"
+  ).all(String(ownerPublicKey).toLowerCase());
+}
+
+function getAllInFlightTradingWithdrawals() {
+  const db = getDb();
+  return db.prepare("SELECT * FROM trading_withdrawals WHERE status IN ('pending', 'broadcast')").all();
+}
+
+function updateTradingWithdrawalStatus(withdrawalId, status, txHash = null, blockHeight = null) {
+  const db = getDb();
+  db.prepare(`
+    UPDATE trading_withdrawals
+    SET status = ?, tx_hash = COALESCE(?, tx_hash), block_height = COALESCE(?, block_height), updated_at = ?
+    WHERE withdrawal_id = ?
+  `).run(status, txHash, blockHeight, Date.now(), withdrawalId);
+}
+
+function saveTradingSettlement(rec) {
+  const db = getDb();
+  const now = Date.now();
+  db.prepare(`
+    INSERT INTO trading_settlements (
+      settlement_id, order_id, owner_public_key, trading_public_key, counterparty_key,
+      tx_hash, aggregate_payload, required_cosigners_json, collected_cosigs_json,
+      transfers_json, delta_json, status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(settlement_id) DO UPDATE SET
+      tx_hash = COALESCE(excluded.tx_hash, trading_settlements.tx_hash),
+      aggregate_payload = excluded.aggregate_payload,
+      collected_cosigs_json = excluded.collected_cosigs_json,
+      status = excluded.status,
+      updated_at = excluded.updated_at
+  `).run(
+    rec.settlementId,
+    rec.orderId ? String(rec.orderId) : null,
+    String(rec.ownerPublicKey).toLowerCase(),
+    String(rec.tradingPublicKey).toLowerCase(),
+    rec.counterpartyKey ? String(rec.counterpartyKey).toLowerCase() : null,
+    rec.txHash || null,
+    rec.aggregatePayload,
+    JSON.stringify(rec.requiredCosigners || []),
+    JSON.stringify(rec.collectedCosigs || []),
+    JSON.stringify(rec.transfers || []),
+    JSON.stringify(rec.delta || {}),
+    rec.status || 'pending_cosign',
+    rec.createdAt || now,
+    now
+  );
+  return getTradingSettlement(rec.settlementId);
+}
+
+function getTradingSettlement(settlementId) {
+  const db = getDb();
+  const row = db.prepare('SELECT * FROM trading_settlements WHERE settlement_id = ?').get(settlementId);
+  return row ? hydrateSettlementRow(row) : null;
+}
+
+function hydrateSettlementRow(row) {
+  return {
+    settlementId: row.settlement_id,
+    orderId: row.order_id,
+    ownerPublicKey: row.owner_public_key,
+    tradingPublicKey: row.trading_public_key,
+    counterpartyKey: row.counterparty_key,
+    txHash: row.tx_hash,
+    aggregatePayload: row.aggregate_payload,
+    requiredCosigners: JSON.parse(row.required_cosigners_json || '[]'),
+    collectedCosigs: JSON.parse(row.collected_cosigs_json || '[]'),
+    transfers: JSON.parse(row.transfers_json || '[]'),
+    delta: JSON.parse(row.delta_json || '{}'),
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function getPendingSettlementsForOwner(ownerPublicKey) {
+  const db = getDb();
+  const rows = db.prepare(
+    "SELECT * FROM trading_settlements WHERE owner_public_key = ? AND status IN ('pending_cosign', 'ready', 'broadcast') ORDER BY created_at ASC"
+  ).all(String(ownerPublicKey).toLowerCase());
+  return rows.map(hydrateSettlementRow);
+}
+
+function getAllInFlightTradingSettlements() {
+  const db = getDb();
+  const rows = db.prepare("SELECT * FROM trading_settlements WHERE status IN ('ready', 'broadcast')").all();
+  return rows.map(hydrateSettlementRow);
+}
+
+function updateTradingSettlementStatus(settlementId, status, txHash = null, collectedCosigs = null) {
+  const db = getDb();
+  if (collectedCosigs !== null) {
+    db.prepare(`
+      UPDATE trading_settlements
+      SET status = ?, tx_hash = COALESCE(?, tx_hash), collected_cosigs_json = ?, updated_at = ?
+      WHERE settlement_id = ?
+    `).run(status, txHash, JSON.stringify(collectedCosigs), Date.now(), settlementId);
+  } else {
+    db.prepare(`
+      UPDATE trading_settlements
+      SET status = ?, tx_hash = COALESCE(?, tx_hash), updated_at = ?
+      WHERE settlement_id = ?
+    `).run(status, txHash, Date.now(), settlementId);
+  }
+}
+
 module.exports = {
   DB_FILE,
   getDb,
@@ -837,4 +1095,18 @@ module.exports = {
   recordFaucetClaim,
   getLastFaucetClaim,
   getDailyFaucetDisbursed,
+  saveTradingAccount,
+  getTradingAccountByTradingKey,
+  getTradingAccountByOwner,
+  getTradingAccountsByStatus,
+  updateTradingAccountStatus,
+  saveTradingWithdrawal,
+  getPendingTradingWithdrawals,
+  getAllInFlightTradingWithdrawals,
+  updateTradingWithdrawalStatus,
+  saveTradingSettlement,
+  getTradingSettlement,
+  getPendingSettlementsForOwner,
+  getAllInFlightTradingSettlements,
+  updateTradingSettlementStatus,
 };

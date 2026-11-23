@@ -40,5 +40,7 @@ cluster/circuit_breaker.json
 cluster/swap_history.json
 cluster/mm_status.json
 cluster/multisig_vault_governance.json
+cluster/validator_cluster_multisig.json
+cluster/node*/validator_key.json
 cluster/node*/data/
 

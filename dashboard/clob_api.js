@@ -41,6 +41,7 @@ const ACCOUNTS_FILE = path.join(CLUSTER_DIR, 'nemesis_accounts.json');
 const BALANCES_FILE = path.join(CLUSTER_DIR, 'clob_balances.json');
 const NONCES_FILE = path.join(CLUSTER_DIR, 'used_nonces.json');
 const clobDb = require('./clob_db');
+const tradingCosigner = require('./trading_account_cosigner');
 
 let sdk;
 try {
@@ -305,7 +306,8 @@ function reconcileActiveOrdersWithTrades() {
             const mId = Number(t.maker_order_id);
             const baseAmt = BigInt(t.base_amount || 0);
             if (mId > 0 && baseAmt > 0n) {
-              makerFillsMap.set(mId, (makerFillsMap.get(mId) || 0n) + baseAmt);
+              const mapKey = `${m}:${mId}`;
+              makerFillsMap.set(mapKey, (makerFillsMap.get(mapKey) || 0n) + baseAmt);
             }
           }
         }
@@ -316,6 +318,7 @@ function reconcileActiveOrdersWithTrades() {
   let modified = false;
   for (const o of activeOrders.values()) {
     const orderId = Number(o.id || o.orderId);
+    const oMarket = normalizePair(o.pair) || 'xpx_usdt';
     let initialAtomic = 0n;
     if (o.amountAtomic !== undefined && o.amountAtomic !== null) {
       initialAtomic = BigInt(o.amountAtomic);
@@ -326,7 +329,7 @@ function reconcileActiveOrdersWithTrades() {
     if (initialAtomic <= 0n) continue;
 
     const takerFilled = BigInt(o.takerFilledAtomic || 0n);
-    const makerFilled = makerFillsMap.get(orderId) || 0n;
+    const makerFilled = makerFillsMap.get(`${oMarket}:${orderId}`) || 0n;
     const totalFilled = takerFilled + makerFilled;
 
     let pct = Number((totalFilled * 100n) / initialAtomic);
@@ -2110,6 +2113,54 @@ async function syncAndGetAccountBalance(publicKeyOrAddr) {
     if (resolved) key = resolved;
   }
 
+  // Smart Trading Account (Solution 2 — Model A):
+  // If owner has an active 2-of-2 Co-Signed Trading Account, balances are strictly backed
+  // by the on-chain mosaics inside T_user (never mixing personal wallet coins!).
+  const tradingAcc = clobDb.getTradingAccountByOwner(key);
+  if (tradingAcc && tradingAcc.status === 'active') {
+    const existingLocal = loadBalances();
+    const cur = existingLocal[key] || {
+      xpx: 0n,
+      usdt: 0n,
+      bnb: 0n,
+      lockedXpx: 0n,
+      lockedUsdt: 0n,
+      lockedBnb: 0n,
+    };
+    const driveBal = getDriveBalances(key);
+    const locks = {
+      lockedXpx: driveBal ? BigInt(driveBal.lockedXpx || 0n) : BigInt(cur.lockedXpx || 0n),
+      lockedUsdt: driveBal ? BigInt(driveBal.lockedUsdt || 0n) : BigInt(cur.lockedUsdt || 0n),
+      lockedBnb: driveBal ? BigInt(driveBal.lockedBnb || 0n) : BigInt(cur.lockedBnb || 0n),
+    };
+    const tb = await tradingCosigner.computeTradingAccountBalances(tradingAcc, locks, false);
+    const syncedEntry = {
+      xpx: BigInt(tb.tradeable.xpx),
+      usdt: BigInt(tb.tradeable.usdt),
+      bnb: BigInt(tb.tradeable.bnb),
+      lockedXpx: locks.lockedXpx,
+      lockedUsdt: locks.lockedUsdt,
+      lockedBnb: locks.lockedBnb,
+      hasTraded: Boolean(cur.hasTraded),
+      lastOnChainXpx: BigInt(tb.onChain.xpx),
+      lastOnChainUsdt: BigInt(tb.onChain.usdt),
+      lastOnChainBnb: BigInt(tb.onChain.bnb),
+      lastUpdated: Date.now(),
+    };
+    existingLocal[key] = syncedEntry;
+    saveBalances(existingLocal);
+    return {
+      ...syncedEntry,
+      isSmartTradingAccount: true,
+      tradingAddress: tradingAcc.trading_address,
+      tradingPublicKey: tradingAcc.trading_public_key,
+      onChainTrading: tb.onChain,
+      withdrawable: tb.withdrawable,
+      pendingDelta: tb.pendingDelta,
+      inFlightWithdraw: tb.inFlightWithdraw,
+    };
+  }
+
   // 1. Reconcile with canonical SuperContract drive state if not present locally
   const existingBalances = loadBalances();
   if (!existingBalances[key]) {
@@ -3725,6 +3776,7 @@ async function _placeOrderUnlocked(orderReq) {
   }
 
   let onChainTxHash = null;
+  let pendingSettlement = null;
   let fillsCount = 0;
   const emittedTx = ret.transaction;
   const payouts = [];
@@ -3733,12 +3785,16 @@ async function _placeOrderUnlocked(orderReq) {
   let takerBaseFilled = 0n;
   let takerQuoteFilled = 0n;
 
+  const callerTradingAcc = clobDb.getTradingAccountByOwner(callerKey);
+  const callerHasSmartTrading = Boolean(callerTradingAcc && callerTradingAcc.status === 'active');
+
   // Process settlement & trade fills if any occurred
   if (emittedTx && Array.isArray(emittedTx.transactions) && emittedTx.transactions.length > 0) {
     try {
       // Construct payout specs for on-chain settlement
       const payoutSpecs = [];
       const memoHex = Buffer.from('CLOB_SETTLE', 'utf8').toString('hex');
+      const smartFillLegs = [];
 
       for (const t of emittedTx.transactions) {
         const payloadBuf = Buffer.isBuffer(t.payload) ? t.payload : Buffer.from(t.payload || '', 'base64');
@@ -3786,26 +3842,40 @@ async function _placeOrderUnlocked(orderReq) {
             isRefund,
           });
 
-          // Queue trade fill payout to Testnet 2 batch settlement aggregator
-          // Only queue real trade fills (not internal orderbook escrow refunds)
+          const recipTradingAcc = clobDb.getTradingAccountByOwner(recipientPub);
+          const recipHasSmartTrading = Boolean(recipTradingAcc && recipTradingAcc.status === 'active');
+
+          // Route Smart Trading Account fills into atomic co-signed L1 swaps; legacy Vault accounts stay on BatchSettler
           if (isTradeFill) {
-            try {
-              const { defaultBatchSettlerTestnet2 } = require('./batch_settler_testnet2');
-              if (defaultBatchSettlerTestnet2) {
-                defaultBatchSettlerTestnet2.queuePayout(recipientPub, mosaicHex, payoutAmount, 'CLOB_MATCH', true);
-                
-                // Route fee deduction to dedicated Fee Collector account
-                if (legFee > 0n && testnet2Config.FEE_COLLECTOR_ADDRESS) {
-                  defaultBatchSettlerTestnet2.queuePayout(
-                    testnet2Config.FEE_COLLECTOR_ADDRESS,
-                    mosaicHex,
-                    legFee,
-                    'CLOB_FEE',
-                    true
-                  );
+            if (callerHasSmartTrading || recipHasSmartTrading) {
+              smartFillLegs.push({
+                recipientPub: recipientPub.toLowerCase(),
+                recipientTradingAcc: recipHasSmartTrading ? recipTradingAcc : null,
+                mosaicHex,
+                payoutAmount,
+                legFee,
+                isBaseLeg: messageStr.startsWith('SiriusCLOB: Trade Fill (Base)'),
+                isQuoteLeg: messageStr.startsWith('SiriusCLOB: Trade Fill (Quote)'),
+              });
+            } else {
+              try {
+                const { defaultBatchSettlerTestnet2 } = require('./batch_settler_testnet2');
+                if (defaultBatchSettlerTestnet2) {
+                  defaultBatchSettlerTestnet2.queuePayout(recipientPub, mosaicHex, payoutAmount, 'CLOB_MATCH', true);
+
+                  // Route fee deduction to dedicated Fee Collector account
+                  if (legFee > 0n && testnet2Config.FEE_COLLECTOR_ADDRESS) {
+                    defaultBatchSettlerTestnet2.queuePayout(
+                      testnet2Config.FEE_COLLECTOR_ADDRESS,
+                      mosaicHex,
+                      legFee,
+                      'CLOB_FEE',
+                      true
+                    );
+                  }
                 }
-              }
-            } catch (_) {}
+              } catch (_) {}
+            }
 
             // Credit Fee Collector account in local database/cache and record protocol revenue
             if (legFee > 0n) {
@@ -3897,8 +3967,164 @@ async function _placeOrderUnlocked(orderReq) {
         }
       }
 
-      // Flush batch settlement transaction to Sirius Testnet 2 L1
-      if (fillsCount > 0) {
+      // Build atomic co-signed L1 settlement for Smart Trading Account fills
+      const anyMakerHasSmartTrading = smartFillLegs.some((l) => Boolean(l.recipientTradingAcc));
+      if (smartFillLegs.length > 0 && (callerHasSmartTrading || anyMakerHasSmartTrading)) {
+        try {
+          const t2Client = require('./testnet2_client');
+          const vault = t2Client.getOrInitVaultAccount();
+          const xpxOnChainHex = (testnet2Config.XPX_MOSAIC_ID || '13BFC518E40549D7').toUpperCase();
+          const usdtOnChainHex = (testnet2Config.USDT_MOSAIC_ID || '4430AEFEF7E15D0C').toUpperCase();
+          const bnbOnChainHex = (testnet2Config.BNB_MOSAIC_ID || '3CC1D3CE7447B6F9').toUpperCase();
+
+          const mapL1Hex = (mHex) => {
+            if (isXpxMosaic(mHex)) return xpxOnChainHex;
+            if (isUsdtMosaic(mHex)) return usdtOnChainHex;
+            if (isBnbMosaic(mHex)) return bnbOnChainHex;
+            return mHex;
+          };
+
+          const settlementTransfers = [];
+          const ownerDelta = { xpx: 0n, usdt: 0n, bnb: 0n };
+          let counterpartyKey = null;
+
+          // Pair consecutive (Base, Quote) trade fill legs emitted per match in sirius_clob.wasm
+          for (let li = 0; li + 1 < smartFillLegs.length; li += 2) {
+            const first = smartFillLegs[li];
+            const second = smartFillLegs[li + 1];
+            const baseLeg = first.isBaseLeg ? first : second;
+            const quoteLeg = first.isBaseLeg ? second : first;
+
+            if (side === 0) {
+              // Taker (callerKey) Bought Base from Maker (quoteLeg.recipientPub)
+              const makerAcc = quoteLeg.recipientTradingAcc;
+              if (!counterpartyKey) counterpartyKey = quoteLeg.recipientPub;
+
+              const baseMosaicOnChain = mapL1Hex(baseLeg.mosaicHex);
+              const quoteMosaicOnChain = mapL1Hex(quoteLeg.mosaicHex);
+              const quoteSym = isUsdtMosaic(quoteLeg.mosaicHex) ? 'USDT' : 'BNB';
+
+              // Leg A: Base delivered Maker/Vault -> Taker
+              const fromMakerPub = makerAcc ? makerAcc.trading_public_key : vault.publicKey;
+              const toTakerAddr = callerTradingAcc
+                ? callerTradingAcc.trading_address
+                : sdk.Address.createFromPublicKey(callerKey, testnet2Config.NETWORK_TYPE).plain();
+
+              settlementTransfers.push({
+                fromTradingPub: fromMakerPub,
+                fromType: makerAcc ? 'TRADING' : 'VAULT',
+                ownerPublicKey: makerAcc ? makerAcc.owner_public_key : null,
+                toAddress: toTakerAddr,
+                mosaicHex: baseMosaicOnChain,
+                amountAtomic: baseLeg.payoutAmount.toString(),
+                symbol: 'XPX',
+              });
+              ownerDelta.xpx += baseLeg.payoutAmount;
+
+              // Leg B: Quote paid Taker -> Maker/Vault
+              const fromTakerPub = callerTradingAcc ? callerTradingAcc.trading_public_key : vault.publicKey;
+              const toMakerAddr = makerAcc ? makerAcc.trading_address : vault.address.plain();
+
+              settlementTransfers.push({
+                fromTradingPub: fromTakerPub,
+                fromType: callerTradingAcc ? 'TRADING' : 'VAULT',
+                ownerPublicKey: callerTradingAcc ? callerKey.toLowerCase() : null,
+                toAddress: toMakerAddr,
+                mosaicHex: quoteMosaicOnChain,
+                amountAtomic: quoteLeg.payoutAmount.toString(),
+                symbol: quoteSym,
+              });
+              if (quoteSym === 'USDT') ownerDelta.usdt -= quoteLeg.payoutAmount;
+              else ownerDelta.bnb -= quoteLeg.payoutAmount;
+
+              if (quoteLeg.legFee > 0n && testnet2Config.FEE_COLLECTOR_ADDRESS) {
+                settlementTransfers.push({
+                  fromTradingPub: fromTakerPub,
+                  fromType: callerTradingAcc ? 'TRADING' : 'VAULT',
+                  ownerPublicKey: callerTradingAcc ? callerKey.toLowerCase() : null,
+                  toAddress: testnet2Config.FEE_COLLECTOR_ADDRESS,
+                  mosaicHex: quoteMosaicOnChain,
+                  amountAtomic: quoteLeg.legFee.toString(),
+                  symbol: quoteSym,
+                });
+                if (quoteSym === 'USDT') ownerDelta.usdt -= quoteLeg.legFee;
+                else ownerDelta.bnb -= quoteLeg.legFee;
+              }
+            } else {
+              // Taker (callerKey) Sold Base to Maker (baseLeg.recipientPub)
+              const makerAcc = baseLeg.recipientTradingAcc;
+              if (!counterpartyKey) counterpartyKey = baseLeg.recipientPub;
+
+              const baseMosaicOnChain = mapL1Hex(baseLeg.mosaicHex);
+              const quoteMosaicOnChain = mapL1Hex(quoteLeg.mosaicHex);
+              const quoteSym = isUsdtMosaic(quoteLeg.mosaicHex) ? 'USDT' : 'BNB';
+
+              // Leg A: Base sent Taker -> Maker/Vault
+              const fromTakerPub = callerTradingAcc ? callerTradingAcc.trading_public_key : vault.publicKey;
+              const toMakerAddr = makerAcc ? makerAcc.trading_address : vault.address.plain();
+
+              settlementTransfers.push({
+                fromTradingPub: fromTakerPub,
+                fromType: callerTradingAcc ? 'TRADING' : 'VAULT',
+                ownerPublicKey: callerTradingAcc ? callerKey.toLowerCase() : null,
+                toAddress: toMakerAddr,
+                mosaicHex: baseMosaicOnChain,
+                amountAtomic: baseLeg.payoutAmount.toString(),
+                symbol: 'XPX',
+              });
+              ownerDelta.xpx -= baseLeg.payoutAmount;
+
+              if (baseLeg.legFee > 0n && testnet2Config.FEE_COLLECTOR_ADDRESS) {
+                settlementTransfers.push({
+                  fromTradingPub: fromTakerPub,
+                  fromType: callerTradingAcc ? 'TRADING' : 'VAULT',
+                  ownerPublicKey: callerTradingAcc ? callerKey.toLowerCase() : null,
+                  toAddress: testnet2Config.FEE_COLLECTOR_ADDRESS,
+                  mosaicHex: baseMosaicOnChain,
+                  amountAtomic: baseLeg.legFee.toString(),
+                  symbol: 'XPX',
+                });
+                ownerDelta.xpx -= baseLeg.legFee;
+              }
+
+              // Leg B: Quote paid Maker/Vault -> Taker
+              const fromMakerPub = makerAcc ? makerAcc.trading_public_key : vault.publicKey;
+              const toTakerAddr = callerTradingAcc
+                ? callerTradingAcc.trading_address
+                : sdk.Address.createFromPublicKey(callerKey, testnet2Config.NETWORK_TYPE).plain();
+
+              settlementTransfers.push({
+                fromTradingPub: fromMakerPub,
+                fromType: makerAcc ? 'TRADING' : 'VAULT',
+                ownerPublicKey: makerAcc ? makerAcc.owner_public_key : null,
+                toAddress: toTakerAddr,
+                mosaicHex: quoteMosaicOnChain,
+                amountAtomic: quoteLeg.payoutAmount.toString(),
+                symbol: quoteSym,
+              });
+              if (quoteSym === 'USDT') ownerDelta.usdt += quoteLeg.payoutAmount;
+              else ownerDelta.bnb += quoteLeg.payoutAmount;
+            }
+          }
+
+          pendingSettlement = await tradingCosigner.createTradeSettlement({
+            orderId: expectedOrderId,
+            ownerPublicKey: callerKey.toLowerCase(),
+            counterpartyKey,
+            transfers: settlementTransfers,
+            delta: {
+              xpx: ownerDelta.xpx.toString(),
+              usdt: ownerDelta.usdt.toString(),
+              bnb: ownerDelta.bnb.toString(),
+            },
+          });
+        } catch (settleErr) {
+          console.warn('[TradingCosigner] Pending settlement creation warning:', settleErr.message);
+        }
+      }
+
+      // Flush legacy Vault batch settlement transaction to Sirius Testnet 2 L1 if queued
+      if (fillsCount > 0 && !callerHasSmartTrading) {
         try {
           const { defaultBatchSettlerTestnet2 } = require('./batch_settler_testnet2');
           if (defaultBatchSettlerTestnet2) {
@@ -4026,7 +4252,9 @@ async function _placeOrderUnlocked(orderReq) {
   }
 
   const totalFeeAtomic = takerFeeAtomic + makerFeeAtomic;
-  const updatedBal = getAccountBalance(callerKey);
+  const updatedBal = callerHasSmartTrading
+    ? await syncAndGetAccountBalance(callerKey)
+    : getAccountBalance(callerKey);
   return {
     ok: true,
     success: true,
@@ -4052,6 +4280,7 @@ async function _placeOrderUnlocked(orderReq) {
     feeAsset: side === 0 ? 'XPX' : (isBnb ? 'BNB' : 'USDT'),
     payouts,
     settlementTxHash: onChainTxHash,
+    pendingSettlement,
     balances: updatedBal,
     latency: {
       authMs: (typeof tAuth !== 'undefined' ? tAuth : Date.now()) - tStart,
@@ -4144,7 +4373,9 @@ async function _cancelOrderUnlocked(cancelReq) {
     success: true,
     orderId,
     gasConsumed: ret.execution_gas_consumed,
-    balances: getAccountBalance(callerKey),
+    balances: (clobDb.getTradingAccountByOwner(callerKey)?.status === 'active')
+      ? await syncAndGetAccountBalance(callerKey)
+      : getAccountBalance(callerKey),
   };
 }
 
@@ -4220,7 +4451,9 @@ async function _batchCancelOrdersUnlocked(batchReq) {
     success: true,
     cancelledOrderIds: orderIds,
     executionGas: ret.execution_gas_consumed,
-    balances: getAccountBalance(callerKey),
+    balances: (clobDb.getTradingAccountByOwner(callerKey)?.status === 'active')
+      ? await syncAndGetAccountBalance(callerKey)
+      : getAccountBalance(callerKey),
   };
 }
 
@@ -4285,7 +4518,9 @@ async function _cancelAllOrdersUnlocked(cancelAllReq) {
     success: true,
     message: 'All open resting orders cancelled',
     executionGas: ret.execution_gas_consumed,
-    balances: getAccountBalance(callerKey),
+    balances: (clobDb.getTradingAccountByOwner(callerKey)?.status === 'active')
+      ? await syncAndGetAccountBalance(callerKey)
+      : getAccountBalance(callerKey),
   };
 }
 
@@ -5194,7 +5429,30 @@ async function _emergencyUnlockUnlocked(req, callerKey) {
   };
 }
 
+/**
+ * Serialized Non-Custodial Smart Trading Account Withdrawal Co-Signing
+ * Protected by per-account lock & circuit breaker to prevent concurrent withdrawal/order races.
+ */
+async function cosignTradingAccountWithdrawal(reqBody) {
+  checkAndEnforceCircuitBreaker('Trading Account Withdrawal');
+  const lockKey = normalizeKey((reqBody && (reqBody.callerPublicKey || reqBody.publicKey)) || 'global');
+  return withAccountLock(lockKey, async () => {
+    const getLocks = (ownerPk) => {
+      const local = loadBalances()[normalizeKey(ownerPk).toLowerCase()] || {};
+      const drive = getDriveBalances(normalizeKey(ownerPk).toLowerCase()) || {};
+      return {
+        lockedXpx: BigInt(drive.lockedXpx || local.lockedXpx || 0n),
+        lockedUsdt: BigInt(drive.lockedUsdt || local.lockedUsdt || 0n),
+        lockedBnb: BigInt(drive.lockedBnb || local.lockedBnb || 0n),
+      };
+    };
+    return tradingCosigner.cosignWithdrawal(reqBody, getLocks);
+  });
+}
+
 module.exports = {
+  tradingCosigner,
+  cosignTradingAccountWithdrawal,
   syncUserOnChainBalanceToDrive,
   creditVerifiedDeposit,
   placeOrder,
