@@ -1212,6 +1212,7 @@ async function createTradeSettlement({
   counterpartyKey,
   transfers, // [{ fromTradingPub, fromType: 'TRADING'|'VAULT', toAddress, mosaicHex, amountAtomic, symbol }]
   delta,     // { xpx: '...', usdt: '...', bnb: '...' } net change for owner
+  orderContext = null,
 }) {
   const record = clobDb.getTradingAccountByOwner(ownerPublicKey);
   if (!record || record.status !== 'active') return null;
@@ -1271,6 +1272,7 @@ async function createTradeSettlement({
     collectedCosigs: [],
     transfers,
     delta,
+    orderContext,
     status: requiredUserSigners.size === 0 ? 'ready' : 'pending_cosign',
   });
 
@@ -1324,6 +1326,8 @@ async function submitSettlementCosignature({ settlementId, cosignature }) {
     metadata: {
       settlementId,
       allowedSigners,
+      orderContext: s.orderContext || null,
+      feeCollectorAddress: config.FEE_COLLECTOR_ADDRESS || null,
     },
   });
 

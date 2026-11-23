@@ -168,12 +168,20 @@ function getDb(customPath = null) {
       collected_cosigs_json TEXT NOT NULL,
       transfers_json TEXT NOT NULL,
       delta_json TEXT NOT NULL,
+      order_context_json TEXT,
       status TEXT NOT NULL CHECK(status IN ('pending_cosign', 'ready', 'broadcast', 'confirmed', 'failed')),
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_trading_settlements_owner ON trading_settlements(owner_public_key, status);
   `);
+
+  try {
+    const settlementCols = db.prepare("PRAGMA table_info(trading_settlements)").all().map((c) => c.name);
+    if (!settlementCols.includes('order_context_json')) {
+      db.exec('ALTER TABLE trading_settlements ADD COLUMN order_context_json TEXT;');
+    }
+  } catch (_) {}
 
   // Automated schema migration to ensure CHECK constraints on pre-existing databases
   const balancesTable = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='account_balances'").get();
@@ -992,12 +1000,13 @@ function saveTradingSettlement(rec) {
     INSERT INTO trading_settlements (
       settlement_id, order_id, owner_public_key, trading_public_key, counterparty_key,
       tx_hash, aggregate_payload, required_cosigners_json, collected_cosigs_json,
-      transfers_json, delta_json, status, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      transfers_json, delta_json, order_context_json, status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(settlement_id) DO UPDATE SET
       tx_hash = COALESCE(excluded.tx_hash, trading_settlements.tx_hash),
       aggregate_payload = excluded.aggregate_payload,
       collected_cosigs_json = excluded.collected_cosigs_json,
+      order_context_json = COALESCE(excluded.order_context_json, trading_settlements.order_context_json),
       status = excluded.status,
       updated_at = excluded.updated_at
   `).run(
@@ -1012,6 +1021,7 @@ function saveTradingSettlement(rec) {
     JSON.stringify(rec.collectedCosigs || []),
     JSON.stringify(rec.transfers || []),
     JSON.stringify(rec.delta || {}),
+    rec.orderContext ? JSON.stringify(rec.orderContext) : null,
     rec.status || 'pending_cosign',
     rec.createdAt || now,
     now
@@ -1026,6 +1036,10 @@ function getTradingSettlement(settlementId) {
 }
 
 function hydrateSettlementRow(row) {
+  let orderContext = null;
+  try {
+    orderContext = row.order_context_json ? JSON.parse(row.order_context_json) : null;
+  } catch (_) {}
   return {
     settlementId: row.settlement_id,
     orderId: row.order_id,
@@ -1038,6 +1052,7 @@ function hydrateSettlementRow(row) {
     collectedCosigs: JSON.parse(row.collected_cosigs_json || '[]'),
     transfers: JSON.parse(row.transfers_json || '[]'),
     delta: JSON.parse(row.delta_json || '{}'),
+    orderContext,
     status: row.status,
     createdAt: row.created_at,
     updatedAt: row.updated_at,

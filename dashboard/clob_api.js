@@ -4123,6 +4123,18 @@ async function _placeOrderUnlocked(orderReq) {
               usdt: ownerDelta.usdt.toString(),
               bnb: ownerDelta.bnb.toString(),
             },
+            orderContext: {
+              pair: (pair || 'XPX/USDT').toUpperCase().replace('_', '/'),
+              side: side === 1 ? 'sell' : 'buy',
+              type: orderType === 1 ? 'Market' : 'Limit',
+              price: canonicalizeDecimalString(priceInput, 8),
+              amount: canonicalizeDecimalString(amountInput, 6),
+              nonce: orderReq.nonce,
+              expiry: orderReq.expiry,
+              signature: orderReq.signature,
+              publicKey: callerKey.toLowerCase(),
+              domainSeparator: DOMAIN_SEPARATOR,
+            },
           });
         } catch (settleErr) {
           console.warn('[TradingCosigner] Pending settlement creation warning:', settleErr.message);
