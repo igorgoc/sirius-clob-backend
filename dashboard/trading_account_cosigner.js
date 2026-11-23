@@ -1023,10 +1023,43 @@ async function cosignWithdrawal(reqBody, getLocksForOwnerFn = null) {
     throw new Error(`Insufficient withdrawable BNB: requested ${outBnb}, free available ${availBnb}`);
   }
 
-  // Determine primary mosaic metadata for independent BFT server check
-  const primarySym = outXpx > 0n ? 'XPX' : (outUsdt > 0n ? 'USDT' : 'BNB');
-  const primaryAmt = outXpx > 0n ? outXpx : (outUsdt > 0n ? outUsdt : outBnb);
-  const primaryAvail = outXpx > 0n ? availXpx : (outUsdt > 0n ? availUsdt : availBnb);
+  // Build full per-mosaic metadata for independent BFT server checks (supports single & multi-mosaic withdrawals)
+  const mosaicChecks = [];
+  if (outXpx > 0n) {
+    mosaicChecks.push({
+      symbol: 'XPX',
+      mosaicHex: xpxHex,
+      mosaicIdDecimal: BigInt('0x0DC67FBE1CAD29E3').toString(10),
+      requestedAmountAtomic: outXpx.toString(),
+      maxWithdrawableAtomic: availXpx.toString(),
+      onChainBalanceAtomic: balState.onChain.xpx,
+    });
+  }
+  if (outUsdt > 0n) {
+    mosaicChecks.push({
+      symbol: 'USDT',
+      mosaicHex: usdtHex,
+      mosaicIdDecimal: BigInt('0x10112CBA1E7B9037').toString(10),
+      requestedAmountAtomic: outUsdt.toString(),
+      maxWithdrawableAtomic: availUsdt.toString(),
+      onChainBalanceAtomic: balState.onChain.usdt,
+    });
+  }
+  if (outBnb > 0n) {
+    mosaicChecks.push({
+      symbol: 'BNB',
+      mosaicHex: bnbHex,
+      mosaicIdDecimal: BigInt('0x1E5C5FADEC7B34DD').toString(10),
+      requestedAmountAtomic: outBnb.toString(),
+      maxWithdrawableAtomic: availBnb.toString(),
+      onChainBalanceAtomic: balState.onChain.bnb,
+    });
+  }
+
+  const primaryCheck = mosaicChecks[0];
+  if (!primaryCheck) {
+    throw new Error('Withdrawal must include at least one supported mosaic (XPX, USDT, or BNB)');
+  }
 
   // Fan out to 3 Distributed Validator Servers (require 2-of-3 quorum)
   const validatorCosigs = await requestBftNodeCosignatures({
@@ -1036,13 +1069,12 @@ async function cosignWithdrawal(reqBody, getLocksForOwnerFn = null) {
     tradingAccountPublicKey: record.trading_public_key,
     metadata: {
       recipientAddress: primaryRecipient,
-      mosaicHex: primaryMosaicHex,
-      requestedAmountAtomic: primaryAmt.toString(),
-      maxWithdrawableAtomic: primaryAvail.toString(),
-      onChainBalanceAtomic: balState.onChain[primarySym.toLowerCase()],
-      mosaicIdDecimal: primarySym === 'XPX'
-        ? BigInt('0x0DC67FBE1CAD29E3').toString(10)
-        : (primarySym === 'USDT' ? BigInt('0x10112CBA1E7B9037').toString(10) : BigInt('0x1E5C5FADEC7B34DD').toString(10)),
+      mosaicHex: primaryCheck.mosaicHex,
+      requestedAmountAtomic: primaryCheck.requestedAmountAtomic,
+      maxWithdrawableAtomic: primaryCheck.maxWithdrawableAtomic,
+      onChainBalanceAtomic: primaryCheck.onChainBalanceAtomic,
+      mosaicIdDecimal: primaryCheck.mosaicIdDecimal,
+      mosaics: mosaicChecks,
     },
   });
 
