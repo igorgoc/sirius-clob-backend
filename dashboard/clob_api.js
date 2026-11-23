@@ -1616,9 +1616,9 @@ function getRolling24hWithdrawalVolume(now = Date.now()) {
 
 // Per-Transaction Maximum Withdrawal Ceilings (Prevents Single-Shot Vault Drain)
 const MAX_SINGLE_WITHDRAWAL = {
-  XPX: 1_000n * 1_000_000n, // 1,000 XPX
-  USDT: 200n * 1_000_000n,   // 200 USDT
-  BNB: 1n * 1_000_000n,      // 1 BNB
+  XPX: 100_000n * 1_000_000n, // 100,000 XPX
+  USDT: 5_000n * 1_000_000n,  // 5,000 USDT
+  BNB: 10n * 1_000_000n,      // 10 BNB
 };
 
 function checkWithdrawalCeiling(rawMosaicId, amountAtomic) {
@@ -5037,6 +5037,12 @@ async function _withdrawTokensUnlocked(withdrawReq) {
   const maxVaultWithdrawable = driveAvail > netDepositsAvail ? driveAvail : netDepositsAvail;
 
   if (amountAtomic > maxVaultWithdrawable) {
+    const activeSmartAcc = clobDb.getTradingAccountByOwner(callerKey);
+    if (activeSmartAcc && activeSmartAcc.status === 'active') {
+      throw new Error(
+        `Your account uses a non-custodial 2-of-2 Smart Trading Account (${activeSmartAcc.trading_address}). Please refresh the page so your wallet uses co-signed withdrawal instead of the legacy vault.`
+      );
+    }
     throw new Error(
       `Insufficient deposited vault balance for withdrawal. Hot Vault withdrawals are strictly capped to deposited collateral (${formatAtomicUnits(maxVaultWithdrawable, 6)} available). Un-deposited coins remain safely in your personal Catapult wallet.`
     );
