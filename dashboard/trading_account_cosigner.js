@@ -1298,8 +1298,24 @@ async function submitSettlementCosignature({ settlementId, cosignature }) {
     finalCosigs
   );
 
-  await testnetClient.announceSignedTransaction(completedSigned);
-  await testnetClient.verifyTransactionAccepted(completedSigned.hash, 8000);
+  try {
+    await testnetClient.announceSignedTransaction(completedSigned);
+    await testnetClient.verifyTransactionAccepted(completedSigned.hash, 8000);
+  } catch (l1Err) {
+    const errMsg = l1Err && l1Err.message ? l1Err.message : String(l1Err || '');
+    if (errMsg.includes('Sirius node rejected transaction')) {
+      clobDb.updateTradingSettlementStatus(settlementId, 'failed', completedSigned.hash, existing);
+      const hasVaultLeg = Array.isArray(s.transfers) && s.transfers.some((t) => t.fromType === 'VAULT');
+      if (hasVaultLeg && errMsg.includes('Insufficient_Balance')) {
+        let vaultAddr = '';
+        try { vaultAddr = testnetClient.getOrInitVaultAccount().address.plain(); } catch (_) {}
+        throw new Error(
+          `Market Maker Vault (${vaultAddr || 'clearing vault'}) lacks on-chain XPX/USDT liquidity on Sirius L1 to settle this MM fill (${errMsg}). Set SIRIUS_VAULT_PRIVATE_KEY on the backend or fund the Vault.`
+        );
+      }
+    }
+    throw l1Err;
+  }
 
   clobDb.updateTradingSettlementStatus(settlementId, 'broadcast', completedSigned.hash, existing);
 
