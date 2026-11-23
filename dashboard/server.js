@@ -1685,6 +1685,21 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 1b. Bootstrap Level-2 Validator Cluster on-chain (or report if 0.5 XPX gas sponsorship needed)
+  if (pathname === '/api/clob/validator-cluster/bootstrap' && req.method === 'POST') {
+    tradingCosigner
+      .ensureValidatorClusterOnChain(true)
+      .then((result) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      })
+      .catch((err) => {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
+      });
+    return;
+  }
+
   // 2. Discover & query user Smart Trading Account status (SQLite + direct Sirius L1 multisig graph discovery)
   if (pathname === '/api/clob/trading-account/status' && req.method === 'GET') {
     const owner = parsedUrl.searchParams.get('ownerPublicKey') ||

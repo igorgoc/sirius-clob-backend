@@ -186,11 +186,35 @@ function getOrInitValidatorClusterConfig() {
   return cfg;
 }
 
+async function findFundedBackendSponsor(xpxHex, minBalanceAtomic = 700_000n) {
+  const candidates = [];
+  try { candidates.push(testnetClient.getOrInitVaultAccount()); } catch (_) {}
+  try {
+    const t = testnetClient.getOrInitTreasuryAccount();
+    if (t) candidates.push(t);
+  } catch (_) {}
+  try {
+    const f = testnetClient.getOrInitFeeCollectorAccount();
+    if (f) candidates.push(f);
+  } catch (_) {}
+
+  for (const acc of candidates) {
+    if (!acc) continue;
+    try {
+      const bal = await testnetClient.getAccountOnChainBalances(acc.address.plain(), true);
+      if ((bal.get(xpxHex) || 0n) >= minBalanceAtomic) {
+        return acc;
+      }
+    } catch (_) {}
+  }
+  return null;
+}
+
 /**
  * Verify that the Level 2 Validator Cluster Account is converted to 2-of-3 multisig on Sirius L1.
- * If not yet converted and bootstrap keys are available locally, converts it atomically.
+ * Never broadcasts an unfunded transaction: returns { ok: false, needsFunding: true } if no sponsor has >= 0.7 XPX.
  */
-async function ensureValidatorClusterOnChain() {
+async function ensureValidatorClusterOnChain(waitForConfirmation = true) {
   const cfg = getOrInitValidatorClusterConfig();
   const clusterAddr = cfg.clusterAddress;
 
@@ -201,13 +225,12 @@ async function ensureValidatorClusterOnChain() {
     if (info && info.multisig && info.multisig.minApproval >= 2 && Array.isArray(info.multisig.cosignatories)) {
       if (!cfg.isMultisigConfirmedOnChain) {
         cfg.isMultisigConfirmedOnChain = true;
-        // Zero out bootstrap private key once permanently converted on L1
         delete cfg.bootstrapPrivateKey;
         try {
           fs.writeFileSync(VALIDATOR_CLUSTER_FILE, JSON.stringify(cfg, null, 2), { mode: 0o600 });
         } catch (_) {}
       }
-      return { ok: true, alreadyMultisig: true, clusterAddress: clusterAddr, clusterPublicKey: cfg.clusterPublicKey, multisig: info.multisig };
+      return { ok: true, alreadyMultisig: true, isMultisigConfirmedOnChain: true, clusterAddress: clusterAddr, clusterPublicKey: cfg.clusterPublicKey, multisig: info.multisig };
     }
   } catch (_) {
     // 404 means not yet converted to multisig on L1
@@ -226,13 +249,51 @@ async function ensureValidatorClusterOnChain() {
     return {
       ok: false,
       alreadyMultisig: false,
+      isMultisigConfirmedOnChain: false,
       clusterAddress: clusterAddr,
       clusterPublicKey: cfg.clusterPublicKey,
-      message: 'Validator cluster not yet converted on-chain and bootstrapPrivateKey already cleared/external.',
+      message: 'Validator cluster not yet converted on-chain and bootstrapPrivateKey is external.',
     };
   }
 
   const clusterAcc = Account.createFromPrivateKey(cfg.bootstrapPrivateKey, config.NETWORK_TYPE, 1);
+
+  // Check if a previous Level-2 activation tx is already unconfirmed/pending in mempool
+  try {
+    const unconf = await testnetClient.fetchJson(`${testnetClient.getActiveNodeUrl()}/account/${clusterAddr}/transactions/unconfirmed`, 3000);
+    if (Array.isArray(unconf) && unconf.length > 0) {
+      if (waitForConfirmation) {
+        for (let i = 0; i < 25; i++) {
+          await new Promise((r) => setTimeout(r, 2500));
+          try {
+            const info = await testnetClient.fetchJson(`${testnetClient.getActiveNodeUrl()}/account/${clusterAddr}/multisig`, 3000);
+            if (info && info.multisig && info.multisig.minApproval >= 2) {
+              cfg.isMultisigConfirmedOnChain = true;
+              delete cfg.bootstrapPrivateKey;
+              try {
+                fs.writeFileSync(VALIDATOR_CLUSTER_FILE, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+              } catch (_) {}
+              return {
+                ok: true,
+                alreadyMultisig: false,
+                isMultisigConfirmedOnChain: true,
+                clusterAddress: clusterAddr,
+                clusterPublicKey: cfg.clusterPublicKey,
+              };
+            }
+          } catch (_) {}
+        }
+      }
+      return {
+        ok: true,
+        alreadyMultisig: false,
+        pendingOnChain: true,
+        isMultisigConfirmedOnChain: false,
+        clusterAddress: clusterAddr,
+        clusterPublicKey: cfg.clusterPublicKey,
+      };
+    }
+  } catch (_) {}
 
   // Ensure clusterAcc has >= 0.35 XPX to pay its own L1 AggregateComplete conversion fee
   const xpxHex = (config.XPX_MOSAIC_ID || '13BFC518E40549D7').toLowerCase();
@@ -243,16 +304,18 @@ async function ensureValidatorClusterOnChain() {
   } catch (_) {}
 
   if (clusterXpx < 350_000n) {
-    let sponsor = testnetClient.getOrInitVaultAccount();
-    try {
-      const vBal = await testnetClient.getAccountOnChainBalances(sponsor.address.plain(), true);
-      if ((vBal.get(xpxHex) || 0n) < 700_000n) {
-        const treasury = testnetClient.getOrInitTreasuryAccount();
-        if (treasury) sponsor = treasury;
-      }
-    } catch (_) {
-      const treasury = testnetClient.getOrInitTreasuryAccount();
-      if (treasury) sponsor = treasury;
+    const sponsor = await findFundedBackendSponsor(xpxHex, 700_000n);
+    if (!sponsor) {
+      return {
+        ok: false,
+        alreadyMultisig: false,
+        needsFunding: true,
+        isMultisigConfirmedOnChain: false,
+        clusterAddress: clusterAddr,
+        clusterPublicKey: cfg.clusterPublicKey,
+        requiredAtomic: '500000',
+        message: `Level-2 Validator Cluster (${clusterAddr}) needs 0.5 XPX on-chain to activate 2-of-3 multisig.`,
+      };
     }
 
     const fundTx = TransferTransaction.create(
@@ -266,7 +329,6 @@ async function ensureValidatorClusterOnChain() {
     const signedFund = sponsor.sign(fundTx, config.GENERATION_HASH);
     await testnetClient.announceSignedTransaction(signedFund);
     await testnetClient.verifyTransactionAccepted(signedFund.hash, 8000);
-    // Wait for block confirmation before clusterAcc spends fee
     for (let i = 0; i < 30; i++) {
       await new Promise((r) => setTimeout(r, 2500));
       try {
@@ -323,9 +385,35 @@ async function ensureValidatorClusterOnChain() {
   } catch (_) {}
 
   console.log(`[TradingCosigner] 🚀 Level-2 Validator Cluster (${clusterAddr}) 2-of-3 Multisig broadcast: ${combined.hash}`);
+
+  if (waitForConfirmation) {
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 2500));
+      try {
+        const info = await testnetClient.fetchJson(`${testnetClient.getActiveNodeUrl()}/account/${clusterAddr}/multisig`, 3000);
+        if (info && info.multisig && info.multisig.minApproval >= 2) {
+          cfg.isMultisigConfirmedOnChain = true;
+          delete cfg.bootstrapPrivateKey;
+          try {
+            fs.writeFileSync(VALIDATOR_CLUSTER_FILE, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+          } catch (_) {}
+          return {
+            ok: true,
+            alreadyMultisig: false,
+            isMultisigConfirmedOnChain: true,
+            txHash: combined.hash,
+            clusterAddress: clusterAddr,
+            clusterPublicKey: cfg.clusterPublicKey,
+          };
+        }
+      } catch (_) {}
+    }
+  }
+
   return {
     ok: true,
     alreadyMultisig: false,
+    isMultisigConfirmedOnChain: false,
     txHash: combined.hash,
     clusterAddress: clusterAddr,
     clusterPublicKey: cfg.clusterPublicKey,
@@ -728,7 +816,16 @@ async function activateTradingAccount(reqBody) {
   }
 
   // Ensure Level 2 Validator Cluster is ready on-chain first
-  await ensureValidatorClusterOnChain();
+  const clusterBoot = await ensureValidatorClusterOnChain(true);
+  if (!clusterBoot.ok) {
+    return {
+      ok: false,
+      needsFunding: Boolean(clusterBoot.needsFunding),
+      clusterAddress: clusterBoot.clusterAddress,
+      requiredAtomic: clusterBoot.requiredAtomic || '500000',
+      error: clusterBoot.message || 'Level-2 Validator Cluster is not yet ready on-chain.',
+    };
+  }
   const cfg = getOrInitValidatorClusterConfig();
 
   const { txHashHex, initiatorPubHex } = verifyOuterInitiatorSignature(signedByInitiatorPayload);
