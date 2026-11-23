@@ -55,6 +55,9 @@ const { supercontractserver, getOrInitNodeValidatorAccount } = require('../execu
 
 const VALIDATOR_QUORUM = 2; // 2-of-3 BFT Threshold
 const GRPC_COSIGN_TIMEOUT_MS = 6000;
+const DEFAULT_CLUSTER_SEED = process.env.DRIVE_KEY_HEX || 'bd1d100a98c34f62e170a8395b4498dc1e730286f5a12c489b37d01562f0cb23';
+let cachedClusterCfg = null;
+let lastClusterProbeAt = 0;
 
 const vmClientCache = new Map();
 function getVmClient(node) {
@@ -136,6 +139,7 @@ function getOrInitValidatorClusterConfig() {
       clusterAddress: clusterAddr,
       minApproval: VALIDATOR_QUORUM,
       minRemoval: VALIDATOR_QUORUM,
+      isMultisigConfirmedOnChain: Boolean(cachedClusterCfg && cachedClusterCfg.isMultisigConfirmedOnChain),
       nodes: NODES.map((n, idx) => ({
         name: n.name,
         host: n.vmHost,
@@ -145,16 +149,33 @@ function getOrInitValidatorClusterConfig() {
     };
   }
 
+  if (cachedClusterCfg && cachedClusterCfg.clusterPublicKey) {
+    return cachedClusterCfg;
+  }
+
   if (fs.existsSync(VALIDATOR_CLUSTER_FILE)) {
     try {
       const parsed = JSON.parse(fs.readFileSync(VALIDATOR_CLUSTER_FILE, 'utf8'));
       if (parsed && parsed.clusterPublicKey && Array.isArray(parsed.nodes) && parsed.nodes.length >= 3) {
-        return parsed;
+        cachedClusterCfg = parsed;
+        return cachedClusterCfg;
       }
     } catch (_) {}
   }
 
-  const clusterAccount = Account.generateNewAccount(config.NETWORK_TYPE);
+  const isMainnet = config.NETWORK_TYPE === 184 || String(config.NETWORK_NAME || '').toLowerCase() === 'mainnet';
+  const clusterSeed = (process.env.SIRIUS_CLUSTER_SEED || '').trim() || (!isMainnet ? DEFAULT_CLUSTER_SEED : '');
+  let clusterAccount;
+  if (clusterSeed && !process.env.SIRIUS_DISABLE_DETERMINISTIC_KEYS) {
+    const clusterPriv = crypto
+      .createHash('sha256')
+      .update(`${clusterSeed}:sirius-clob:${config.NETWORK_TYPE}:validator-cluster`)
+      .digest('hex')
+      .toUpperCase();
+    clusterAccount = Account.createFromPrivateKey(clusterPriv, config.NETWORK_TYPE, 1);
+  } else {
+    clusterAccount = Account.generateNewAccount(config.NETWORK_TYPE);
+  }
   const nodeEntries = NODES.map((n) => {
     const acc = getOrInitNodeValidatorAccount(n.name);
     return {
@@ -181,9 +202,12 @@ function getOrInitValidatorClusterConfig() {
     createdAt: new Date().toISOString(),
   };
 
-  fs.mkdirSync(path.dirname(VALIDATOR_CLUSTER_FILE), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(VALIDATOR_CLUSTER_FILE, JSON.stringify(cfg, null, 2), { mode: 0o600 });
-  return cfg;
+  try {
+    fs.mkdirSync(path.dirname(VALIDATOR_CLUSTER_FILE), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(VALIDATOR_CLUSTER_FILE, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+  } catch (_) {}
+  cachedClusterCfg = cfg;
+  return cachedClusterCfg;
 }
 
 async function findFundedBackendSponsor(xpxHex, minBalanceAtomic = 700_000n) {
@@ -226,6 +250,7 @@ async function ensureValidatorClusterOnChain(waitForConfirmation = true) {
       if (!cfg.isMultisigConfirmedOnChain) {
         cfg.isMultisigConfirmedOnChain = true;
         delete cfg.bootstrapPrivateKey;
+        if (cachedClusterCfg) cachedClusterCfg.isMultisigConfirmedOnChain = true;
         try {
           fs.writeFileSync(VALIDATOR_CLUSTER_FILE, JSON.stringify(cfg, null, 2), { mode: 0o600 });
         } catch (_) {}
@@ -597,7 +622,14 @@ function combineAndDedupeCosignatures(payloadHex, initiatorPubHex, cosigsList) {
  * Discover active/pending Trading Account for an owner, including direct on-chain L1 multisig graph discovery!
  */
 async function discoverTradingAccountStatus(ownerPublicKeyOrAddress, existingLocks = null) {
-  const cfg = getOrInitValidatorClusterConfig();
+  let cfg = getOrInitValidatorClusterConfig();
+  if (!cfg.isMultisigConfirmedOnChain && Date.now() - lastClusterProbeAt > 15000) {
+    lastClusterProbeAt = Date.now();
+    try {
+      await ensureValidatorClusterOnChain(false);
+      cfg = getOrInitValidatorClusterConfig();
+    } catch (_) {}
+  }
   let ownerPublicKey = null;
   let ownerAddress = null;
 
