@@ -1292,25 +1292,43 @@ for (const node of NODES) {
   nodeWasmPaths[node.name] = destWasm;
 }
 
+const marketsHashCache = new Map();
+
 function computeMarketsHashForDir(marketsDir) {
   if (!marketsDir || !fs.existsSync(marketsDir)) return null;
   try {
-    const hash = crypto.createHash('sha256');
     const relFiles = [
       'balances.json',
       'xpx_usdt/market_state.bin',
       'xpx_bnb/market_state.bin',
     ];
-    let anyFound = false;
+    let sig = '';
+    const existing = [];
     for (const rel of relFiles) {
       const full = path.join(marketsDir, rel);
-      if (fs.existsSync(full)) {
-        anyFound = true;
-        hash.update(rel);
-        hash.update(fs.readFileSync(full));
+      try {
+        const st = fs.statSync(full);
+        sig += `${rel}:${st.ino}:${st.mtimeMs}:${st.size};`;
+        existing.push({ rel, full });
+      } catch (_) {
+        sig += `${rel}:0;`;
       }
     }
-    return anyFound ? hash.digest('hex') : null;
+    if (existing.length === 0) return null;
+
+    const cached = marketsHashCache.get(marketsDir);
+    if (cached && cached.sig === sig) {
+      return cached.hash;
+    }
+
+    const hash = crypto.createHash('sha256');
+    for (const item of existing) {
+      hash.update(item.rel);
+      hash.update(fs.readFileSync(item.full));
+    }
+    const digest = hash.digest('hex');
+    marketsHashCache.set(marketsDir, { sig, hash: digest });
+    return digest;
   } catch (_) {
     return null;
   }
@@ -1929,7 +1947,23 @@ function loadBalances() {
   return normalized;
 }
 
-function saveBalances(balances) {
+let pendingBalancesJsonFlush = null;
+
+function flushBalancesJsonSnapshot(balances) {
+  try {
+    const serialized = JSON.stringify(balances, (key, value) => {
+      if (typeof value === 'bigint') {
+        return value.toString();
+      }
+      return value;
+    }, 2);
+    const tmp = `${BALANCES_FILE}.tmp.${process.pid}.${Date.now()}`;
+    fs.writeFileSync(tmp, serialized);
+    fs.renameSync(tmp, BALANCES_FILE);
+  } catch (_) {}
+}
+
+function saveBalances(balances, onlyKeys = null) {
   try {
     const db = clobDb.getDb();
     const insertStmt = db.prepare(`
@@ -1951,11 +1985,17 @@ function saveBalances(balances) {
         last_on_chain_bnb = excluded.last_on_chain_bnb,
         updated_at = excluded.updated_at
     `);
-    const updateAll = db.transaction(() => {
+    const targetKeys = Array.isArray(onlyKeys) && onlyKeys.length > 0
+      ? onlyKeys.map((k) => String(k).toLowerCase()).filter((k) => balances[k])
+      : Object.keys(balances);
+    const updateRows = db.transaction(() => {
       const now = Date.now();
-      for (const [key, b] of Object.entries(balances)) {
+      for (const rawKey of targetKeys) {
+        const key = String(rawKey).toLowerCase();
+        const b = balances[key];
+        if (!b) continue;
         insertStmt.run(
-          key.toLowerCase(),
+          key,
           (b.xpx || 0n).toString(),
           (b.usdt || 0n).toString(),
           (b.bnb || 0n).toString(),
@@ -1970,21 +2010,24 @@ function saveBalances(balances) {
         );
       }
     });
-    updateAll();
+    updateRows();
   } catch (err) {
     console.error('[ClobApi] Critical SQLite save error in saveBalances:', err.message);
     throw err;
   }
 
-  try {
-    const serialized = JSON.stringify(balances, (key, value) => {
-      if (typeof value === 'bigint') {
-        return value.toString();
-      }
-      return value;
-    }, 2);
-    fs.writeFileSync(BALANCES_FILE, serialized);
-  } catch (_) {}
+  // SQLite WAL above is durable & authoritative; debounce full JSON mirror writes on single-key hot paths.
+  if (Array.isArray(onlyKeys) && onlyKeys.length > 0) {
+    if (!pendingBalancesJsonFlush) {
+      pendingBalancesJsonFlush = setTimeout(() => {
+        pendingBalancesJsonFlush = null;
+        flushBalancesJsonSnapshot(loadBalances());
+      }, 1000);
+      if (pendingBalancesJsonFlush.unref) pendingBalancesJsonFlush.unref();
+    }
+  } else {
+    flushBalancesJsonSnapshot(balances);
+  }
 }
 
 function normalizeKey(pubKey) {
@@ -2061,14 +2104,14 @@ function getAccountBalance(publicKey) {
       lockedBnb: driveBal ? driveBal.lockedBnb : 0n,
       lastUpdated: Date.now(),
     };
-    saveBalances(localBalances);
+    saveBalances(localBalances, [key]);
   } else if (driveBal) {
     // Only update locked escrow amounts from drive - NEVER ratchet or overwrite trading balances!
     localBalances[key].lockedXpx = driveBal.lockedXpx;
     localBalances[key].lockedUsdt = driveBal.lockedUsdt;
     localBalances[key].lockedBnb = driveBal.lockedBnb;
     localBalances[key].lastUpdated = Date.now();
-    saveBalances(localBalances);
+    saveBalances(localBalances, [key]);
   }
 
   return localBalances[key];
@@ -2154,7 +2197,7 @@ async function syncAndGetAccountBalance(publicKeyOrAddr) {
       lastUpdated: Date.now(),
     };
     existingLocal[key] = syncedEntry;
-    saveBalances(existingLocal);
+    saveBalances(existingLocal, [key]);
     return {
       ...syncedEntry,
       isSmartTradingAccount: true,
@@ -2272,7 +2315,7 @@ async function syncAndGetAccountBalance(publicKeyOrAddr) {
   currentEntry.lastUpdated = Date.now();
 
   balances[key] = currentEntry;
-  saveBalances(balances);
+  saveBalances(balances, [key]);
 
   return {
     xpx: rawLocalXpx,
@@ -2364,7 +2407,7 @@ function updateAccountBalance(publicKey, updater, authContext = null) {
 
   balances[key].lastUpdated = Date.now();
   accountOnChainCache.delete(key);
-  saveBalances(balances);
+  saveBalances(balances, [key]);
   return balances[key];
 }
 
@@ -2588,7 +2631,7 @@ function syncGatewayCacheFromDrive(publicKey) {
       lockedBnb: driveBal ? driveBal.lockedBnb : 0n,
       lastUpdated: Date.now(),
     };
-    saveBalances(localBalances);
+    saveBalances(localBalances, [key]);
     return localBalances[key];
   }
 
@@ -2598,7 +2641,7 @@ function syncGatewayCacheFromDrive(publicKey) {
     localBalances[key].lockedUsdt = driveBal.lockedUsdt;
     localBalances[key].lockedBnb = driveBal.lockedBnb;
     localBalances[key].lastUpdated = Date.now();
-    saveBalances(localBalances);
+    saveBalances(localBalances, [key]);
   }
   return localBalances[key];
 }
@@ -2965,10 +3008,82 @@ async function syncDriveDepth() {
   } catch (_) {}
 }
 
+const marketDepthCache = new Map();
+
+/**
+ * Decode Rust bincode `MarketPair` binary directly into `OrderBookDepth` format
+ * so reads and price-collar checks get exact committed state without acquiring `withClusterConsensusLock`.
+ */
+function decodeMarketStateDepth(statePath, maxLevels = 50) {
+  const st = fs.statSync(statePath);
+  const sig = `${st.ino}:${st.mtimeMs}:${st.size}`;
+  const cached = marketDepthCache.get(statePath);
+  if (cached && cached.sig === sig) {
+    return cached.depth;
+  }
+
+  const buf = fs.readFileSync(statePath);
+  if (buf.length < 72) return null;
+  let off = 0;
+  const ensure = (n) => {
+    if (off + n > buf.length) throw new Error('Truncated market_state.bin');
+  };
+  const readU64Big = () => {
+    ensure(8);
+    const v = buf.readBigUInt64LE(off);
+    off += 8;
+    return v;
+  };
+  const readU64 = () => Number(readU64Big());
+
+  const baseId = readU64Big();
+  const quoteId = readU64Big();
+  off += 40; // skip tick_size, min_order_size, next_order_id, maker_fee_bps, taker_fee_bps
+
+  const readSideLevels = (reverse) => {
+    const mapLen = readU64();
+    const levels = [];
+    for (let i = 0; i < mapLen; i++) {
+      readU64(); // BTreeMap key price
+      const levelPrice = readU64();
+      const totalDepth = readU64();
+      const ordersLen = readU64();
+      ensure(ordersLen * 76); // LimitOrder in bincode: u64 + [u8;32] + u32 + 4*u64 = 76 bytes
+      off += ordersLen * 76;
+      levels.push({ price: levelPrice, total_depth: totalDepth, order_count: ordersLen });
+    }
+    if (reverse) levels.reverse();
+    return levels.slice(0, maxLevels);
+  };
+
+  const bids = readSideLevels(true);
+  const asks = readSideLevels(false);
+  const depth = {
+    base_mosaic_id: Number(baseId),
+    base_mosaic_hex: '0x' + baseId.toString(16).toUpperCase().padStart(16, '0'),
+    quote_mosaic_id: Number(quoteId),
+    quote_mosaic_hex: '0x' + quoteId.toString(16).toUpperCase().padStart(16, '0'),
+    best_bid: bids.length > 0 ? bids[0].price : null,
+    best_ask: asks.length > 0 ? asks[0].price : null,
+    bids,
+    asks,
+  };
+  marketDepthCache.set(statePath, { sig, depth });
+  return depth;
+}
+
 function getMarketDepthSnapshot(marketKey = 'xpx_usdt') {
+  const market = (marketKey || 'xpx_usdt').toLowerCase().replace('/', '_');
+  const marketDir = path.join(CLUSTER_DIR, 'node1', 'data', 'drives', DRIVE_KEY_HEX, 'drive', 'markets', market);
   try {
-    const market = (marketKey || 'xpx_usdt').toLowerCase().replace('/', '_');
-    const depthPath = path.join(CLUSTER_DIR, 'node1', 'data', 'drives', DRIVE_KEY_HEX, 'drive', 'markets', market, 'depth.json');
+    const statePath = path.join(marketDir, 'market_state.bin');
+    if (fs.existsSync(statePath)) {
+      const decoded = decodeMarketStateDepth(statePath, 50);
+      if (decoded) return decoded;
+    }
+  } catch (_) {}
+  try {
+    const depthPath = path.join(marketDir, 'depth.json');
     if (fs.existsSync(depthPath)) {
       const raw = fs.readFileSync(depthPath, 'utf8');
       return JSON.parse(raw);
@@ -3094,7 +3209,6 @@ async function cancelAllOrdersInternal(callerKeyRaw, pair = 'XPX/USDT', reason =
         }
       }
       saveActiveOrders();
-      syncDriveDepth().catch(() => {});
       console.log(`✅ [COD Watchdog] Cancelled ${removedCount} active orders for ${callerKey} (${reason})`);
       return { ok: true, success: true, removedOrders: removedCount, reason };
     } catch (err) {
@@ -3169,7 +3283,6 @@ async function cancelSingleOrderInternal(orderIdRaw, pair = 'XPX/USDT', callerKe
         saveActiveOrders();
       }
 
-      syncDriveDepth().catch(() => {});
       console.log(`🧹 [Order Sweeper] Order #${orderId} for ${callerKey} cancelled & funds liberated (${reason})`);
       return { ok: true, success: true, orderId, reason };
     } catch (err) {
@@ -4219,9 +4332,6 @@ async function _placeOrderUnlocked(orderReq) {
     syncGatewayCacheFromDrive(callerKey);
   }
 
-  // Refresh public depth feed
-  syncDriveDepth().catch(() => {});
-
   const orderId = expectedOrderId;
   const initialAtomic = BigInt(amountAtomic);
   const remainingAtomic = initialAtomic > takerBaseFilled ? initialAtomic - takerBaseFilled : 0n;
@@ -4384,8 +4494,6 @@ async function _cancelOrderUnlocked(cancelReq) {
     saveActiveOrders();
   }
 
-  syncDriveDepth().catch(() => {});
-
   return {
     ok: true,
     success: true,
@@ -4462,8 +4570,6 @@ async function _batchCancelOrdersUnlocked(batchReq) {
   // Restore escrow into available balance from canonical drive ledger
   syncGatewayCacheFromDrive(callerKey);
 
-  syncDriveDepth().catch(() => {});
-
   return {
     ok: true,
     success: true,
@@ -4528,8 +4634,6 @@ async function _cancelAllOrdersUnlocked(cancelAllReq) {
     }
   }
   saveActiveOrders();
-
-  syncDriveDepth().catch(() => {});
 
   return {
     ok: true,

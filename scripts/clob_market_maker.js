@@ -260,22 +260,34 @@ class ClobMarketMaker {
     return (results && results[0] && results[0].returns) ? results[0].returns : { success: true, return_val: 0 };
   }
 
+  getCanonicalMarketDepth(marketKey) {
+    try {
+      const clobApi = require('../dashboard/clob_api');
+      if (clobApi && typeof clobApi.getMarketDepthSnapshot === 'function') {
+        const snap = clobApi.getMarketDepthSnapshot(marketKey);
+        if (snap) return snap;
+      }
+    } catch (_) {}
+    const driveDepthPath = path.join(this.nodeDrivePaths['node1'], 'drive', `markets/${marketKey}/depth.json`);
+    if (fs.existsSync(driveDepthPath)) {
+      try {
+        return JSON.parse(fs.readFileSync(driveDepthPath, 'utf8'));
+      } catch (_) {}
+    }
+    return null;
+  }
+
   async ensureMarketLadderDepth(marketKey) {
     const m = this.markets[marketKey];
-    const driveDepthPath = path.join(this.nodeDrivePaths['node1'], 'drive', `markets/${marketKey}/depth.json`);
     let needsSeeding = false;
-    if (!fs.existsSync(driveDepthPath)) {
+    const existing = this.getCanonicalMarketDepth(marketKey);
+    if (!existing) {
       needsSeeding = true;
     } else {
-      try {
-        const existing = JSON.parse(fs.readFileSync(driveDepthPath, 'utf8'));
-        const bidsCount = Array.isArray(existing.bids) ? existing.bids.length : 0;
-        const asksCount = Array.isArray(existing.asks) ? existing.asks.length : 0;
-        if (bidsCount < 2 || asksCount < 2) {
-          console.log(`⚠️ [LiquidityGuard] ${m.symbol} depth degraded (bids: ${bidsCount}, asks: ${asksCount}). Auto-replenishing full ladder...`);
-          needsSeeding = true;
-        }
-      } catch (_) {
+      const bidsCount = Array.isArray(existing.bids) ? existing.bids.length : 0;
+      const asksCount = Array.isArray(existing.asks) ? existing.asks.length : 0;
+      if (bidsCount < 2 || asksCount < 2) {
+        console.log(`⚠️ [LiquidityGuard] ${m.symbol} depth degraded (bids: ${bidsCount}, asks: ${asksCount}). Auto-replenishing full ladder...`);
         needsSeeding = true;
       }
     }
@@ -286,28 +298,23 @@ class ClobMarketMaker {
 
   async seedMarketLadder(marketKey, forceReseed = false) {
     const m = this.markets[marketKey];
-    const driveDepthPath = path.join(this.nodeDrivePaths['node1'], 'drive', `markets/${marketKey}/depth.json`);
 
     let needReseed = Boolean(forceReseed);
-    if (!needReseed && fs.existsSync(driveDepthPath)) {
-      try {
-        const existing = JSON.parse(fs.readFileSync(driveDepthPath, 'utf8'));
-        if (existing.bids && existing.bids.length >= 2 && existing.asks && existing.asks.length >= 2) {
-          const existingMid = Math.floor((existing.best_bid + existing.best_ask) / 2);
-          // Check if existing book price deviates wildly (>25%) from PancakeSwap oracle price
-          const priceDiffRatio = Math.abs(existingMid - m.currentMidPrice) / m.currentMidPrice;
-          if (priceDiffRatio < 0.25) {
-            console.log(`📊 [${m.symbol}] Reusing healthy depth ladder (${existing.bids.length} bids, ${existing.asks.length} asks, mid: ${existingMid}).`);
-            m.currentMidPrice = existingMid;
-            needReseed = false;
-          } else {
-            console.log(`⚠️ [${m.symbol}] Existing book price (${existingMid}) deviates ${(priceDiffRatio * 100).toFixed(1)}% from PancakeSwap (${m.currentMidPrice}). Purging stale book for fresh alignment...`);
-            needReseed = true;
-          }
+    if (!needReseed) {
+      const existing = this.getCanonicalMarketDepth(marketKey);
+      if (existing && existing.bids && existing.bids.length >= 2 && existing.asks && existing.asks.length >= 2) {
+        const existingMid = Math.floor((existing.best_bid + existing.best_ask) / 2);
+        // Check if existing book price deviates wildly (>25%) from PancakeSwap oracle price
+        const priceDiffRatio = Math.abs(existingMid - m.currentMidPrice) / m.currentMidPrice;
+        if (priceDiffRatio < 0.25) {
+          console.log(`📊 [${m.symbol}] Reusing healthy depth ladder (${existing.bids.length} bids, ${existing.asks.length} asks, mid: ${existingMid}).`);
+          m.currentMidPrice = existingMid;
+          needReseed = false;
         } else {
+          console.log(`⚠️ [${m.symbol}] Existing book price (${existingMid}) deviates ${(priceDiffRatio * 100).toFixed(1)}% from PancakeSwap (${m.currentMidPrice}). Purging stale book for fresh alignment...`);
           needReseed = true;
         }
-      } catch (_) {
+      } else {
         needReseed = true;
       }
     }

@@ -807,23 +807,23 @@ async function computeTradingAccountBalances(record, lockedOverrides = null, for
   const lockedUsdt = BigInt(lockedOverrides ? (lockedOverrides.lockedUsdt || 0n) : (dbBal ? dbBal.lockedUsdt : 0n));
   const lockedBnb = BigInt(lockedOverrides ? (lockedOverrides.lockedBnb || 0n) : (dbBal ? dbBal.lockedBnb : 0n));
 
-  const effectiveTotalXpx = onChainXpx + deltaXpx - inFlightWithdrawXpx;
-  const effectiveTotalUsdt = onChainUsdt + deltaUsdt - inFlightWithdrawUsdt;
-  const effectiveTotalBnb = onChainBnb + deltaBnb - inFlightWithdrawBnb;
+  const negDeltaXpx = deltaXpx < 0n ? deltaXpx : 0n;
+  const negDeltaUsdt = deltaUsdt < 0n ? deltaUsdt : 0n;
+  const negDeltaBnb = deltaBnb < 0n ? deltaBnb : 0n;
+
+  // Never allow unconfirmed positive settlement credits (pending_cosign/ready/broadcast) to back
+  // new trades or withdrawals before Sirius L1 confirms; negative liabilities ALWAYS deduct immediately.
+  const effectiveTotalXpx = onChainXpx + negDeltaXpx - inFlightWithdrawXpx;
+  const effectiveTotalUsdt = onChainUsdt + negDeltaUsdt - inFlightWithdrawUsdt;
+  const effectiveTotalBnb = onChainBnb + negDeltaBnb - inFlightWithdrawBnb;
 
   const tradeableXpx = effectiveTotalXpx > lockedXpx ? effectiveTotalXpx - lockedXpx : 0n;
   const tradeableUsdt = effectiveTotalUsdt > lockedUsdt ? effectiveTotalUsdt - lockedUsdt : 0n;
   const tradeableBnb = effectiveTotalBnb > lockedBnb ? effectiveTotalBnb - lockedBnb : 0n;
 
-  // For withdrawals, never allow withdrawing unconfirmed positive settlement credits before L1 settles,
-  // and always deduct negative liabilities immediately so counterparties can never be cheated!
-  const negDeltaXpx = deltaXpx < 0n ? deltaXpx : 0n;
-  const negDeltaUsdt = deltaUsdt < 0n ? deltaUsdt : 0n;
-  const negDeltaBnb = deltaBnb < 0n ? deltaBnb : 0n;
-
-  const withdrawableRawXpx = onChainXpx + negDeltaXpx - inFlightWithdrawXpx - lockedXpx;
-  const withdrawableRawUsdt = onChainUsdt + negDeltaUsdt - inFlightWithdrawUsdt - lockedUsdt;
-  const withdrawableRawBnb = onChainBnb + negDeltaBnb - inFlightWithdrawBnb - lockedBnb;
+  const withdrawableRawXpx = effectiveTotalXpx - lockedXpx;
+  const withdrawableRawUsdt = effectiveTotalUsdt - lockedUsdt;
+  const withdrawableRawBnb = effectiveTotalBnb - lockedBnb;
 
   return {
     onChain: {
@@ -1344,7 +1344,7 @@ async function submitSettlementCosignature({ settlementId, cosignature }) {
 
   try {
     await testnetClient.announceSignedTransaction(completedSigned);
-    await testnetClient.verifyTransactionAccepted(completedSigned.hash, 8000);
+    await testnetClient.verifyTransactionAccepted(completedSigned.hash, 2500, 400);
   } catch (l1Err) {
     const errMsg = l1Err && l1Err.message ? l1Err.message : String(l1Err || '');
     if (errMsg.includes('Sirius node rejected transaction')) {

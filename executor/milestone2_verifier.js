@@ -113,46 +113,258 @@ function safeAtomicRename(src, dest) {
   }
 }
 
+let overlayCommitSeq = 0;
+
 /**
- * Per-Execution Drive Sandbox Overlay Manager (`VirtualMachineStorageQueryHandler`)
- * Stages Drive files in an isolated sandbox directory during WASM execution,
- * and atomically commits overlay changes to the persistent Drive only if execution succeeds.
+ * Per-Execution In-Memory Copy-on-Write Drive Sandbox Overlay Manager (`VirtualMachineStorageQueryHandler`)
+ * Stages reads lazily from the committed drive (via defensive Buffer copies) and buffers all writes,
+ * renames, and deletes purely in RAM during WASM execution, then atomically commits only modified
+ * files via temp-file + rename(2) on BFT quorum consensus (or discards in 0ms on rollback).
  */
 class DriveSandboxOverlay {
   constructor(nodeName, driveRootDir) {
     this.nodeName = nodeName;
+    this.driveRootDir = driveRootDir;
     this.driveDir = path.join(driveRootDir, 'drive');
     this.sandboxDir = path.join(driveRootDir, 'sandbox');
+    fs.mkdirSync(this.driveDir, { recursive: true });
     this.nextFileId = 1;
-    this.openFiles = new Map(); // id -> { absPath, mode, fd, readOffset }
+    this.openFiles = new Map(); // id -> { relPath, mode, readBuf, readOffset, chunks, dirty }
     this.nextIterId = 1;
     this.dirIterators = new Map(); // id -> { entries: [{name, depth}], index }
-
-    // Reset sandbox overlay from committed drive state
-    safeRmSync(this.sandboxDir);
-    copyDirRecursive(this.driveDir, this.sandboxDir);
+    this.dirtyFiles = new Map(); // relPath -> Buffer
+    this.deletedFiles = new Set(); // relPath
+    this.deletedDirs = new Set(); // relPath
+    this.createdDirs = new Set(); // relPath
   }
 
-  resolveSandboxPath(relPath) {
-    const cleanRel = String(relPath || '').replace(/^[/\\]+/, '');
-    const resolved = path.resolve(this.sandboxDir, cleanRel);
-    const rootWithSep = this.sandboxDir.endsWith(path.sep)
-      ? this.sandboxDir
-      : this.sandboxDir + path.sep;
-    if (resolved !== this.sandboxDir && !resolved.startsWith(rootWithSep)) {
+  resolveRelPath(relPath) {
+    const cleanRel = String(relPath || '').replace(/\\/g, '/').replace(/^\/+/, '');
+    if (cleanRel.includes('\0')) {
+      throw new Error(`Sandbox null-byte path blocked: ${relPath}`);
+    }
+    const resolved = path.resolve(this.driveDir, cleanRel);
+    const rootWithSep = this.driveDir.endsWith(path.sep) ? this.driveDir : this.driveDir + path.sep;
+    if (resolved !== this.driveDir && !resolved.startsWith(rootWithSep)) {
       throw new Error(`Sandbox path traversal blocked: ${relPath}`);
     }
-    return resolved;
+    const rel = path.relative(this.driveDir, resolved).split(path.sep).join('/');
+    if (rel === '.' || rel === '') return '';
+    if (rel.split('/').some((seg) => seg === '..')) {
+      throw new Error(`Sandbox path traversal blocked: ${relPath}`);
+    }
+    return rel;
   }
 
-  collectDirEntries(dirAbs, recursive, currentDepth = 0, out = []) {
-    const entries = fs
-      .readdirSync(dirAbs, { withFileTypes: true })
-      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-    for (const entry of entries) {
-      out.push({ name: entry.name, depth: currentDepth });
-      if (recursive && entry.isDirectory()) {
-        this.collectDirEntries(path.join(dirAbs, entry.name), true, currentDepth + 1, out);
+  _diskStatSafe(relPath) {
+    if (!relPath) {
+      try {
+        const st = fs.lstatSync(this.driveDir);
+        return st.isSymbolicLink() ? null : st;
+      } catch (_) {
+        return null;
+      }
+    }
+    const abs = path.join(this.driveDir, relPath);
+    try {
+      const st = fs.lstatSync(abs);
+      if (st.isSymbolicLink()) return null;
+      return st;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _flushOpenWriterByPath(relPath) {
+    for (const entry of this.openFiles.values()) {
+      if (entry.mode === 'w' && entry.relPath === relPath && entry.dirty) {
+        const materialized = entry.chunks.length === 1 ? entry.chunks[0] : Buffer.concat(entry.chunks);
+        entry.chunks = [materialized];
+        entry.dirty = false;
+        this.dirtyFiles.set(relPath, materialized);
+      }
+    }
+  }
+
+  _flushAllOpenWriters() {
+    for (const entry of this.openFiles.values()) {
+      if (entry.mode === 'w' && entry.dirty) {
+        const materialized = entry.chunks.length === 1 ? entry.chunks[0] : Buffer.concat(entry.chunks);
+        entry.chunks = [materialized];
+        entry.dirty = false;
+        this.dirtyFiles.set(entry.relPath, materialized);
+      }
+    }
+  }
+
+  _ensureDirVirtual(dirRel) {
+    if (!dirRel) return;
+    const parts = dirRel.split('/').filter(Boolean);
+    let cur = '';
+    for (const p of parts) {
+      cur = cur ? `${cur}/${p}` : p;
+      this.deletedDirs.delete(cur);
+      this.deletedFiles.delete(cur);
+      this.createdDirs.add(cur);
+    }
+  }
+
+  _isVirtualFile(relPath) {
+    if (!relPath) return false;
+    this._flushOpenWriterByPath(relPath);
+    if (this.dirtyFiles.has(relPath)) return true;
+    if (this.deletedFiles.has(relPath) || this.createdDirs.has(relPath)) return false;
+    const st = this._diskStatSafe(relPath);
+    return Boolean(st && st.isFile());
+  }
+
+  _isVirtualDir(relPath) {
+    if (!relPath) return true;
+    if (this.dirtyFiles.has(relPath)) return false;
+    if (this.createdDirs.has(relPath)) return true;
+    // Implicitly created by any child dirty file or child created dir
+    const prefix = `${relPath}/`;
+    for (const k of this.dirtyFiles.keys()) {
+      if (k.startsWith(prefix)) return true;
+    }
+    for (const d of this.createdDirs) {
+      if (d.startsWith(prefix)) return true;
+    }
+    if (this.deletedDirs.has(relPath)) return false;
+    const st = this._diskStatSafe(relPath);
+    return Boolean(st && st.isDirectory());
+  }
+
+  _virtualExists(relPath) {
+    if (!relPath) return true;
+    return this._isVirtualFile(relPath) || this._isVirtualDir(relPath);
+  }
+
+  _readVirtualFileBuffer(relPath) {
+    this._flushOpenWriterByPath(relPath);
+    if (this.dirtyFiles.has(relPath)) {
+      return Buffer.from(this.dirtyFiles.get(relPath));
+    }
+    if (this.deletedFiles.has(relPath)) {
+      throw new Error(`ENOENT: ${relPath}`);
+    }
+    const st = this._diskStatSafe(relPath);
+    if (!st || !st.isFile()) {
+      throw new Error(`ENOENT: ${relPath}`);
+    }
+    return fs.readFileSync(path.join(this.driveDir, relPath));
+  }
+
+  _removeVirtualEntry(relPath) {
+    if (!relPath) return false;
+    this._flushAllOpenWriters();
+    const prefix = `${relPath}/`;
+
+    // Close any open handles under this path cleanly
+    for (const [id, entry] of this.openFiles.entries()) {
+      if (entry.relPath === relPath || entry.relPath.startsWith(prefix)) {
+        this.openFiles.delete(id);
+      }
+    }
+
+    // Collect any existing disk subtree so recreated dirs never resurrect old deleted files
+    const st = this._diskStatSafe(relPath);
+    if (st) {
+      if (st.isFile()) {
+        this.deletedFiles.add(relPath);
+      } else if (st.isDirectory()) {
+        const markDiskTree = (curRel) => {
+          this.deletedDirs.add(curRel);
+          const abs = path.join(this.driveDir, curRel);
+          let entries = [];
+          try { entries = fs.readdirSync(abs, { withFileTypes: true }); } catch (_) {}
+          for (const e of entries) {
+            if (e.isSymbolicLink()) continue;
+            const childRel = `${curRel}/${e.name}`;
+            if (e.isDirectory()) markDiskTree(childRel);
+            else if (e.isFile()) this.deletedFiles.add(childRel);
+          }
+        };
+        markDiskTree(relPath);
+      }
+    }
+
+    for (const k of Array.from(this.dirtyFiles.keys())) {
+      if (k === relPath || k.startsWith(prefix)) {
+        this.dirtyFiles.delete(k);
+        this.deletedFiles.add(k);
+      }
+    }
+    for (const d of Array.from(this.createdDirs)) {
+      if (d === relPath || d.startsWith(prefix)) {
+        this.createdDirs.delete(d);
+        this.deletedDirs.add(d);
+      }
+    }
+    return true;
+  }
+
+  _listDirectChildren(dirRel) {
+    this._flushAllOpenWriters();
+    const childMap = new Map(); // name -> isDir
+    if (!this.deletedDirs.has(dirRel)) {
+      const absDir = dirRel ? path.join(this.driveDir, dirRel) : this.driveDir;
+      try {
+        const st = fs.lstatSync(absDir);
+        if (!st.isSymbolicLink() && st.isDirectory()) {
+          for (const entry of fs.readdirSync(absDir, { withFileTypes: true })) {
+            if (entry.isSymbolicLink()) continue;
+            const childRel = dirRel ? `${dirRel}/${entry.name}` : entry.name;
+            if (entry.isDirectory()) {
+              if (!this.deletedDirs.has(childRel) && !this.dirtyFiles.has(childRel)) {
+                childMap.set(entry.name, true);
+              }
+            } else if (entry.isFile()) {
+              if (!this.deletedFiles.has(childRel)) {
+                childMap.set(entry.name, false);
+              }
+            }
+          }
+        }
+      } catch (_) {}
+    }
+
+    const prefix = dirRel ? `${dirRel}/` : '';
+    for (const d of this.createdDirs) {
+      if (prefix ? d.startsWith(prefix) : d.length > 0) {
+        const rest = prefix ? d.slice(prefix.length) : d;
+        const slashIdx = rest.indexOf('/');
+        const name = slashIdx === -1 ? rest : rest.slice(0, slashIdx);
+        if (name && !this.dirtyFiles.has(dirRel ? `${dirRel}/${name}` : name)) {
+          childMap.set(name, true);
+        }
+      }
+    }
+    for (const f of this.dirtyFiles.keys()) {
+      if (prefix ? f.startsWith(prefix) : f.length > 0) {
+        const rest = prefix ? f.slice(prefix.length) : f;
+        const slashIdx = rest.indexOf('/');
+        if (slashIdx === -1) {
+          childMap.set(rest, false);
+        } else {
+          const name = rest.slice(0, slashIdx);
+          if (name && !childMap.has(name)) childMap.set(name, true);
+        }
+      }
+    }
+
+    return Array.from(childMap.entries())
+      .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+      .map(([name, isDir]) => ({ name, isDir }));
+  }
+
+  collectDirEntries(dirRel, recursive, currentDepth = 0, out = []) {
+    const children = this._listDirectChildren(dirRel);
+    for (const child of children) {
+      out.push({ name: child.name, depth: currentDepth });
+      if (recursive && child.isDir) {
+        const childRel = dirRel ? `${dirRel}/${child.name}` : child.name;
+        this.collectDirEntries(childRel, true, currentDepth + 1, out);
       }
     }
     return out;
@@ -160,22 +372,41 @@ class DriveSandboxOverlay {
 
   handleMessage(responseMsg) {
     if (responseMsg.open_file) {
-      const { path: relPath, mode } = responseMsg.open_file;
+      const { path: relPathRaw, mode } = responseMsg.open_file;
       try {
-        const absPath = this.resolveSandboxPath(relPath);
+        const relPath = this.resolveRelPath(relPathRaw);
+        if (!relPath || relPath.endsWith('.wasm') && mode === 'w') {
+          return { open_file_return: { success: false, identifier: '0' } };
+        }
         if (mode === 'w') {
-          fs.mkdirSync(path.dirname(absPath), { recursive: true });
-          const fd = fs.openSync(absPath, 'w');
+          const parentRel = relPath.includes('/') ? relPath.slice(0, relPath.lastIndexOf('/')) : '';
+          if (parentRel) this._ensureDirVirtual(parentRel);
+          this.deletedFiles.delete(relPath);
+          this.dirtyFiles.set(relPath, Buffer.alloc(0));
           const id = String(this.nextFileId++);
-          this.openFiles.set(id, { absPath, mode, fd, readOffset: 0 });
+          this.openFiles.set(id, {
+            relPath,
+            mode: 'w',
+            readBuf: null,
+            readOffset: 0,
+            chunks: [],
+            dirty: false,
+          });
           return { open_file_return: { success: true, identifier: id } };
         } else {
-          if (!fs.existsSync(absPath)) {
+          if (!this._isVirtualFile(relPath)) {
             return { open_file_return: { success: false, identifier: '0' } };
           }
-          const fd = fs.openSync(absPath, 'r');
+          const readBuf = this._readVirtualFileBuffer(relPath);
           const id = String(this.nextFileId++);
-          this.openFiles.set(id, { absPath, mode: 'r', fd, readOffset: 0 });
+          this.openFiles.set(id, {
+            relPath,
+            mode: 'r',
+            readBuf,
+            readOffset: 0,
+            chunks: null,
+            dirty: false,
+          });
           return { open_file_return: { success: true, identifier: id } };
         }
       } catch (e) {
@@ -190,9 +421,10 @@ class DriveSandboxOverlay {
         return { write_file_stream_return: { success: false, num_bytes_written: '0' } };
       }
       try {
-        const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || '');
-        const written = fs.writeSync(entry.fd, buf);
-        return { write_file_stream_return: { success: true, num_bytes_written: String(written) } };
+        const buf = Buffer.isBuffer(buffer) ? Buffer.from(buffer) : Buffer.from(buffer || '');
+        entry.chunks.push(buf);
+        entry.dirty = true;
+        return { write_file_stream_return: { success: true, num_bytes_written: String(buf.length) } };
       } catch (e) {
         return { write_file_stream_return: { success: false, num_bytes_written: '0' } };
       }
@@ -205,7 +437,9 @@ class DriveSandboxOverlay {
         return { flush_return: { success: false } };
       }
       try {
-        fs.fsyncSync(entry.fd);
+        if (entry.mode === 'w') {
+          this._flushOpenWriterByPath(entry.relPath);
+        }
         return { flush_return: { success: true } };
       } catch (e) {
         return { flush_return: { success: false } };
@@ -215,17 +449,17 @@ class DriveSandboxOverlay {
     if (responseMsg.read_file_stream) {
       const { identifier } = responseMsg.read_file_stream;
       const entry = this.openFiles.get(String(identifier));
-      if (!entry || entry.mode !== 'r') {
+      if (!entry || entry.mode !== 'r' || !entry.readBuf) {
         return { read_file_stream_return: { success: false, buffer: Buffer.alloc(0) } };
       }
       try {
-        const buf = Buffer.alloc(16384);
-        const bytesRead = fs.readSync(entry.fd, buf, 0, buf.length, entry.readOffset);
-        entry.readOffset += bytesRead;
+        const end = Math.min(entry.readBuf.length, entry.readOffset + 16384);
+        const slice = entry.readBuf.subarray(entry.readOffset, end);
+        entry.readOffset = end;
         return {
           read_file_stream_return: {
             success: true,
-            buffer: buf.subarray(0, bytesRead),
+            buffer: slice,
           },
         };
       } catch (e) {
@@ -240,7 +474,9 @@ class DriveSandboxOverlay {
         return { close_file_return: { success: false } };
       }
       try {
-        fs.closeSync(entry.fd);
+        if (entry.mode === 'w') {
+          this._flushOpenWriterByPath(entry.relPath);
+        }
         return { close_file_return: { success: true } };
       } catch (e) {
         return { close_file_return: { success: false } };
@@ -251,8 +487,8 @@ class DriveSandboxOverlay {
 
     if (responseMsg.path_exist) {
       try {
-        const absPath = this.resolveSandboxPath(responseMsg.path_exist.path);
-        return { path_exist_return: { exist: fs.existsSync(absPath) } };
+        const relPath = this.resolveRelPath(responseMsg.path_exist.path);
+        return { path_exist_return: { exist: this._virtualExists(relPath) } };
       } catch (e) {
         return { path_exist_return: { exist: false } };
       }
@@ -260,9 +496,11 @@ class DriveSandboxOverlay {
 
     if (responseMsg.is_file) {
       try {
-        const absPath = this.resolveSandboxPath(responseMsg.is_file.path);
-        const stat = fs.statSync(absPath);
-        return { is_file_return: { success: true, is_file: stat.isFile() } };
+        const relPath = this.resolveRelPath(responseMsg.is_file.path);
+        if (!this._virtualExists(relPath)) {
+          return { is_file_return: { success: false, is_file: false } };
+        }
+        return { is_file_return: { success: true, is_file: this._isVirtualFile(relPath) } };
       } catch (e) {
         return { is_file_return: { success: false, is_file: false } };
       }
@@ -270,9 +508,19 @@ class DriveSandboxOverlay {
 
     if (responseMsg.file_size) {
       try {
-        const absPath = this.resolveSandboxPath(responseMsg.file_size.path);
-        const stat = fs.statSync(absPath);
-        return { file_size_return: { success: true, file_size: String(stat.size) } };
+        const relPath = this.resolveRelPath(responseMsg.file_size.path);
+        if (!this._virtualExists(relPath)) {
+          return { file_size_return: { success: false, file_size: '0' } };
+        }
+        if (this._isVirtualFile(relPath)) {
+          this._flushOpenWriterByPath(relPath);
+          if (this.dirtyFiles.has(relPath)) {
+            return { file_size_return: { success: true, file_size: String(this.dirtyFiles.get(relPath).length) } };
+          }
+          const st = this._diskStatSafe(relPath);
+          return { file_size_return: { success: Boolean(st), file_size: String(st ? st.size : 0) } };
+        }
+        return { file_size_return: { success: true, file_size: '0' } };
       } catch (e) {
         return { file_size_return: { success: false, file_size: '0' } };
       }
@@ -280,8 +528,8 @@ class DriveSandboxOverlay {
 
     if (responseMsg.create_dir) {
       try {
-        const absPath = this.resolveSandboxPath(responseMsg.create_dir.path);
-        fs.mkdirSync(absPath, { recursive: true });
+        const relPath = this.resolveRelPath(responseMsg.create_dir.path);
+        this._ensureDirVirtual(relPath);
         return { create_dir_return: { success: true } };
       } catch (e) {
         return { create_dir_return: { success: false } };
@@ -291,10 +539,37 @@ class DriveSandboxOverlay {
     if (responseMsg.move_filesystem_entry) {
       const { old_path, new_path } = responseMsg.move_filesystem_entry;
       try {
-        const oldAbs = this.resolveSandboxPath(old_path);
-        const newAbs = this.resolveSandboxPath(new_path);
-        fs.mkdirSync(path.dirname(newAbs), { recursive: true });
-        safeAtomicRename(oldAbs, newAbs);
+        const oldRel = this.resolveRelPath(old_path);
+        const newRel = this.resolveRelPath(new_path);
+        if (!oldRel || !newRel || !this._virtualExists(oldRel) || oldRel === newRel) {
+          return { move_filesystem_entry_return: { success: false } };
+        }
+        this._flushAllOpenWriters();
+        if (this._isVirtualFile(oldRel)) {
+          const data = this._readVirtualFileBuffer(oldRel);
+          const newParent = newRel.includes('/') ? newRel.slice(0, newRel.lastIndexOf('/')) : '';
+          if (newParent) this._ensureDirVirtual(newParent);
+          this.deletedFiles.delete(newRel);
+          this.dirtyFiles.set(newRel, data);
+          this._removeVirtualEntry(oldRel);
+          return { move_filesystem_entry_return: { success: true } };
+        }
+        // Directory move: copy virtual tree over recursively, then remove old subtree
+        const copyTree = (srcDir, dstDir) => {
+          this._ensureDirVirtual(dstDir);
+          for (const child of this._listDirectChildren(srcDir)) {
+            const sRel = `${srcDir}/${child.name}`;
+            const dRel = `${dstDir}/${child.name}`;
+            if (child.isDir) {
+              copyTree(sRel, dRel);
+            } else {
+              this.deletedFiles.delete(dRel);
+              this.dirtyFiles.set(dRel, this._readVirtualFileBuffer(sRel));
+            }
+          }
+        };
+        copyTree(oldRel, newRel);
+        this._removeVirtualEntry(oldRel);
         return { move_filesystem_entry_return: { success: true } };
       } catch (e) {
         return { move_filesystem_entry_return: { success: false } };
@@ -303,11 +578,11 @@ class DriveSandboxOverlay {
 
     if (responseMsg.remove_filesystem_entry) {
       try {
-        const absPath = this.resolveSandboxPath(responseMsg.remove_filesystem_entry.path);
-        if (absPath === this.sandboxDir) {
+        const relPath = this.resolveRelPath(responseMsg.remove_filesystem_entry.path);
+        if (!relPath || !this._virtualExists(relPath)) {
           return { remove_filesystem_entry_return: { success: false } };
         }
-        safeRmSync(absPath);
+        this._removeVirtualEntry(relPath);
         return { remove_filesystem_entry_return: { success: true } };
       } catch (e) {
         return { remove_filesystem_entry_return: { success: false } };
@@ -315,10 +590,13 @@ class DriveSandboxOverlay {
     }
 
     if (responseMsg.create_dir_iterator) {
-      const { path: relPath, recursive } = responseMsg.create_dir_iterator;
+      const { path: relPathRaw, recursive } = responseMsg.create_dir_iterator;
       try {
-        const absPath = this.resolveSandboxPath(relPath);
-        const entries = this.collectDirEntries(absPath, Boolean(recursive));
+        const relPath = this.resolveRelPath(relPathRaw);
+        if (!this._isVirtualDir(relPath)) {
+          return { create_dir_iterator_return: { success: false, identifier: '0' } };
+        }
+        const entries = this.collectDirEntries(relPath, Boolean(recursive));
         const id = String(this.nextIterId++);
         this.dirIterators.set(id, { entries, index: 0 });
         return { create_dir_iterator_return: { success: true, identifier: id } };
@@ -353,61 +631,93 @@ class DriveSandboxOverlay {
   }
 
   closeAllHandles() {
-    for (const entry of this.openFiles.values()) {
-      try {
-        fs.closeSync(entry.fd);
-      } catch (_) {}
-    }
+    this._flushAllOpenWriters();
     this.openFiles.clear();
     this.dirIterators.clear();
   }
 
   commitOverlay() {
     this.closeAllHandles();
-    // Mirror synchronization: remove deleted files from driveDir before copy
-    const mirrorSync = (srcDir, dstDir) => {
-      if (!fs.existsSync(dstDir)) fs.mkdirSync(dstDir, { recursive: true });
-      for (const entry of fs.readdirSync(dstDir, { withFileTypes: true })) {
-        if (entry.isSymbolicLink() || entry.name.endsWith('.wasm')) continue;
-        const dstPath = path.join(dstDir, entry.name);
-        const srcPath = path.join(srcDir, entry.name);
-        if (!fs.existsSync(srcPath)) {
-          safeRmSync(dstPath);
-        }
-      }
-      copyDirRecursive(srcDir, dstDir);
-    };
-    mirrorSync(this.sandboxDir, this.driveDir);
-    safeRmSync(this.sandboxDir);
+
+    // 1. Apply explicit file deletions (only when not overwritten in the same execution)
+    for (const rel of this.deletedFiles) {
+      if (this.dirtyFiles.has(rel) || rel.endsWith('.wasm')) continue;
+      const abs = path.join(this.driveDir, rel);
+      try {
+        if (fs.existsSync(abs)) fs.unlinkSync(abs);
+      } catch (_) {}
+    }
+
+    // 2. Remove deleted directories deepest-first unless recreated
+    const sortedDelDirs = Array.from(this.deletedDirs).sort((a, b) => b.length - a.length);
+    for (const rel of sortedDelDirs) {
+      if (this.createdDirs.has(rel)) continue;
+      const abs = path.join(this.driveDir, rel);
+      safeRmSync(abs);
+    }
+
+    // 3. Ensure created directories exist (unlink colliding file if any)
+    for (const rel of this.createdDirs) {
+      const absDir = path.join(this.driveDir, rel);
+      try {
+        const st = fs.lstatSync(absDir);
+        if (st.isFile() || st.isSymbolicLink()) fs.unlinkSync(absDir);
+      } catch (_) {}
+      fs.mkdirSync(absDir, { recursive: true });
+    }
+
+    // 4. Atomically write only dirty files via temp-file + same-filesystem rename(2)
+    for (const [rel, buf] of this.dirtyFiles.entries()) {
+      if (rel.endsWith('.wasm')) continue;
+      const abs = path.join(this.driveDir, rel);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      const tmp = `${abs}.tmp.${process.pid}.${++overlayCommitSeq}`;
+      fs.writeFileSync(tmp, buf);
+      safeAtomicRename(tmp, abs);
+    }
+
+    this.dirtyFiles.clear();
+    this.deletedFiles.clear();
+    this.deletedDirs.clear();
+    this.createdDirs.clear();
   }
 
   rollbackOverlay() {
-    this.closeAllHandles();
-    safeRmSync(this.sandboxDir);
+    this.openFiles.clear();
+    this.dirIterators.clear();
+    this.dirtyFiles.clear();
+    this.deletedFiles.clear();
+    this.deletedDirs.clear();
+    this.createdDirs.clear();
   }
 
   computeStateRootHash() {
     this.closeAllHandles();
-    const marketsDir = path.join(this.sandboxDir, 'markets');
-    const rootToHash = fs.existsSync(marketsDir) ? marketsDir : this.sandboxDir;
-    if (!fs.existsSync(rootToHash)) return null;
+    const hasMarkets = this._isVirtualDir('markets');
+    const rootRel = hasMarkets ? 'markets' : '';
     const hash = crypto.createHash('sha256');
-    const walk = (dir) => {
-      const entries = fs
-        .readdirSync(dir, { withFileTypes: true })
-        .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-      for (const e of entries) {
-        if (e.isSymbolicLink() || e.name.endsWith('.wasm')) continue;
-        const p = path.join(dir, e.name);
-        if (e.isDirectory()) {
-          walk(p);
-        } else if (e.isFile()) {
-          hash.update(path.relative(rootToHash, p));
-          hash.update(fs.readFileSync(p));
+    let hashedAny = false;
+
+    const walk = (dirRel) => {
+      const children = this._listDirectChildren(dirRel);
+      for (const child of children) {
+        if (child.name.endsWith('.wasm')) continue;
+        const childRel = dirRel ? `${dirRel}/${child.name}` : child.name;
+        if (child.isDir) {
+          walk(childRel);
+        } else {
+          hashedAny = true;
+          const relFromRoot = rootRel ? childRel.slice(rootRel.length + 1) : childRel;
+          hash.update(relFromRoot.split('/').join(path.sep));
+          hash.update(this._readVirtualFileBuffer(childRel));
         }
       }
     };
-    walk(rootToHash);
+
+    walk(rootRel);
+    if (!hashedAny && !hasMarkets && this._listDirectChildren('').length === 0) {
+      return null;
+    }
     return hash.digest('hex');
   }
 }
@@ -460,6 +770,29 @@ function executeOnNodeVm(
   );
 }
 
+const vmClientCache = new Map();
+
+function getOrCreateVmClient(targetEndpoint) {
+  let client = vmClientCache.get(targetEndpoint);
+  if (!client) {
+    client = new supercontractserver.SupercontractServer(
+      targetEndpoint,
+      grpc.credentials.createInsecure()
+    );
+    vmClientCache.set(targetEndpoint, client);
+  }
+  return client;
+}
+
+function resetVmClient(targetEndpoint, client) {
+  if (vmClientCache.get(targetEndpoint) === client) {
+    vmClientCache.delete(targetEndpoint);
+  }
+  try {
+    client.close();
+  } catch (_) {}
+}
+
 function _executeOnNodeVmUnlocked(
   node,
   wasmFilePath,
@@ -488,10 +821,7 @@ function _executeOnNodeVmUnlocked(
   return new Promise((resolve, reject) => {
     let isCompleted = false;
     const targetEndpoint = `${node.vmHost || '127.0.0.1'}:${node.vmPort}`;
-    const client = new supercontractserver.SupercontractServer(
-      targetEndpoint,
-      grpc.credentials.createInsecure()
-    );
+    const client = getOrCreateVmClient(targetEndpoint);
 
     const overlay = new DriveSandboxOverlay(node.name, driveRootDir);
     const callMetadata = new grpc.Metadata();
@@ -508,7 +838,7 @@ function _executeOnNodeVmUnlocked(
         isCompleted = true;
         try { stream.cancel(); } catch (_) {}
         overlay.rollbackOverlay();
-        client.close();
+        resetVmClient(targetEndpoint, client);
         reject(new Error(`[${node.name} VM] ExecuteCall timed out after ${timeoutMs}ms`));
       }
     }, timeoutMs);
@@ -541,7 +871,7 @@ function _executeOnNodeVmUnlocked(
         if (!deferCommit) {
           commit();
         }
-        client.close();
+        try { stream.end(); } catch (_) {}
 
         const finishResolve = () =>
           resolve({
@@ -627,7 +957,7 @@ function _executeOnNodeVmUnlocked(
       isCompleted = true;
       cleanup();
       overlay.rollbackOverlay();
-      client.close();
+      resetVmClient(targetEndpoint, client);
       reject(err);
     });
 
@@ -636,7 +966,7 @@ function _executeOnNodeVmUnlocked(
       isCompleted = true;
       cleanup();
       overlay.rollbackOverlay();
-      client.close();
+      resetVmClient(targetEndpoint, client);
       reject(new Error(`[${node.name} VM] Stream ended abruptly without execution returns`));
     });
 
@@ -1077,6 +1407,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  DriveSandboxOverlay,
   runMilestone2Verification,
   executeOnNodeVm,
   assert3NodeConsensus,

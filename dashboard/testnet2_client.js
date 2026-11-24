@@ -264,8 +264,9 @@ async function announceSignedTransaction(signedTx) {
 /**
  * Verify a transaction was accepted on-chain (not rejected in group === 'failed')
  */
-async function verifyTransactionAccepted(txHash, maxWaitMs = 6000) {
+async function verifyTransactionAccepted(txHash, maxWaitMs = 6000, pollIntervalMs = 600) {
   const start = Date.now();
+  const sleepMs = Math.max(200, Number(pollIntervalMs) || 600);
   while (Date.now() - start < maxWaitMs) {
     try {
       const status = await withNodeFailover(async (_, nodeUrl) => {
@@ -292,7 +293,7 @@ async function verifyTransactionAccepted(txHash, maxWaitMs = 6000) {
         throw err;
       }
     }
-    await new Promise((r) => setTimeout(r, 600));
+    await new Promise((r) => setTimeout(r, sleepMs));
   }
   return { hash: txHash, group: 'announced' };
 }

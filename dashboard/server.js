@@ -1394,23 +1394,29 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // SiriusCLOB DEX Endpoint: Live Depth Snapshot
+  // SiriusCLOB DEX Endpoint: Live Depth Snapshot (decoded directly from canonical market_state.bin without consensus lock)
   if (pathname === '/api/clob/depth' && req.method === 'GET') {
     const market = sanitizeMarket(parsedUrl.searchParams.get('pair') || parsedUrl.searchParams.get('market') || parsedUrl.searchParams.get('symbol'));
-    const DRIVE_KEY_HEX = 'bd1d100a98c34f62e170a8395b4498dc1e730286f5a12c489b37d01562f0cb23';
-    const depthPath = path.join(CLUSTER_DIR, 'node1', 'data', 'drives', DRIVE_KEY_HEX, 'drive', 'markets', market, 'depth.json');
-    if (fs.existsSync(depthPath)) {
-      try {
-        const data = fs.readFileSync(depthPath, 'utf8');
-        const parsed = JSON.parse(data);
-        if (parsed && Array.isArray(parsed.bids) && Array.isArray(parsed.asks) && (parsed.bids.length > 0 || parsed.asks.length > 0)) {
-          lastValidDepth[market] = data;
+    try {
+      const parsed = clobApi.getMarketDepthSnapshot(market);
+      if (parsed && Array.isArray(parsed.bids) && Array.isArray(parsed.asks)) {
+        const serialized = JSON.stringify(parsed);
+        if (parsed.bids.length > 0 || parsed.asks.length > 0) {
+          lastValidDepth[market] = serialized;
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(data);
+          res.end(serialized);
           return;
         }
-      } catch (_) {}
-    }
+        if (lastValidDepth[market]) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(lastValidDepth[market]);
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(serialized);
+        return;
+      }
+    } catch (_) {}
     // Fallback to in-memory cached depth so order book is NEVER empty
     if (lastValidDepth[market]) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
