@@ -7,7 +7,6 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { execFileSync } = require('child_process');
 
 if (!crypto.webcrypto) {
   crypto.webcrypto = {
@@ -36,7 +35,6 @@ const {
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const CLUSTER_DIR = path.join(ROOT_DIR, 'cluster');
-const BIN_DIR = path.join(ROOT_DIR, 'bin');
 const ACCOUNTS_FILE = path.join(CLUSTER_DIR, 'nemesis_accounts.json');
 const BALANCES_FILE = path.join(CLUSTER_DIR, 'clob_balances.json');
 const NONCES_FILE = path.join(CLUSTER_DIR, 'used_nonces.json');
@@ -168,7 +166,6 @@ function isBnbMosaic(val) {
 
 const ACTIVE_ORDERS_FILE = path.join(CLUSTER_DIR, 'active_orders.json');
 const activeOrders = new Map();
-let globalNextOrderId = 1000;
 
 // Per-account async mutex to eliminate TOCTOU races across concurrent order/withdrawal requests
 const accountLocks = new Map();
@@ -443,7 +440,6 @@ loadUsedNonces();
 // Persistent on-chain deposit registry enforcing unique constraint on credit path
 const PROCESSED_DEPOSITS_FILE = path.join(CLUSTER_DIR, 'processed_deposits.json');
 const processedDeposits = new Map();
-const syncedOnChainAssets = new Map();
 
 function loadProcessedDeposits() {
   processedDeposits.clear();
@@ -2992,20 +2988,6 @@ function encodeWithdraw(mosaicId, amount) {
   buf.writeBigUInt64LE(BigInt(mosaicId || XPX_MOSAIC_ID), 1);
   buf.writeBigUInt64LE(BigInt(amount), 9);
   return buf;
-}
-
-async function syncDriveDepth() {
-  try {
-    const h = getLatestCommittedHeight();
-    const depthParams = encodeGetDepth(50);
-    await executeConsensusCall(
-      'Sync Drive Depth',
-      h + 1,
-      crypto.randomBytes(32).toString('hex'),
-      99999,
-      { parameters: depthParams }
-    );
-  } catch (_) {}
 }
 
 const marketDepthCache = new Map();

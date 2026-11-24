@@ -471,30 +471,6 @@ function escapeHtml(str) {
     .replace(/'/g, '&#039;');
 }
 
-function ansiToHtml(str) {
-  // Convert basic ANSI colors to HTML spans
-  const colors = {
-    '31': '#ef4444', // red
-    '32': '#22c55e', // green
-    '33': '#eab308', // yellow
-    '34': '#3b82f6', // blue
-    '35': '#a855f7', // purple
-    '36': '#06b6d4', // cyan
-    '37': '#f3f4f6', // white
-    '90': '#9ca3af', // gray
-  };
-
-  let html = escapeHtml(str);
-  html = html.replace(/\x1b\[0?m/g, '</span>');
-  for (const [code, hex] of Object.entries(colors)) {
-    const regex = new RegExp(`\\x1b\\[(?:0;)?${code}m`, 'g');
-    html = html.replace(regex, `<span style="color: ${hex}">`);
-  }
-  // Strip remaining escape codes
-  html = html.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
-  return html;
-}
-
 function getClientIp(req) {
   // If cf-connecting-ip is provided, validate it is a legitimate IP address
   const cfIp = req.headers['cf-connecting-ip'];

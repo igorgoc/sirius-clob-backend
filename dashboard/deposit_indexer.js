@@ -9,8 +9,6 @@ const fs = require('fs');
 const path = require('path');
 module.paths.push(path.resolve(__dirname, '../../web-wallet-vuejs/node_modules'));
 const {
-  ChainHttp,
-  AccountHttp,
   Address,
   TransactionQueryParams,
 } = require('tsjs-xpx-chain-sdk');
@@ -247,24 +245,6 @@ async function scanDeposits(onDepositCallback) {
   } finally {
     isScanning = false;
   }
-}
-
-function reconcileProcessedDeposits(onDepositCallback) {
-  if (!fs.existsSync(config.PROCESSED_DEPOSITS_FILE)) return;
-  try {
-    const list = JSON.parse(fs.readFileSync(config.PROCESSED_DEPOSITS_FILE, 'utf8'));
-    if (Array.isArray(list)) {
-      for (const item of list) {
-        if (typeof item === 'object' && item.senderPublicKey && item.amountAtomic) {
-          try {
-            if (typeof onDepositCallback === 'function') {
-              onDepositCallback(item);
-            }
-          } catch (_) {}
-        }
-      }
-    }
-  } catch (_) {}
 }
 
 /**

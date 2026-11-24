@@ -29,7 +29,6 @@ const {
   TransactionHttp,
   TransferTransaction,
   Deadline,
-  NetworkType,
   PlainMessage,
   Mosaic,
   MosaicId,
