@@ -374,14 +374,32 @@ async function autoCreditTx(tx, blockNumber) {
       }
     } else if (tx.to && tx.to.toLowerCase() === BSC_TESTNET_USDT_CONTRACT.toLowerCase()) {
       tokenName = 'USDT';
-      if (tx.input && tx.input.toLowerCase().startsWith('0xa9059cbb')) {
-        const recipientParam = '0x' + tx.input.slice(34, 74).toLowerCase();
-        if (recipientParam === BRIDGE_SINK_ADDRESS.toLowerCase()) {
-          try {
-            const valHex = '0x' + tx.input.slice(74, 138);
-            transferAmount = Number(BigInt(valHex)) / 1e18;
-          } catch (_) {}
+      // Verify actual ERC-20 Transfer(from, to, value) receipt log to BRIDGE_SINK_ADDRESS
+      // rather than trusting raw tx.input alone (protects against fee-on-transfer or spoofed calls).
+      const transferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+      const sinkLower = BRIDGE_SINK_ADDRESS.toLowerCase();
+      const usdtLower = BSC_TESTNET_USDT_CONTRACT.toLowerCase();
+      let totalLogAtomic = 0n;
+      if (Array.isArray(receipt.logs)) {
+        for (const log of receipt.logs) {
+          if (
+            log &&
+            (log.address || '').toLowerCase() === usdtLower &&
+            Array.isArray(log.topics) &&
+            log.topics.length >= 3 &&
+            (log.topics[0] || '').toLowerCase() === transferTopic
+          ) {
+            const logRecipient = '0x' + String(log.topics[2]).slice(-40).toLowerCase();
+            if (logRecipient === sinkLower) {
+              try {
+                totalLogAtomic += BigInt(log.data || '0x0');
+              } catch (_) {}
+            }
+          }
         }
+      }
+      if (totalLogAtomic > 0n) {
+        transferAmount = Number(totalLogAtomic) / 1e18;
       }
     }
 
@@ -463,7 +481,7 @@ async function startAutoRelayer() {
   try {
     const currentHex = await queryBscRpc('eth_blockNumber', []);
     if (currentHex) {
-      lastScannedBlock = parseInt(currentHex, 16) - 5;
+      lastScannedBlock = Math.max(0, parseInt(currentHex, 16) - 5);
       console.log(`[Bridge Relayer] Starting block indexer from block #${lastScannedBlock}`);
     }
   } catch (err) {
@@ -471,17 +489,21 @@ async function startAutoRelayer() {
   }
 
   watcherInterval = setInterval(async () => {
-    if (isScanning || !lastScannedBlock) return;
+    if (isScanning) return;
     isScanning = true;
     try {
       const currentHex = await queryBscRpc('eth_blockNumber', []);
       if (!currentHex) {
-        isScanning = false;
         return;
       }
       const currentBlock = parseInt(currentHex, 16);
+      if (!Number.isFinite(currentBlock)) return;
+      if (lastScannedBlock === null) {
+        lastScannedBlock = Math.max(0, currentBlock - 5);
+        console.log(`[Bridge Relayer] Lazy-initialized block indexer at block #${lastScannedBlock}`);
+        return;
+      }
       if (currentBlock <= lastScannedBlock) {
-        isScanning = false;
         return;
       }
 

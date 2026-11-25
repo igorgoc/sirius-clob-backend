@@ -851,107 +851,118 @@ function _executeOnNodeVmUnlocked(
     }
 
     stream.on('data', (responseMsg) => {
-      // 1. Final execution return from WASM VM
-      if (responseMsg.returns) {
-        if (isCompleted) return;
-        isCompleted = true;
-        cleanup();
-        const ret = responseMsg.returns;
-        const stateRootHash = ret.success ? overlay.computeStateRootHash() : null;
-        let finalized = false;
-        const commit = () => {
-          if (finalized) return;
-          finalized = true;
-          if (ret.success) overlay.commitOverlay();
-          else overlay.rollbackOverlay();
-        };
-        const rollback = () => {
-          if (finalized) return;
-          finalized = true;
-          overlay.rollbackOverlay();
-        };
+      try {
+        // 1. Final execution return from WASM VM
+        if (responseMsg.returns) {
+          if (isCompleted) return;
+          isCompleted = true;
+          cleanup();
+          const ret = responseMsg.returns;
+          const stateRootHash = ret.success ? overlay.computeStateRootHash() : null;
+          let finalized = false;
+          const commit = () => {
+            if (finalized) return;
+            finalized = true;
+            if (ret.success) overlay.commitOverlay();
+            else overlay.rollbackOverlay();
+          };
+          const rollback = () => {
+            if (finalized) return;
+            finalized = true;
+            overlay.rollbackOverlay();
+          };
 
-        if (!deferCommit) {
-          commit();
+          if (!deferCommit) {
+            commit();
+          }
+          try { stream.end(); } catch (_) {}
+
+          const finishResolve = () =>
+            resolve({
+              node: node.name,
+              vmPort: node.vmPort,
+              hostCallsHandled,
+              returns: ret,
+              stateRootHash,
+              commit,
+              rollback,
+            });
+
+          if (simulatedLatencyMs > 0) {
+            setTimeout(finishResolve, simulatedLatencyMs);
+          } else {
+            finishResolve();
+          }
+          return;
         }
-        try { stream.end(); } catch (_) {}
 
-        const finishResolve = () =>
-          resolve({
-            node: node.name,
-            vmPort: node.vmPort,
-            hostCallsHandled,
-            returns: ret,
-            stateRootHash,
-            commit,
-            rollback,
+        hostCallsHandled++;
+
+        // 2. Blockchain Host Queries (`VirtualMachineBlockchainQueryHandler`)
+        if (responseMsg.get_block_height) {
+          stream.write({ get_block_height_return: { height: String(blockHeight) } });
+          return;
+        }
+        if (responseMsg.get_block_hash) {
+          stream.write({
+            get_block_hash_return: {
+              hash: crypto.createHash('sha256').update(`block-${blockHeight}`).digest(),
+            },
           });
-
-        if (simulatedLatencyMs > 0) {
-          setTimeout(finishResolve, simulatedLatencyMs);
-        } else {
-          finishResolve();
+          return;
         }
-        return;
-      }
+        if (responseMsg.get_block_time) {
+          stream.write({ get_block_time_return: { timestamp: String(1760600000000n + BigInt(blockHeight) * 15000n) } });
+          return;
+        }
+        if (responseMsg.get_block_generation_time) {
+          stream.write({ get_block_generation_time_return: { delta: '15000' } });
+          return;
+        }
+        if (responseMsg.get_transaction_hash) {
+          stream.write({ get_transaction_hash_return: { hash: Buffer.from(txHashHex, 'hex') } });
+          return;
+        }
+        if (responseMsg.get_caller_public_key) {
+          stream.write({ get_caller_public_key_return: { public_key: Buffer.from(callerKeyHex, 'hex') } });
+          return;
+        }
+        if (responseMsg.get_contract_public_key) {
+          stream.write({ get_contract_public_key_return: { public_key: Buffer.from(CONTRACT_KEY_HEX, 'hex') } });
+          return;
+        }
+        if (responseMsg.get_service_payments) {
+          stream.write({
+            get_service_payments_return: {
+              payments: servicePayments,
+            },
+          });
+          return;
+        }
+        if (responseMsg.get_execution_payment) {
+          stream.write({ get_execution_payment_return: { amount: '5000000' } });
+          return;
+        }
+        if (responseMsg.get_download_payment) {
+          stream.write({ get_download_payment_return: { amount: '1000000' } });
+          return;
+        }
 
-      hostCallsHandled++;
-
-      // 2. Blockchain Host Queries (`VirtualMachineBlockchainQueryHandler`)
-      if (responseMsg.get_block_height) {
-        stream.write({ get_block_height_return: { height: String(blockHeight) } });
-        return;
-      }
-      if (responseMsg.get_block_hash) {
-        stream.write({
-          get_block_hash_return: {
-            hash: crypto.createHash('sha256').update(`block-${blockHeight}`).digest(),
-          },
-        });
-        return;
-      }
-      if (responseMsg.get_block_time) {
-        stream.write({ get_block_time_return: { timestamp: String(1760600000000n + BigInt(blockHeight) * 15000n) } });
-        return;
-      }
-      if (responseMsg.get_block_generation_time) {
-        stream.write({ get_block_generation_time_return: { delta: '15000' } });
-        return;
-      }
-      if (responseMsg.get_transaction_hash) {
-        stream.write({ get_transaction_hash_return: { hash: Buffer.from(txHashHex, 'hex') } });
-        return;
-      }
-      if (responseMsg.get_caller_public_key) {
-        stream.write({ get_caller_public_key_return: { public_key: Buffer.from(callerKeyHex, 'hex') } });
-        return;
-      }
-      if (responseMsg.get_contract_public_key) {
-        stream.write({ get_contract_public_key_return: { public_key: Buffer.from(CONTRACT_KEY_HEX, 'hex') } });
-        return;
-      }
-      if (responseMsg.get_service_payments) {
-        stream.write({
-          get_service_payments_return: {
-            payments: servicePayments,
-          },
-        });
-        return;
-      }
-      if (responseMsg.get_execution_payment) {
-        stream.write({ get_execution_payment_return: { amount: '5000000' } });
-        return;
-      }
-      if (responseMsg.get_download_payment) {
-        stream.write({ get_download_payment_return: { amount: '1000000' } });
-        return;
-      }
-
-      // 3. Storage & Filesystem Overlay Queries (`VirtualMachineStorageQueryHandler`)
-      const storageReply = overlay.handleMessage(responseMsg);
-      if (storageReply) {
-        stream.write(storageReply);
-        return;
+        // 3. Storage & Filesystem Overlay Queries (`VirtualMachineStorageQueryHandler`)
+        const storageReply = overlay.handleMessage(responseMsg);
+        if (storageReply) {
+          stream.write(storageReply);
+          return;
+        }
+      } catch (handlerErr) {
+        if (!isCompleted) {
+          isCompleted = true;
+          cleanup();
+          try { overlay.rollbackOverlay(); } catch (_) {}
+          try { stream.cancel(); } catch (_) {}
+          resetVmClient(targetEndpoint, client);
+          reject(handlerErr);
+        }
       }
     });
 
@@ -995,7 +1006,7 @@ function assert3NodeConsensus(stageName, results, expectSuccessOrOpts = true) {
       : { expectSuccess: Boolean(expectSuccessOrOpts), allowQuorum: false };
   const expectSuccess = opts.expectSuccess !== undefined ? Boolean(opts.expectSuccess) : true;
   const allowQuorum = Boolean(opts.allowQuorum);
-  const minQuorum = allowQuorum ? Math.max(2, Math.floor((NODES.length * 2) / 3)) : NODES.length;
+  const minQuorum = allowQuorum ? Math.max(2, Math.ceil((NODES.length * 2) / 3)) : NODES.length;
 
   const validResults = (Array.isArray(results) ? results : []).filter(
     (r) => r && r.returns && Boolean(r.returns.success) === expectSuccess
@@ -1028,6 +1039,9 @@ function assert3NodeConsensus(stageName, results, expectSuccessOrOpts = true) {
     });
 
   if (!allowQuorum) {
+    if (!Array.isArray(results) || results.length === 0 || !results[0] || !results[0].returns) {
+      throw new Error(`[${stageName}] Consensus failure: missing primary node execution result`);
+    }
     const first = results[0].returns;
     const firstFp = fingerprint(results[0]);
     for (const r of results) {

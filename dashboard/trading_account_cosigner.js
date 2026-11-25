@@ -779,17 +779,41 @@ async function computeTradingAccountBalances(record, lockedOverrides = null, for
   const onChainBnb = mosaics.get(bnbHex) || 0n;
 
   const ownerPk = record.owner_public_key.toLowerCase();
-  const settlements = clobDb.getPendingSettlementsForOwner(ownerPk);
+  const tradingPubUpper = String(record.trading_public_key || '').toUpperCase();
+  const tradingAddrUpper = String(record.trading_address || '').replace(/[- ]/g, '').toUpperCase();
+  const settlements = clobDb.getPendingSettlementsForCosigner(ownerPk);
   let deltaXpx = 0n;
   let deltaUsdt = 0n;
   let deltaBnb = 0n;
 
   for (const s of settlements) {
     if (s.status === 'confirmed' || s.status === 'failed') continue;
-    const d = s.delta || {};
-    deltaXpx += BigInt(d.xpx || '0');
-    deltaUsdt += BigInt(d.usdt || '0');
-    deltaBnb += BigInt(d.bnb || '0');
+    if (Array.isArray(s.transfers) && s.transfers.length > 0 && tradingPubUpper) {
+      // Compute exact per-participant delta directly from settlement transfer legs so BOTH
+      // taker (owner_public_key) and maker/counterparty pending outflows are strictly deducted!
+      for (const tr of s.transfers) {
+        const amt = BigInt(tr.amountAtomic || '0');
+        if (amt <= 0n) continue;
+        const mHex = String(tr.mosaicHex || '').toLowerCase();
+        const isOut = tr.fromType === 'TRADING' && String(tr.fromTradingPub || '').toUpperCase() === tradingPubUpper;
+        const isIn = tradingAddrUpper && String(tr.toAddress || '').replace(/[- ]/g, '').toUpperCase() === tradingAddrUpper;
+        if (isOut) {
+          if (mHex === xpxHex || tr.symbol === 'XPX') deltaXpx -= amt;
+          else if (mHex === usdtHex || tr.symbol === 'USDT') deltaUsdt -= amt;
+          else if (mHex === bnbHex || tr.symbol === 'BNB') deltaBnb -= amt;
+        }
+        if (isIn) {
+          if (mHex === xpxHex || tr.symbol === 'XPX') deltaXpx += amt;
+          else if (mHex === usdtHex || tr.symbol === 'USDT') deltaUsdt += amt;
+          else if (mHex === bnbHex || tr.symbol === 'BNB') deltaBnb += amt;
+        }
+      }
+    } else if (s.ownerPublicKey === ownerPk) {
+      const d = s.delta || {};
+      deltaXpx += BigInt(d.xpx || '0');
+      deltaUsdt += BigInt(d.usdt || '0');
+      deltaBnb += BigInt(d.bnb || '0');
+    }
   }
 
   const withdrawals = clobDb.getPendingTradingWithdrawals(ownerPk);
@@ -1000,10 +1024,36 @@ async function activateTradingAccount(reqBody) {
   };
 }
 
+const withdrawalLocks = new Map();
+const settlementLocks = new Map();
+
+async function withKeyedLock(lockMap, key, fn) {
+  const k = String(key || '').toLowerCase();
+  const prev = lockMap.get(k) || Promise.resolve();
+  let release;
+  const next = new Promise((resolve) => { release = resolve; });
+  const tail = prev.then(() => next);
+  lockMap.set(k, tail);
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (lockMap.get(k) === tail) {
+      lockMap.delete(k);
+    }
+  }
+}
+
 /**
  * Co-sign a user-initiated non-custodial withdrawal from their 2-of-2 Trading Account on Sirius L1.
  */
 async function cosignWithdrawal(reqBody, getLocksForOwnerFn = null) {
+  const lockKey = (reqBody && (reqBody.callerPublicKey || reqBody.tradingAccountPublicKey)) || 'global';
+  return withKeyedLock(withdrawalLocks, lockKey, () => _cosignWithdrawalUnlocked(reqBody, getLocksForOwnerFn));
+}
+
+async function _cosignWithdrawalUnlocked(reqBody, getLocksForOwnerFn = null) {
   const {
     signedByInitiatorPayload,
     callerPublicKey,
@@ -1393,8 +1443,14 @@ async function createTradeSettlement({
 /**
  * Submit User Cosigner-1 signature for a pending atomic trade settlement;
  * once all required user cosignatures are collected, requests 2-of-3 Validator Server cosigs and broadcasts!
+ * Serialized per settlementId to prevent lost updates when User A & User B cosign simultaneously.
  */
 async function submitSettlementCosignature({ settlementId, cosignature }) {
+  if (!settlementId) throw new Error('settlementId is required');
+  return withKeyedLock(settlementLocks, settlementId, () => _submitSettlementCosignatureUnlocked({ settlementId, cosignature }));
+}
+
+async function _submitSettlementCosignatureUnlocked({ settlementId, cosignature }) {
   const s = clobDb.getTradingSettlement(settlementId);
   if (!s) throw new Error(`Settlement ${settlementId} not found`);
   if (s.status === 'broadcast' || s.status === 'confirmed') {
