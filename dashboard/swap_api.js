@@ -308,6 +308,7 @@ async function verifyBscOnChainTx(txHash) {
       to: receipt.to || (txDetails && txDetails.to),
       valueBnb: nativeBnbValue,
       contractAddress: receipt.contractAddress,
+      logs: Array.isArray(receipt.logs) ? receipt.logs : [],
       logsCount: receipt.logs ? receipt.logs.length : 0,
       input: txDetails ? txDetails.input : null,
     };
@@ -680,24 +681,43 @@ const swapApi = {
           throw new Error(`Native BNB deposit transaction contains 0 BNB value`);
         }
       } else if (toAddr === usdtContract) {
-        // ERC20 USDT transfer to sink
+        // ERC20 USDT transfer to sink: prefer verified on-chain Transfer event logs from receipt
         verifiedToken = 'USDT';
-        const input = onChainResult.input || '';
-        if (!input.toLowerCase().startsWith('0xa9059cbb')) {
-          throw new Error(`USDT contract interaction is not a standard transfer() call`);
-        }
-        const recipientParam = '0x' + input.slice(34, 74).toLowerCase();
-        if (recipientParam !== sinkAddr) {
-          throw new Error(`USDT transfer recipient (${recipientParam}) does not match Bridge Sink (${sinkAddr})`);
-        }
-        try {
-          const valHex = '0x' + input.slice(74, 138);
-          transferAmount = Number(BigInt(valHex)) / 1e18;
-        } catch (_) {
-          throw new Error(`Failed to decode USDT transfer amount from input data`);
-        }
-        if (!transferAmount || transferAmount <= 0) {
-          throw new Error(`USDT transfer amount must be strictly greater than 0`);
+        const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+        if (Array.isArray(onChainResult.logs)) {
+          let totalLogAtomic = 0n;
+          for (const log of onChainResult.logs) {
+            if (!log || !Array.isArray(log.topics) || log.topics.length < 3) continue;
+            if (String(log.address || '').toLowerCase() !== usdtContract) continue;
+            if (String(log.topics[0] || '').toLowerCase() !== TRANSFER_TOPIC) continue;
+            const logRecipient = '0x' + String(log.topics[2] || '').slice(-40).toLowerCase();
+            if (logRecipient !== sinkAddr) continue;
+            try {
+              totalLogAtomic += BigInt(log.data || '0x0');
+            } catch (_) {}
+          }
+          if (totalLogAtomic <= 0n) {
+            throw new Error(`No verified ERC-20 Transfer log to Bridge Sink (${sinkAddr}) found in transaction receipt`);
+          }
+          transferAmount = Number(totalLogAtomic) / 1e18;
+        } else {
+          const input = onChainResult.input || '';
+          if (!input.toLowerCase().startsWith('0xa9059cbb')) {
+            throw new Error(`USDT contract interaction is not a standard transfer() call`);
+          }
+          const recipientParam = '0x' + input.slice(34, 74).toLowerCase();
+          if (recipientParam !== sinkAddr) {
+            throw new Error(`USDT transfer recipient (${recipientParam}) does not match Bridge Sink (${sinkAddr})`);
+          }
+          try {
+            const valHex = '0x' + input.slice(74, 138);
+            transferAmount = Number(BigInt(valHex)) / 1e18;
+          } catch (_) {
+            throw new Error(`Failed to decode USDT transfer amount from input data`);
+          }
+          if (!transferAmount || transferAmount <= 0) {
+            throw new Error(`USDT transfer amount must be strictly greater than 0`);
+          }
         }
       } else {
         throw new Error(`Transaction target ${onChainResult.to} is neither the Bridge Sink nor the USDT Contract`);
@@ -829,9 +849,9 @@ const swapApi = {
       };
     }
     return {
-      status: 'COMPLETED',
-      transactionId: 'SWAP-BSC-GENERIC',
-      timestamp: new Date().toISOString(),
+      ok: false,
+      status: 'NOT_FOUND',
+      error: 'Swap transaction not found',
     };
   },
 

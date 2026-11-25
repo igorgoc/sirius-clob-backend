@@ -264,16 +264,20 @@ async function getAdminOverviewData() {
     console.warn('[Admin Overview] Failed to fetch fees summary:', err.message);
   }
 
+  const xpxHexLower = (l1Config.XPX_MOSAIC_ID || '13BFC518E40549D7').toLowerCase();
+  const usdtHexLower = (l1Config.USDT_MOSAIC_ID || '4430AEFEF7E15D0C').toLowerCase();
+  const bnbHexLower = (l1Config.BNB_MOSAIC_ID || '3CC1D3CE7447B6F9').toLowerCase();
+
   let xpxLiabilities = 0n, usdtLiabilities = 0n, bnbLiabilities = 0n;
   try {
-    xpxLiabilities = clobApi.getTestnet2LiabilitiesAtomic ? clobApi.getTestnet2LiabilitiesAtomic('13bfc518e40549d7') : 0n;
-    usdtLiabilities = clobApi.getTestnet2LiabilitiesAtomic ? clobApi.getTestnet2LiabilitiesAtomic('4430aefef7e15d0c') : 0n;
-    bnbLiabilities = clobApi.getTestnet2LiabilitiesAtomic ? clobApi.getTestnet2LiabilitiesAtomic('3cc1d3ce7447b6f9') : 0n;
+    xpxLiabilities = clobApi.getTestnet2LiabilitiesAtomic ? clobApi.getTestnet2LiabilitiesAtomic(xpxHexLower) : 0n;
+    usdtLiabilities = clobApi.getTestnet2LiabilitiesAtomic ? clobApi.getTestnet2LiabilitiesAtomic(usdtHexLower) : 0n;
+    bnbLiabilities = clobApi.getTestnet2LiabilitiesAtomic ? clobApi.getTestnet2LiabilitiesAtomic(bnbHexLower) : 0n;
   } catch (_) {}
 
-  const vXpxAtomic = (scBal.get('13bfc518e40549d7') || 0n) + (vBal.get('13bfc518e40549d7') || 0n);
-  const vUsdtAtomic = (scBal.get('4430aefef7e15d0c') || 0n) + (vBal.get('4430aefef7e15d0c') || 0n);
-  const vBnbAtomic = (scBal.get('3cc1d3ce7447b6f9') || 0n) + (vBal.get('3cc1d3ce7447b6f9') || 0n);
+  const vXpxAtomic = (scBal.get(xpxHexLower) || 0n) + (vBal.get(xpxHexLower) || 0n);
+  const vUsdtAtomic = (scBal.get(usdtHexLower) || 0n) + (vBal.get(usdtHexLower) || 0n);
+  const vBnbAtomic = (scBal.get(bnbHexLower) || 0n) + (vBal.get(bnbHexLower) || 0n);
 
   const xpxRatio = xpxLiabilities > 0n ? Math.round(Number(vXpxAtomic * 10000n / xpxLiabilities) / 100) : 100;
   const usdtRatio = usdtLiabilities > 0n ? Math.round(Number(vUsdtAtomic * 10000n / usdtLiabilities) / 100) : 100;
@@ -472,22 +476,26 @@ function escapeHtml(str) {
 }
 
 function getClientIp(req) {
-  // If cf-connecting-ip is provided, validate it is a legitimate IP address
-  const cfIp = req.headers['cf-connecting-ip'];
-  if (cfIp && typeof cfIp === 'string') {
-    const trimmed = cfIp.trim();
-    if (net.isIP(trimmed)) {
-      return trimmed;
+  // Only trust cf-connecting-ip when explicitly deployed behind Cloudflare
+  if (process.env.TRUST_CLOUDFLARE_PROXY === 'true') {
+    const cfIp = req.headers['cf-connecting-ip'];
+    if (cfIp && typeof cfIp === 'string') {
+      const trimmed = cfIp.trim();
+      if (net.isIP(trimmed)) {
+        return trimmed;
+      }
     }
   }
-  const xForwardedFor = req.headers['x-forwarded-for'];
-  if (xForwardedFor && typeof xForwardedFor === 'string') {
-    const parts = xForwardedFor.split(',');
-    // First IP in X-Forwarded-For is the originating client IP
-    for (const part of parts) {
-      const candidate = part.trim();
-      if (net.isIP(candidate)) {
-        return candidate;
+  // Use rightmost trusted proxy-appended IP in X-Forwarded-For (immune to client-prepended spoofed IPs)
+  if (process.env.TRUST_PROXY !== 'false') {
+    const xForwardedFor = req.headers['x-forwarded-for'];
+    if (xForwardedFor && typeof xForwardedFor === 'string') {
+      const parts = xForwardedFor.split(',');
+      for (let i = parts.length - 1; i >= 0; i--) {
+        const candidate = parts[i].trim();
+        if (net.isIP(candidate)) {
+          return candidate;
+        }
       }
     }
   }
@@ -506,9 +514,16 @@ function isDirectLocalhost(req) {
 }
 
 function isTelemetryAllowed(req) {
-  const adminHeader = req.headers['x-admin-key'] || '';
-  if (adminHeader && adminHeader.trim() === getOrInitAdminKey()) {
-    return true;
+  const adminHeader = String(req.headers['x-admin-key'] || '').trim();
+  const expectedKey = getOrInitAdminKey();
+  if (adminHeader && expectedKey) {
+    try {
+      const a = Buffer.from(adminHeader, 'utf8');
+      const b = Buffer.from(expectedKey, 'utf8');
+      if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
+        return true;
+      }
+    } catch (_) {}
   }
   // Direct localhost connection allowed for local operator cockpit debugging
   if (isDirectLocalhost(req)) {
@@ -963,8 +978,13 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // SiriusCLOB DEX Endpoint: Export Network Drive Snapshot Bundle (for cross-machine WAN state sync)
+  // SiriusCLOB DEX Endpoint: Export Network Drive Snapshot Bundle (Admin/Operator Protected)
   if (pathname === '/api/clob/snapshot' && req.method === 'GET') {
+    if (!isTelemetryAllowed(req)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Forbidden: Drive snapshot export is restricted to authorized operators' }));
+      return;
+    }
     const clobApi = require('./clob_api');
     const snapshot = clobApi.exportNodeDriveSnapshot();
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1667,18 +1687,26 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 1b. Bootstrap Level-2 Validator Cluster on-chain (or report if 0.5 XPX gas sponsorship needed)
+  // 1b. Bootstrap Level-2 Validator Cluster on-chain (Admin Protected)
   if (pathname === '/api/clob/validator-cluster/bootstrap' && req.method === 'POST') {
-    tradingCosigner
-      .ensureValidatorClusterOnChain(true)
-      .then((result) => {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(result));
-      })
-      .catch((err) => {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: err.message }));
-      });
+    parseJsonBody(req).catch(() => ({})).then((body) => {
+      const auth = verifyAdminAuth(req, body, 'BOOTSTRAP_VALIDATOR_CLUSTER');
+      if (!auth.authorized) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: auth.error }));
+        return;
+      }
+      tradingCosigner
+        .ensureValidatorClusterOnChain(true)
+        .then((result) => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(result));
+        })
+        .catch((err) => {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        });
+    });
     return;
   }
 
@@ -1785,8 +1813,13 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // SiriusCLOB DEX Endpoint: Inspect On-Chain Balance Ledger
+  // SiriusCLOB DEX Endpoint: Inspect On-Chain Balance Ledger (Operator Protected)
   if (pathname === '/api/clob/ledger' && req.method === 'GET') {
+    if (!isTelemetryAllowed(req)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Forbidden: Full balance ledger export is restricted to authorized operators' }));
+      return;
+    }
     const DRIVE_KEY_HEX = 'bd1d100a98c34f62e170a8395b4498dc1e730286f5a12c489b37d01562f0cb23';
     const balancesPath = path.join(CLUSTER_DIR, 'node1', 'data', 'drives', DRIVE_KEY_HEX, 'drive', 'markets', 'balances.json');
     if (fs.existsSync(balancesPath)) {

@@ -1725,10 +1725,30 @@ let clusterConsensusSeq = 0;
 const CONSENSUS_LOCK_DIR = path.join(CLUSTER_DIR, 'consensus_ipc.lock');
 const CONSENSUS_LOCK_OWNER = path.join(CONSENSUS_LOCK_DIR, 'owner.json');
 
-// Cleanup any stale lock directory on boot
+// Cleanup only genuinely stale lock directory on boot (never break an active live process lock)
 try {
-  if (fs.existsSync(CONSENSUS_LOCK_OWNER)) fs.unlinkSync(CONSENSUS_LOCK_OWNER);
-  if (fs.existsSync(CONSENSUS_LOCK_DIR)) fs.rmdirSync(CONSENSUS_LOCK_DIR);
+  if (fs.existsSync(CONSENSUS_LOCK_DIR)) {
+    let isStale = true;
+    if (fs.existsSync(CONSENSUS_LOCK_OWNER)) {
+      try {
+        const ownerData = JSON.parse(fs.readFileSync(CONSENSUS_LOCK_OWNER, 'utf8'));
+        const ownerPid = Number(ownerData && ownerData.pid);
+        const ownerAgeMs = Date.now() - Number((ownerData && ownerData.time) || 0);
+        if (ownerPid && ownerAgeMs < 60000) {
+          try {
+            process.kill(ownerPid, 0);
+            isStale = false; // Owning process is alive and lock is fresh
+          } catch (_) {
+            isStale = true;
+          }
+        }
+      } catch (_) {}
+    }
+    if (isStale) {
+      if (fs.existsSync(CONSENSUS_LOCK_OWNER)) fs.unlinkSync(CONSENSUS_LOCK_OWNER);
+      fs.rmdirSync(CONSENSUS_LOCK_DIR);
+    }
+  }
 } catch (_) {}
 
 async function withClusterConsensusLock(fn) {
