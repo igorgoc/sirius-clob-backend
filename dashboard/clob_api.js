@@ -2821,6 +2821,12 @@ function getTestnet2LiabilitiesAtomic(mosaicId) {
 
     let total = 0n;
     for (const key of testnetKeys) {
+      // Non-custodial 2-of-2 Smart Trading Accounts hold their own funds on Sirius L1
+      // inside T_user (NOT inside the Vault), so they are NOT Vault custodial liabilities.
+      try {
+        const tradingAcc = clobDb.getTradingAccountByOwner(key);
+        if (tradingAcc && tradingAcc.status === 'active') continue;
+      } catch (_) {}
       const b = balances[key];
       if (!b) continue;
       if (isXpxMosaic(normMosaic)) {
@@ -3442,6 +3448,19 @@ async function runSolvencySentinelAudit(options = {}) {
         auditResults.circuitBreakerTripped = true;
       }
     }
+  }
+
+  // Auto-heal false-positive Solvency Sentinel trips once Vault reserves cover custodial liabilities
+  // (never auto-resets manual admin Emergency Halt or consensus invariant trips).
+  if (
+    auditResults.healthy &&
+    isCircuitBreakerTripped() &&
+    typeof exchangeCircuitBreaker.reason === 'string' &&
+    exchangeCircuitBreaker.reason.startsWith('Solvency Sentinel Breach:')
+  ) {
+    resetCircuitBreaker();
+    auditResults.circuitBreakerTripped = false;
+    console.log('✅ [Solvency Sentinel] Vault reserves verified solvent; auto-cleared prior Solvency Sentinel circuit breaker.');
   }
 
   return auditResults;
