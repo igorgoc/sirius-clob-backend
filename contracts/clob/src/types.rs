@@ -66,7 +66,7 @@ impl PriceLevel {
     }
 
     pub fn push_order(&mut self, order: LimitOrder) {
-        self.total_depth += order.remaining_amount;
+        self.total_depth = self.total_depth.saturating_add(order.remaining_amount);
         self.orders.push(order);
     }
 }

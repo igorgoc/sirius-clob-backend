@@ -167,24 +167,6 @@ impl MarketPair {
 
         match side {
             OrderSide::Buy => {
-                // Post-Only check: if order crosses best ask immediately, reject
-                if order_type == OrderType::PostOnly {
-                    if let Some(best_ask) = self.best_ask() {
-                        if price >= best_ask {
-                            return Ok(OrderResult {
-                                order_id,
-                                status: OrderStatus::Rejected,
-                                fills: Vec::new(),
-                                remaining_amount: 0,
-                                total_base_filled: 0,
-                                total_quote_filled: 0,
-                                refund_base: 0,
-                                refund_quote: Self::calculate_quote_amount(amount, price),
-                            });
-                        }
-                    }
-                }
-
                 // Match against resting Asks (Lowest Ask first)
                 while remaining > 0 {
                     let best_ask_price = match self.best_ask() {
@@ -200,11 +182,11 @@ impl MarketPair {
                             // Self-Trade Prevention (STP): Decrement and Cancel
                             if resting.owner_pubkey == trader {
                                 let cancel_qty = std::cmp::min(remaining, resting.remaining_amount);
-                                level.total_depth -= cancel_qty;
-                                resting.remaining_amount -= cancel_qty;
-                                remaining -= cancel_qty;
+                                level.total_depth = level.total_depth.saturating_sub(cancel_qty);
+                                resting.remaining_amount = resting.remaining_amount.saturating_sub(cancel_qty);
+                                remaining = remaining.saturating_sub(cancel_qty);
                                 // The resting Sell order was backed by Base asset (XPX), which is now cancelled
-                                stp_refund_base += cancel_qty;
+                                stp_refund_base = stp_refund_base.saturating_add(cancel_qty);
                                 if resting.remaining_amount == 0 {
                                     let removed = level.orders.remove(0);
                                     self.order_index.remove(&removed.order_id);
@@ -229,11 +211,11 @@ impl MarketPair {
                                 taker_fee,
                             });
 
-                            total_base_filled += fill_qty;
-                            total_quote_filled += quote_amt;
-                            remaining -= fill_qty;
-                            level.total_depth -= fill_qty;
-                            resting.remaining_amount -= fill_qty;
+                            total_base_filled = total_base_filled.saturating_add(fill_qty);
+                            total_quote_filled = total_quote_filled.saturating_add(quote_amt);
+                            remaining = remaining.saturating_sub(fill_qty);
+                            level.total_depth = level.total_depth.saturating_sub(fill_qty);
+                            resting.remaining_amount = resting.remaining_amount.saturating_sub(fill_qty);
 
                             if resting.remaining_amount == 0 {
                                 let removed = level.orders.remove(0);
@@ -270,24 +252,6 @@ impl MarketPair {
             }
 
             OrderSide::Sell => {
-                // Post-Only check: if order crosses best bid immediately, reject
-                if order_type == OrderType::PostOnly {
-                    if let Some(best_bid) = self.best_bid() {
-                        if price <= best_bid {
-                            return Ok(OrderResult {
-                                order_id,
-                                status: OrderStatus::Rejected,
-                                fills: Vec::new(),
-                                remaining_amount: 0,
-                                total_base_filled: 0,
-                                total_quote_filled: 0,
-                                refund_base: amount,
-                                refund_quote: 0,
-                            });
-                        }
-                    }
-                }
-
                 // Match against resting Bids (Highest Bid first)
                 while remaining > 0 {
                     let best_bid_price = match self.best_bid() {
@@ -303,11 +267,11 @@ impl MarketPair {
                             // Self-Trade Prevention (STP): Decrement and Cancel
                             if resting.owner_pubkey == trader {
                                 let cancel_qty = std::cmp::min(remaining, resting.remaining_amount);
-                                level.total_depth -= cancel_qty;
-                                resting.remaining_amount -= cancel_qty;
-                                remaining -= cancel_qty;
+                                level.total_depth = level.total_depth.saturating_sub(cancel_qty);
+                                resting.remaining_amount = resting.remaining_amount.saturating_sub(cancel_qty);
+                                remaining = remaining.saturating_sub(cancel_qty);
                                 // The resting Buy order was backed by Quote asset (USDT), which is now cancelled
-                                stp_refund_quote += Self::calculate_quote_amount(cancel_qty, best_bid_price);
+                                stp_refund_quote = stp_refund_quote.saturating_add(Self::calculate_quote_amount(cancel_qty, best_bid_price));
                                 if resting.remaining_amount == 0 {
                                     let removed = level.orders.remove(0);
                                     self.order_index.remove(&removed.order_id);
@@ -332,11 +296,11 @@ impl MarketPair {
                                 taker_fee,
                             });
 
-                            total_base_filled += fill_qty;
-                            total_quote_filled += quote_amt;
-                            remaining -= fill_qty;
-                            level.total_depth -= fill_qty;
-                            resting.remaining_amount -= fill_qty;
+                            total_base_filled = total_base_filled.saturating_add(fill_qty);
+                            total_quote_filled = total_quote_filled.saturating_add(quote_amt);
+                            remaining = remaining.saturating_sub(fill_qty);
+                            level.total_depth = level.total_depth.saturating_sub(fill_qty);
+                            resting.remaining_amount = resting.remaining_amount.saturating_sub(fill_qty);
 
                             if resting.remaining_amount == 0 {
                                 let removed = level.orders.remove(0);

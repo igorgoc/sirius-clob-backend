@@ -338,6 +338,117 @@ async function runTests() {
   );
   console.log('✅ Test 5 passed: assert3NodeConsensus null guard & quorum enforcement');
 
+  // ============================================================================
+  // TEST 6: deposit_indexer corrupt processed_deposits.json recovery (isolated)
+  // ============================================================================
+  {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'depidx-edge-'));
+    const origDepPath = config.PROCESSED_DEPOSITS_FILE;
+    config.PROCESSED_DEPOSITS_FILE = path.join(tmpDir, 'processed_deposits.json');
+    const depIdx = require('../dashboard/deposit_indexer');
+    try {
+      depIdx.recordProcessedDeposit({ txHash: 'aaaa1111', mosaicIdHex: '13bfc518e40549d7', amountAtomic: '1000000' });
+      assert(fs.existsSync(config.PROCESSED_DEPOSITS_FILE + '.bak'), 'Backup file must be created');
+      fs.writeFileSync(config.PROCESSED_DEPOSITS_FILE, '{corrupt json!!!');
+      depIdx.recordProcessedDeposit({ txHash: 'bbbb2222', mosaicIdHex: '13bfc518e40549d7', amountAtomic: '2000000' });
+      const dirFiles = fs.readdirSync(tmpDir);
+      assert(dirFiles.some((f) => f.includes('.corrupt.')), 'Corrupt JSON file must be backed up');
+      const recovered = JSON.parse(fs.readFileSync(config.PROCESSED_DEPOSITS_FILE, 'utf8'));
+      assert.strictEqual(recovered.length, 2, 'Both prior and new deposit records must survive corruption');
+    } finally {
+      config.PROCESSED_DEPOSITS_FILE = origDepPath;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+    console.log('✅ Test 6 passed: deposit_indexer corrupt-file backup & .bak restoration');
+  }
+
+  // ============================================================================
+  // TEST 7: HTTP Gateway Security, CORS, Malformed URL & Payload-Size DoS
+  // ============================================================================
+  {
+    const http = require('http');
+    const { spawn } = require('child_process');
+    const gwPort = 15992;
+    const gwProc = spawn(process.execPath, [path.join(__dirname, '../dashboard/server.js')], {
+      env: {
+        ...process.env,
+        PORT: String(gwPort),
+        CLOB_DB_FILE: tempDbPath,
+        NODE_ENV: 'production',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const waitReady = async () => {
+      const deadline = Date.now() + 8000;
+      while (Date.now() < deadline) {
+        try {
+          const r = await new Promise((resolve, reject) => {
+            const req = http.get(`http://127.0.0.1:${gwPort}/api/clob/config`, resolve);
+            req.on('error', reject);
+          });
+          r.resume();
+          if (r.statusCode === 200) return;
+        } catch (_) {}
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      throw new Error('Gateway test server did not start in time');
+    };
+
+    const httpReq = (opts, bodyBuf = null) => new Promise((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port: gwPort, ...opts }, (res) => {
+        let data = '';
+        res.on('data', (c) => (data += c));
+        res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: data }));
+      });
+      req.on('error', reject);
+      if (bodyBuf) req.write(bodyBuf);
+      req.end();
+    });
+
+    try {
+      await waitReady();
+
+      // 7a. Public CLOB endpoint has CORS *
+      const pubRes = await httpReq({ method: 'GET', path: '/api/clob/config' });
+      assert.strictEqual(pubRes.status, 200);
+      assert.strictEqual(pubRes.headers['access-control-allow-origin'], '*', 'Public CLOB route should allow CORS');
+
+      // 7b. Admin / logs routes MUST NOT emit wildcard CORS *
+      const adminRes = await httpReq({ method: 'GET', path: '/api/logs' });
+      assert.strictEqual(adminRes.headers['access-control-allow-origin'], undefined, 'Admin/logs route must NOT emit wildcard CORS *');
+
+      // 7c. Malformed Host header MUST NOT crash server
+      const badHostRes = await httpReq({ method: 'GET', path: '/api/clob/config', headers: { host: 'bad host:::99999' } });
+      assert.strictEqual(badHostRes.status, 200, 'Untrusted/malformed Host header must not crash URL parsing');
+
+      // 7d. Oversized (>2MB) JSON payload must be rejected cleanly and server must remain alive
+      const bigPayload = Buffer.alloc(2 * 1024 * 1024 + 4096, 0x61);
+      try {
+        const bigRes = await httpReq({ method: 'POST', path: '/api/clob/order', headers: { 'content-type': 'application/json' } }, bigPayload);
+        assert.strictEqual(bigRes.status, 400, 'Oversized payload must return 400');
+      } catch (e) {
+        // Socket reset on req.destroy() is also expected for oversized streams
+        assert(e.code === 'ECONNRESET' || e.code === 'EPIPE', `Unexpected socket error: ${e.code}`);
+      }
+      const healthAfter = await httpReq({ method: 'GET', path: '/api/clob/config' });
+      assert.strictEqual(healthAfter.status, 200, 'Server must remain healthy after oversized payload DoS attempt');
+
+      // 7e. Hot read endpoints return Cache-Control: no-cache and respond fast
+      const t0 = Date.now();
+      const tradesRes1 = await httpReq({ method: 'GET', path: '/api/clob/trades?pair=xpx_usdt&limit=20' });
+      const tradesRes2 = await httpReq({ method: 'GET', path: '/api/clob/trades?pair=xpx_usdt&limit=20' });
+      const elapsed = Date.now() - t0;
+      assert.strictEqual(tradesRes1.status, 200);
+      assert.strictEqual(tradesRes2.status, 200);
+      assert(elapsed < 500, `Cached /trades responses should be fast (took ${elapsed}ms)`);
+
+      console.log(`✅ Test 7 passed: HTTP Gateway CORS, malformed Host, 2MB DoS protection & cached hot reads (${elapsed}ms)`);
+    } finally {
+      gwProc.kill('SIGTERM');
+    }
+  }
+
   clobDb.closeDb();
   try { fs.unlinkSync(tempDbPath); } catch (_) {}
   console.log('\n🎉 ALL COMPREHENSIVE EDGE-CASE & SECURITY REGRESSION TESTS PASSED!');

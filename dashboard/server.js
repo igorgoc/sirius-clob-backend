@@ -149,22 +149,39 @@ const { getPancakeSwapPriceCached, getCachedPancakeSwapPriceSync } = require('./
 
 function parseJsonBody(req) {
   return new Promise((resolve, reject) => {
-    let body = '';
+    const MAX_BYTES = 2 * 1024 * 1024;
+    const chunks = [];
+    let totalBytes = 0;
+    let settled = false;
+
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+
     req.on('data', (chunk) => {
-      body += chunk;
-      if (body.length > 2 * 1024 * 1024) {
+      if (settled) return;
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      totalBytes += buf.length;
+      if (totalBytes > MAX_BYTES) {
+        fail(new Error('Payload too large'));
         req.destroy();
-        reject(new Error('Payload too large'));
+        return;
       }
+      chunks.push(buf);
     });
     req.on('end', () => {
+      if (settled) return;
+      settled = true;
       try {
+        const body = chunks.length > 0 ? Buffer.concat(chunks).toString('utf8') : '';
         resolve(body ? JSON.parse(body) : {});
       } catch (err) {
         reject(new Error('Malformed JSON body: ' + err.message));
       }
     });
-    req.on('error', reject);
+    req.on('error', (err) => fail(err));
   });
 }
 
@@ -578,16 +595,58 @@ class SlidingWindowRateLimiter {
 }
 
 const apiRateLimiter = new SlidingWindowRateLimiter();
+let activeLogStreams = 0;
+const MAX_ACTIVE_LOG_STREAMS = 10;
+
+// Mtime-keyed RAM caches for hot read endpoints (/api/clob/trades & /api/clob/candles)
+const tradesReadCache = new Map();
+const candlesReadCache = new Map();
+
+function isTimingSafeStringEqual(a, b) {
+  if (!a || !b) return false;
+  const bufA = Buffer.from(String(a), 'utf8');
+  const bufB = Buffer.from(String(b), 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+function getSafeRateLimit(envVal, fallback) {
+  const n = parseInt(envVal || '', 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
 
 const server = http.createServer((req, res) => {
-  const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
+  if (!req.url || typeof req.url !== 'string' || !req.url.startsWith('/')) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'Malformed request URL' }));
+    return;
+  }
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(req.url, 'http://localhost');
+  } catch (_) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'Malformed request URL' }));
+    return;
+  }
   const pathname = parsedUrl.pathname;
   const clientIp = getClientIp(req);
   const isDirectLocal = isDirectLocalhost(req);
 
-  // Hardened Security & CORS headers
-  const isAdminRoute = pathname.startsWith('/api/admin') || pathname.startsWith('/api/logs');
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  // Hardened Security & CORS headers (never emit wildcard CORS on admin/log/action routes)
+  const isAdminRoute =
+    pathname.startsWith('/api/admin') ||
+    pathname.startsWith('/api/logs') ||
+    pathname.startsWith('/api/action');
+  if (!isAdminRoute) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  } else if (process.env.ALLOWED_ADMIN_ORIGINS && req.headers.origin) {
+    const allowed = process.env.ALLOWED_ADMIN_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean);
+    if (allowed.includes(req.headers.origin)) {
+      res.setHeader('Access-Control-Allow-Origin', req.headers.origin);
+      res.setHeader('Vary', 'Origin');
+    }
+  }
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader(
     'Access-Control-Allow-Headers',
@@ -645,12 +704,9 @@ const server = http.createServer((req, res) => {
     pathname === '/api/clob/trading-account/cosign-settlement'
   ) {
     const adminHeader = req.headers['x-admin-key'] || req.headers['x-load-test-key'];
-    const isLoadTestAuth = Boolean(
-      adminHeader &&
-      (adminHeader === clusterAdminKey || (process.env.NODE_ENV !== 'production' && adminHeader === 'sirius-load-test-suite'))
-    );
+    const isLoadTestAuth = isTimingSafeStringEqual(adminHeader, clusterAdminKey);
     const isPrivileged = isDirectLocal || isLoadTestAuth;
-    const ipLimit = isPrivileged ? 2400 : (process.env.CLOB_IP_RATE_LIMIT ? parseInt(process.env.CLOB_IP_RATE_LIMIT, 10) : 600);
+    const ipLimit = isPrivileged ? 2400 : getSafeRateLimit(process.env.CLOB_IP_RATE_LIMIT, 600);
     const rate = apiRateLimiter.check(`clob:${clientIp}`, ipLimit, 60000);
     if (!rate.allowed) {
       res.writeHead(429, {
@@ -686,12 +742,9 @@ const server = http.createServer((req, res) => {
   // 4. CLOB General Market & Account Read Queries: High-throughput capacity for streaming & load testing
   if (pathname.startsWith('/api/clob/') && req.method === 'GET') {
     const adminHeader = req.headers['x-admin-key'] || req.headers['x-load-test-key'];
-    const isLoadTestAuth = Boolean(
-      adminHeader &&
-      (adminHeader === clusterAdminKey || (process.env.NODE_ENV !== 'production' && adminHeader === 'sirius-load-test-suite'))
-    );
+    const isLoadTestAuth = isTimingSafeStringEqual(adminHeader, clusterAdminKey);
     const isPrivileged = isDirectLocal || isLoadTestAuth;
-    const readLimit = isPrivileged ? 3600 : (process.env.CLOB_READ_RATE_LIMIT ? parseInt(process.env.CLOB_READ_RATE_LIMIT, 10) : 1200);
+    const readLimit = isPrivileged ? 3600 : getSafeRateLimit(process.env.CLOB_READ_RATE_LIMIT, 1200);
     const rate = apiRateLimiter.check(`clob_read:${clientIp}`, readLimit, 60000);
     if (!rate.allowed) {
       res.writeHead(429, {
@@ -735,6 +788,13 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ ok: false, error: 'Forbidden: Log streaming is restricted to authorized operators' }));
       return;
     }
+    if (activeLogStreams >= MAX_ACTIVE_LOG_STREAMS) {
+      res.writeHead(429, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Too many active log streams' }));
+      return;
+    }
+    activeLogStreams++;
+    let streamClosed = false;
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
@@ -745,6 +805,7 @@ const server = http.createServer((req, res) => {
     let lastLength = 0;
 
     const interval = setInterval(() => {
+      if (streamClosed) return;
       const logFile = node === 'mm'
         ? path.join(CLUSTER_DIR, 'mm.log')
         : path.join(CLUSTER_DIR, node, 'logs/vm.log');
@@ -759,7 +820,7 @@ const server = http.createServer((req, res) => {
             let chunk = '';
             stream.on('data', d => chunk += d);
             stream.on('end', () => {
-              if (chunk.length > 0) {
+              if (!streamClosed && chunk.length > 0) {
                 res.write(`data: ${JSON.stringify({ log: chunk })}\n\n`);
               }
               lastLength = stats.size;
@@ -769,7 +830,13 @@ const server = http.createServer((req, res) => {
       }
     }, 1000);
 
-    req.on('close', () => clearInterval(interval));
+    req.on('close', () => {
+      if (!streamClosed) {
+        streamClosed = true;
+        activeLogStreams = Math.max(0, activeLogStreams - 1);
+      }
+      clearInterval(interval);
+    });
     return;
   }
 
@@ -1220,6 +1287,14 @@ const server = http.createServer((req, res) => {
     const tradesPath = path.join(CLUSTER_DIR, 'node1', 'data', 'drives', DRIVE_KEY_HEX, 'drive', 'markets', market, 'trades.json');
     if (fs.existsSync(tradesPath)) {
       try {
+        const st = fs.statSync(tradesPath);
+        const cacheKey = `${market}:${limit}`;
+        const cached = tradesReadCache.get(cacheKey);
+        if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
+          res.end(cached.body);
+          return;
+        }
         const raw = fs.readFileSync(tradesPath, 'utf8');
         const rawTrades = JSON.parse(raw);
         if (Array.isArray(rawTrades) && rawTrades.length > 0) {
@@ -1233,9 +1308,11 @@ const server = http.createServer((req, res) => {
             };
           });
           const recentTrades = enriched.slice(-limit).reverse();
+          const bodyStr = JSON.stringify(recentTrades);
           lastValidTrades[market] = recentTrades;
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(recentTrades));
+          tradesReadCache.set(cacheKey, { mtimeMs: st.mtimeMs, size: st.size, body: bodyStr });
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
+          res.end(bodyStr);
           return;
         }
       } catch (_) {}
@@ -1272,6 +1349,14 @@ const server = http.createServer((req, res) => {
 
     if (fs.existsSync(tradesPath)) {
       try {
+        const st = fs.statSync(tradesPath);
+        const candleCacheKey = `${market}:${intervalStr}:${limit}`;
+        const cachedCandles = candlesReadCache.get(candleCacheKey);
+        if (cachedCandles && cachedCandles.mtimeMs === st.mtimeMs && cachedCandles.size === st.size) {
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
+          res.end(cachedCandles.body);
+          return;
+        }
         const raw = fs.readFileSync(tradesPath, 'utf8');
         const rawTrades = JSON.parse(raw);
         if (Array.isArray(rawTrades) && rawTrades.length > 0) {
@@ -1309,8 +1394,10 @@ const server = http.createServer((req, res) => {
           if (candles.length > limit) {
             candles = candles.slice(-limit);
           }
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, pair: market, interval: intervalStr, candles }));
+          const bodyStr = JSON.stringify({ ok: true, pair: market, interval: intervalStr, candles });
+          candlesReadCache.set(candleCacheKey, { mtimeMs: st.mtimeMs, size: st.size, body: bodyStr });
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
+          res.end(bodyStr);
           return;
         }
       } catch (_) {}
@@ -1397,18 +1484,8 @@ const server = http.createServer((req, res) => {
       const parsed = clobApi.getMarketDepthSnapshot(market);
       if (parsed && Array.isArray(parsed.bids) && Array.isArray(parsed.asks)) {
         const serialized = JSON.stringify(parsed);
-        if (parsed.bids.length > 0 || parsed.asks.length > 0) {
-          lastValidDepth[market] = serialized;
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(serialized);
-          return;
-        }
-        if (lastValidDepth[market]) {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(lastValidDepth[market]);
-          return;
-        }
-        res.writeHead(200, { 'Content-Type': 'application/json' });
+        lastValidDepth[market] = serialized;
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
         res.end(serialized);
         return;
       }
