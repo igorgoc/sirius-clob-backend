@@ -300,8 +300,8 @@ pub fn handle_place_order(params: &[u8]) -> u32 {
     };
 
     // Exact Escrow Refunds (IOC unspent, price improvement, STP, and excess deposit)
-    let total_refund_base = result.refund_base + if side == OrderSide::Sell { excess_deposit } else { 0 };
-    let total_refund_quote = result.refund_quote + if side == OrderSide::Buy { excess_deposit } else { 0 };
+    let total_refund_base = result.refund_base.saturating_add(if side == OrderSide::Sell { excess_deposit } else { 0 });
+    let total_refund_quote = result.refund_quote.saturating_add(if side == OrderSide::Buy { excess_deposit } else { 0 });
 
     if total_refund_base > 0 {
         let _ = ledger.unlock(&caller, market.base_mosaic_id, total_refund_base);
