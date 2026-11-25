@@ -408,6 +408,11 @@ class ClobMarketMaker {
       await this.fetchOraclePrices(false);
     }
 
+    // Automated simulated taker trades are disabled by default (set ENABLE_SIMULATED_TRADES=true to re-enable)
+    if (process.env.ENABLE_SIMULATED_TRADES !== 'true') {
+      return;
+    }
+
     // 2. Alternate between XPX/USDT and XPX/BNB
     const marketKey = roundNum % 2 === 1 ? 'xpx_usdt' : 'xpx_bnb';
     const m = this.markets[marketKey];
