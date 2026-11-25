@@ -62,20 +62,54 @@ function recordProcessedDeposit(record) {
   processedHashes.add(txKey);
   processedHashes.add(mosaicKey);
   try {
-    let list = [];
-    if (fs.existsSync(config.PROCESSED_DEPOSITS_FILE)) {
+    let list = null;
+    const filePath = config.PROCESSED_DEPOSITS_FILE;
+    const bakPath = `${filePath}.bak`;
+
+    if (fs.existsSync(filePath)) {
       try {
-        list = JSON.parse(fs.readFileSync(config.PROCESSED_DEPOSITS_FILE, 'utf8'));
-        if (!Array.isArray(list)) list = [];
-      } catch (_) {
-        list = [];
+        const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        if (Array.isArray(parsed)) {
+          list = parsed;
+        }
+      } catch (parseErr) {
+        const corruptPath = `${filePath}.corrupt.${Date.now()}`;
+        try {
+          fs.copyFileSync(filePath, corruptPath);
+          console.error(`[Deposit Indexer] ⚠️ Corrupt processed_deposits.json backed up to ${corruptPath}: ${parseErr.message}`);
+        } catch (_) {
+          console.error(`[Deposit Indexer] ⚠️ Corrupt processed_deposits.json (backup failed): ${parseErr.message}`);
+        }
       }
     }
+
+    // If primary file was missing or corrupt, try last-known-good backup before falling back to in-memory hashes
+    if (list === null && fs.existsSync(bakPath)) {
+      try {
+        const bakParsed = JSON.parse(fs.readFileSync(bakPath, 'utf8'));
+        if (Array.isArray(bakParsed)) {
+          list = bakParsed;
+          console.warn(`[Deposit Indexer] Restored ${list.length} prior records from ${bakPath}`);
+        }
+      } catch (_) {}
+    }
+
+    if (list === null) {
+      // Never wipe in-memory idempotency state if disk files were unreadable
+      list = Array.from(processedHashes)
+        .filter((k) => !k.includes(':') && k !== txKey)
+        .map((h) => ({ txHash: h, recoveredFromMemory: true }));
+    }
+
     list.push(record);
-    fs.mkdirSync(path.dirname(config.PROCESSED_DEPOSITS_FILE), { recursive: true });
-    const tmpFile = `${config.PROCESSED_DEPOSITS_FILE}.tmp.${process.pid}`;
-    fs.writeFileSync(tmpFile, JSON.stringify(list, null, 2));
-    fs.renameSync(tmpFile, config.PROCESSED_DEPOSITS_FILE);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const serialized = JSON.stringify(list, null, 2);
+    const tmpFile = `${filePath}.tmp.${process.pid}`;
+    fs.writeFileSync(tmpFile, serialized);
+    fs.renameSync(tmpFile, filePath);
+    try {
+      fs.writeFileSync(bakPath, serialized);
+    } catch (_) {}
   } catch (err) {
     console.error('[Deposit Indexer] Error saving processed deposit:', err.message);
   }
@@ -177,7 +211,6 @@ async function scanDeposits(onDepositCallback) {
 
           // Idempotency check
           if (processedHashes.has(txHash)) continue;
-          hasNewOnPage = true;
 
           // Type 16724 = TransferTransaction
           if (tx.type !== 16724) continue;
@@ -225,6 +258,7 @@ async function scanDeposits(onDepositCallback) {
                 await onDepositCallback(depositRecord);
               }
               recordProcessedDeposit(depositRecord);
+              hasNewOnPage = true;
               console.log(`[Deposit Indexer] Credited deposit ${mosaicIdHex} (${amountAtomic}) from ${senderAddress} to ${targetAddr.plain()} (Tx: ${txHash.slice(0, 16)}...)`);
             } catch (cbErr) {
               console.error(`[Deposit Indexer] Callback error for deposit tx ${txHash}:`, cbErr.message);
