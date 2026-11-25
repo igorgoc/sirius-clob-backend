@@ -735,7 +735,7 @@ async function discoverTradingAccountStatus(ownerPublicKeyOrAddress, existingLoc
   // Fetch live on-chain balance of the Trading Account
   const effectiveOwnerPk = record.owner_public_key;
   const balances = await computeTradingAccountBalances(record, existingLocks);
-  const pendingSettlements = clobDb.getPendingSettlementsForOwner(effectiveOwnerPk);
+  const pendingSettlements = clobDb.getPendingSettlementsForCosigner(effectiveOwnerPk);
   const pendingWithdrawals = clobDb.getPendingTradingWithdrawals(effectiveOwnerPk);
 
   return {
@@ -1205,27 +1205,48 @@ async function cosignWithdrawal(reqBody, getLocksForOwnerFn = null) {
   };
 }
 
-/**
- * Create an Atomic Trade Settlement AggregateCompleteV1 between a User's Trading Account
- * and the Counterparty (another Trading Account or Clearing Pool/Vault).
- */
-async function createTradeSettlement({
-  orderId,
-  ownerPublicKey,
-  counterpartyKey,
-  transfers, // [{ fromTradingPub, fromType: 'TRADING'|'VAULT', toAddress, mosaicHex, amountAtomic, symbol }]
-  delta,     // { xpx: '...', usdt: '...', bnb: '...' } net change for owner
-  orderContext = null,
-}) {
-  const record = clobDb.getTradingAccountByOwner(ownerPublicKey);
-  if (!record || record.status !== 'active') return null;
+const SETTLEMENT_EXPIRY_BUFFER_MS = Math.max(
+  30_000,
+  Number(process.env.SETTLEMENT_EXPIRY_BUFFER_MS || 5 * 60 * 1000)
+);
 
+/**
+ * Decode the Sirius L1 deadline (Unix epoch ms) embedded inside an AggregateComplete payload.
+ */
+function getAggregateDeadlineEpochMs(aggregatePayloadHex) {
+  if (!aggregatePayloadHex || typeof aggregatePayloadHex !== 'string') return null;
+  try {
+    const decoded = TransactionMapping.createFromPayload(aggregatePayloadHex);
+    if (!decoded || !decoded.deadline || !decoded.deadline.adjustedValue) return null;
+    const adjustedMs = typeof decoded.deadline.adjustedValue.compact === 'function'
+      ? Number(decoded.deadline.adjustedValue.compact())
+      : Number(decoded.deadline.adjustedValue);
+    if (!Number.isFinite(adjustedMs)) return null;
+    return adjustedMs + Number(Deadline.timestampNemesisBlock || 1459468800) * 1000;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Returns true if the settlement's L1 AggregateComplete deadline has passed or is within bufferMs of expiring.
+ */
+function isSettlementPayloadExpired(aggregatePayloadHex, bufferMs = SETTLEMENT_EXPIRY_BUFFER_MS) {
+  const deadlineEpochMs = getAggregateDeadlineEpochMs(aggregatePayloadHex);
+  if (deadlineEpochMs === null) return true;
+  return Date.now() + Math.max(0, Number(bufferMs) || 0) >= deadlineEpochMs;
+}
+
+/**
+ * Build and Vault-sign an AggregateCompleteV1 transaction from a settlement's transfer legs.
+ */
+function buildSettlementAggregateTx({ orderId, transfers }) {
   const vault = testnetClient.getOrInitVaultAccount();
   const embeddedTxs = [];
   const requiredUserSigners = new Set();
   const allowedInnerSigners = new Set();
 
-  for (const tr of transfers) {
+  for (const tr of (transfers || [])) {
     const amt = BigInt(tr.amountAtomic || '0');
     if (amt <= 0n) continue;
     const fromPub = tr.fromType === 'VAULT' ? vault.publicKey : tr.fromTradingPub;
@@ -1261,6 +1282,93 @@ async function createTradeSettlement({
 
   // Vault initiates and pays the tiny L1 settlement fee (satisfies Vault leg if Vault is sending!)
   const signedByVault = vault.sign(aggTx, config.GENERATION_HASH);
+  return { signedByVault, requiredUserSigners, allowedInnerSigners };
+}
+
+/**
+ * Rebuild a pending_cosign (or Past_Deadline) settlement with a fresh Sirius L1 Deadline.
+ * Because the txHash changes, any prior cosignatures for the expired hash are cleared so
+ * all required parties automatically sign the fresh payload when online.
+ */
+function rebuildExpiredSettlement(settlement, { force = false, bufferMs = SETTLEMENT_EXPIRY_BUFFER_MS } = {}) {
+  if (!settlement || !settlement.settlementId) return { rebuilt: false, settlement };
+  if (!force && settlement.status !== 'pending_cosign') {
+    return { rebuilt: false, settlement };
+  }
+  if (!force && !isSettlementPayloadExpired(settlement.aggregatePayload, bufferMs)) {
+    return { rebuilt: false, settlement };
+  }
+  if (!Array.isArray(settlement.transfers) || settlement.transfers.length === 0) {
+    return { rebuilt: false, settlement };
+  }
+
+  const built = buildSettlementAggregateTx({
+    orderId: settlement.orderId,
+    transfers: settlement.transfers,
+  });
+  if (!built) return { rebuilt: false, settlement };
+
+  const oldHash = settlement.txHash;
+  const updated = clobDb.updateTradingSettlementPayload(settlement.settlementId, {
+    txHash: built.signedByVault.hash,
+    aggregatePayload: built.signedByVault.payload,
+    collectedCosigs: [],
+    status: 'pending_cosign',
+  });
+
+  console.log(
+    `[TradingCosigner] 🔄 Auto-rebuilt expired settlement ${settlement.settlementId}: ` +
+    `oldHash=${oldHash ? oldHash.slice(0, 12) : 'none'} -> newHash=${built.signedByVault.hash.slice(0, 12)}`
+  );
+
+  return { rebuilt: true, settlement: updated };
+}
+
+/**
+ * Fetch all pending settlements where publicKey is owner or required cosigner,
+ * automatically rebuilding any expired pending_cosign AggregateComplete payloads with a fresh L1 deadline.
+ */
+function getPendingSettlementsWithAutoRebuild(publicKey, options = {}) {
+  const rows = clobDb.getPendingSettlementsForCosigner(publicKey);
+  return rows.map((s) => {
+    let current = s;
+    let rebuilt = false;
+    if (s.status === 'pending_cosign') {
+      try {
+        const res = rebuildExpiredSettlement(s, options);
+        current = res.settlement || s;
+        rebuilt = Boolean(res.rebuilt);
+      } catch (err) {
+        console.warn(`[TradingCosigner] Settlement rebuild warning (${s.settlementId}):`, err.message);
+      }
+    }
+    return {
+      ...current,
+      rebuilt,
+      deadlineEpochMs: getAggregateDeadlineEpochMs(current.aggregatePayload),
+    };
+  });
+}
+
+/**
+ * Create an Atomic Trade Settlement AggregateCompleteV1 between a User's Trading Account
+ * and the Counterparty (another Trading Account or Clearing Pool/Vault).
+ */
+async function createTradeSettlement({
+  orderId,
+  ownerPublicKey,
+  counterpartyKey,
+  transfers, // [{ fromTradingPub, fromType: 'TRADING'|'VAULT', toAddress, mosaicHex, amountAtomic, symbol }]
+  delta,     // { xpx: '...', usdt: '...', bnb: '...' } net change for owner
+  orderContext = null,
+}) {
+  const record = clobDb.getTradingAccountByOwner(ownerPublicKey);
+  if (!record || record.status !== 'active') return null;
+
+  const built = buildSettlementAggregateTx({ orderId, transfers });
+  if (!built) return null;
+  const { signedByVault, requiredUserSigners } = built;
+
   const settlementId = `SET_${signedByVault.hash.slice(0, 16)}_${crypto.randomBytes(3).toString('hex')}`;
 
   const saved = clobDb.saveTradingSettlement({
@@ -1291,6 +1399,26 @@ async function submitSettlementCosignature({ settlementId, cosignature }) {
   if (!s) throw new Error(`Settlement ${settlementId} not found`);
   if (s.status === 'broadcast' || s.status === 'confirmed') {
     return { ok: true, alreadySubmitted: true, txHash: s.txHash, status: s.status };
+  }
+
+  // If the AggregateComplete L1 deadline expired (or is about to expire) while waiting for an offline user,
+  // automatically rebuild with a fresh deadline and ask the client to re-sign the refreshed payload.
+  if (isSettlementPayloadExpired(s.aggregatePayload)) {
+    const { rebuilt, settlement: refreshed } = rebuildExpiredSettlement(s, { force: true });
+    if (rebuilt && refreshed) {
+      return {
+        ok: true,
+        rebuilt: true,
+        status: 'pending_cosign',
+        txHash: refreshed.txHash,
+        settlement: {
+          ...refreshed,
+          rebuilt: true,
+          deadlineEpochMs: getAggregateDeadlineEpochMs(refreshed.aggregatePayload),
+        },
+        message: 'Settlement deadline expired and was automatically rebuilt with a fresh L1 deadline.',
+      };
+    }
   }
 
   const verified = verifyCosignatureObject(cosignature, s.aggregatePayload);
@@ -1350,6 +1478,23 @@ async function submitSettlementCosignature({ settlementId, cosignature }) {
     await testnetClient.verifyTransactionAccepted(completedSigned.hash, 2500, 400);
   } catch (l1Err) {
     const errMsg = l1Err && l1Err.message ? l1Err.message : String(l1Err || '');
+    if (errMsg.includes('Past_Deadline')) {
+      const { rebuilt, settlement: refreshed } = rebuildExpiredSettlement(s, { force: true });
+      if (rebuilt && refreshed) {
+        return {
+          ok: true,
+          rebuilt: true,
+          status: 'pending_cosign',
+          txHash: refreshed.txHash,
+          settlement: {
+            ...refreshed,
+            rebuilt: true,
+            deadlineEpochMs: getAggregateDeadlineEpochMs(refreshed.aggregatePayload),
+          },
+          message: 'Sirius L1 rejected transaction with Past_Deadline; automatically rebuilt with a fresh deadline.',
+        };
+      }
+    }
     if (errMsg.includes('Sirius node rejected transaction')) {
       clobDb.updateTradingSettlementStatus(settlementId, 'failed', completedSigned.hash, existing);
       const hasVaultLeg = Array.isArray(s.transfers) && s.transfers.some((t) => t.fromType === 'VAULT');
@@ -1432,7 +1577,11 @@ async function reconcileInFlightL1Txs() {
             if (rec) testnetClient.invalidateAccountBalanceCache(rec.trading_address);
             clobDb.updateTradingSettlementStatus(s.settlementId, 'confirmed', s.txHash, null);
           } else if (st && st.group === 'failed') {
-            clobDb.updateTradingSettlementStatus(s.settlementId, 'failed', s.txHash, null);
+            if (String(st.status || '').includes('Past_Deadline')) {
+              rebuildExpiredSettlement(s, { force: true });
+            } else {
+              clobDb.updateTradingSettlementStatus(s.settlementId, 'failed', s.txHash, null);
+            }
           }
         } catch (_) {}
       }
@@ -1451,6 +1600,10 @@ module.exports = {
   cosignWithdrawal,
   createTradeSettlement,
   submitSettlementCosignature,
+  getAggregateDeadlineEpochMs,
+  isSettlementPayloadExpired,
+  rebuildExpiredSettlement,
+  getPendingSettlementsWithAutoRebuild,
   requestBftNodeCosignatures,
   reconcileInFlightL1Txs,
   verifyOuterInitiatorSignature,

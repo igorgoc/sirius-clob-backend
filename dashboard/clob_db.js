@@ -1067,6 +1067,25 @@ function getPendingSettlementsForOwner(ownerPublicKey) {
   return rows.map(hydrateSettlementRow);
 }
 
+function getPendingSettlementsForCosigner(publicKey) {
+  const db = getDb();
+  const pkLower = String(publicKey || '').toLowerCase();
+  if (!pkLower) return [];
+  const rows = db.prepare(
+    `SELECT * FROM trading_settlements
+     WHERE status IN ('pending_cosign', 'ready', 'broadcast')
+       AND (owner_public_key = ? OR counterparty_key = ? OR LOWER(required_cosigners_json) LIKE ?)
+     ORDER BY created_at ASC`
+  ).all(pkLower, pkLower, `%${pkLower}%`);
+  return rows
+    .map(hydrateSettlementRow)
+    .filter((s) => (
+      s.ownerPublicKey === pkLower ||
+      s.counterpartyKey === pkLower ||
+      (Array.isArray(s.requiredCosigners) && s.requiredCosigners.some((r) => String(r || '').toLowerCase() === pkLower))
+    ));
+}
+
 function getAllInFlightTradingSettlements() {
   const db = getDb();
   const rows = db.prepare("SELECT * FROM trading_settlements WHERE status IN ('ready', 'broadcast')").all();
@@ -1088,6 +1107,16 @@ function updateTradingSettlementStatus(settlementId, status, txHash = null, coll
       WHERE settlement_id = ?
     `).run(status, txHash, Date.now(), settlementId);
   }
+}
+
+function updateTradingSettlementPayload(settlementId, { txHash, aggregatePayload, collectedCosigs = [], status = 'pending_cosign' }) {
+  const db = getDb();
+  db.prepare(`
+    UPDATE trading_settlements
+    SET tx_hash = ?, aggregate_payload = ?, collected_cosigs_json = ?, status = ?, updated_at = ?
+    WHERE settlement_id = ?
+  `).run(txHash, aggregatePayload, JSON.stringify(collectedCosigs), status, Date.now(), settlementId);
+  return getTradingSettlement(settlementId);
 }
 
 module.exports = {
@@ -1126,6 +1155,8 @@ module.exports = {
   saveTradingSettlement,
   getTradingSettlement,
   getPendingSettlementsForOwner,
+  getPendingSettlementsForCosigner,
   getAllInFlightTradingSettlements,
   updateTradingSettlementStatus,
+  updateTradingSettlementPayload,
 };
