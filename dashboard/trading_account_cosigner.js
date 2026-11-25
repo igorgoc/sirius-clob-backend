@@ -52,6 +52,7 @@ const testnetClient = require('./testnet2_client');
 const clobDb = require('./clob_db');
 const { NODES } = require('../executor/milestone2_verifier');
 const { supercontractserver, getOrInitNodeValidatorAccount } = require('../executor/grpc_vm_server');
+const { createGrpcClientCredentials } = require('../executor/grpc_tls');
 
 const VALIDATOR_QUORUM = 2; // 2-of-3 BFT Threshold
 const GRPC_COSIGN_TIMEOUT_MS = 6000;
@@ -63,9 +64,11 @@ const vmClientCache = new Map();
 function getVmClient(node) {
   const addr = `${node.vmHost || '127.0.0.1'}:${node.vmPort || 5051}`;
   if (!vmClientCache.has(addr)) {
+    const { credentials, channelOptions } = createGrpcClientCredentials(addr);
     const client = new supercontractserver.SupercontractServer(
       addr,
-      grpc.credentials.createInsecure()
+      credentials,
+      channelOptions
     );
     vmClientCache.set(addr, client);
   }

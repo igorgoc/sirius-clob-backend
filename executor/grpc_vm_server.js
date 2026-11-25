@@ -10,6 +10,7 @@ const crypto = require('crypto');
 const { Worker } = require('worker_threads');
 const grpc = require('@grpc/grpc-js');
 const protoLoader = require('@grpc/proto-loader');
+const { createGrpcServerCredentials } = require('./grpc_tls');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const CLUSTER_DIR = path.join(ROOT_DIR, 'cluster');
@@ -816,11 +817,20 @@ function startVmServer(port, nodeName, bindHost = process.env.SIRIUS_VM_BIND_HOS
       supercontractserver.SupercontractServer.service,
       createSupercontractService(nodeName, bindAddress)
     );
-    server.bindAsync(bindAddress, grpc.ServerCredentials.createInsecure(), (err, boundPort) => {
+    let serverCreds;
+    let tlsMode = 'insecure';
+    try {
+      const built = createGrpcServerCredentials(bindAddress);
+      serverCreds = built.credentials;
+      tlsMode = built.mode;
+    } catch (credErr) {
+      return reject(credErr);
+    }
+    server.bindAsync(bindAddress, serverCreds, (err, boundPort) => {
       if (err) {
         return reject(err);
       }
-      console.log(`🚀 [${nodeName}] SuperContract V2 gRPC WASM VM listening on ${bindHost}:${boundPort}`);
+      console.log(`🚀 [${nodeName}] SuperContract V2 gRPC WASM VM listening on ${bindHost}:${boundPort} (${tlsMode})`);
       resolve(server);
     });
   });

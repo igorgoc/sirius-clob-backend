@@ -13,6 +13,7 @@ const path = require('path');
 const crypto = require('crypto');
 const grpc = require('@grpc/grpc-js');
 const { supercontractserver } = require('./grpc_vm_server');
+const { createGrpcClientCredentials } = require('./grpc_tls');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const CLUSTER_DIR = path.join(ROOT_DIR, 'cluster');
@@ -775,9 +776,11 @@ const vmClientCache = new Map();
 function getOrCreateVmClient(targetEndpoint) {
   let client = vmClientCache.get(targetEndpoint);
   if (!client) {
+    const { credentials, channelOptions } = createGrpcClientCredentials(targetEndpoint);
     client = new supercontractserver.SupercontractServer(
       targetEndpoint,
-      grpc.credentials.createInsecure()
+      credentials,
+      channelOptions
     );
     vmClientCache.set(targetEndpoint, client);
   }
@@ -1125,9 +1128,12 @@ async function runMilestone2Verification() {
   // 2. Verify gRPC Ping liveness across all 3 WASM VMs (:5051, :5052, :5053)
   for (const node of NODES) {
     await new Promise((resolve, reject) => {
+      const pingEndpoint = `${node.vmHost || '127.0.0.1'}:${node.vmPort}`;
+      const { credentials, channelOptions } = createGrpcClientCredentials(pingEndpoint);
       const client = new supercontractserver.SupercontractServer(
-        `127.0.0.1:${node.vmPort}`,
-        grpc.credentials.createInsecure()
+        pingEndpoint,
+        credentials,
+        channelOptions
       );
       client.Ping({ name: `Executor-${node.name}` }, (err, reply) => {
         client.close();
