@@ -1678,9 +1678,13 @@ function checkWithdrawalCeiling(rawMosaicId, amountAtomic) {
   }
 }
 
-function checkAndEnforceCircuitBreaker(contextLabel = 'CLOB Operation') {
+function checkAndEnforceCircuitBreaker(contextLabel = 'CLOB Operation', options = {}) {
   loadCircuitBreakerState();
-  if (exchangeCircuitBreaker.tripped) {
+  const isNonCustodial = Boolean(options && options.isNonCustodialTradingAccount);
+  const isLegacyVaultSolvencyTrip =
+    typeof exchangeCircuitBreaker.reason === 'string' &&
+    exchangeCircuitBreaker.reason.startsWith('Solvency Sentinel Breach:');
+  if (exchangeCircuitBreaker.tripped && !(isNonCustodial && isLegacyVaultSolvencyTrip)) {
     throw new Error(
       `Exchange Circuit Breaker is TRIPPED (${exchangeCircuitBreaker.reason}). ${contextLabel} halted to protect user funds.`
     );
@@ -3603,7 +3607,13 @@ async function placeOrder(orderReq) {
 
 async function _placeOrderUnlocked(orderReq) {
   const tStart = Date.now();
-  checkAndEnforceCircuitBreaker('Order Placement');
+  let isNonCustodialCaller = false;
+  try {
+    const preKey = normalizeKey(orderReq && (orderReq.publicKey || orderReq.callerPublicKey));
+    const preAcc = preKey ? clobDb.getTradingAccountByOwner(preKey) : null;
+    isNonCustodialCaller = Boolean(preAcc && preAcc.status === 'active');
+  } catch (_) {}
+  checkAndEnforceCircuitBreaker('Order Placement', { isNonCustodialTradingAccount: isNonCustodialCaller });
   const pair = (orderReq.pair || orderReq.market || 'XPX/USDT').toUpperCase().replace('_', '/');
   const pairParts = pair.split('/');
   const baseAsset = (pairParts[0] || 'XPX').trim();
@@ -5583,7 +5593,7 @@ async function _emergencyUnlockUnlocked(req, callerKey) {
  * Protected by per-account lock & circuit breaker to prevent concurrent withdrawal/order races.
  */
 async function cosignTradingAccountWithdrawal(reqBody) {
-  checkAndEnforceCircuitBreaker('Trading Account Withdrawal');
+  checkAndEnforceCircuitBreaker('Trading Account Withdrawal', { isNonCustodialTradingAccount: true });
   const lockKey = normalizeKey((reqBody && (reqBody.callerPublicKey || reqBody.publicKey)) || 'global');
   return withAccountLock(lockKey, async () => {
     const getLocks = (ownerPk) => {
