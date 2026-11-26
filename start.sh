@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -e
+umask 077
 
 echo "=== Starting Sirius CLOB BFT Consensus Cluster ==="
+
+# Ensure cluster state directory exists with owner-only permissions before writing PIDs/keys
+mkdir -p cluster
+chmod 700 cluster
 
 # Trap termination signals to kill background processes
 cleanup() {
@@ -37,7 +42,6 @@ if [ -z "$SIRIUS_NODE_URL" ]; then
 fi
 
 echo "Starting Market Maker Daemon..."
-mkdir -p cluster
 node scripts/clob_market_maker.js --daemon > cluster/mm.log 2>&1 &
 echo $! > cluster/mm.pid
 

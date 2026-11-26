@@ -8,9 +8,45 @@
 
 let cachedPancakeOracle = null;
 let lastPancakeOracleFetch = 0;
+let consecutiveSpikeCount = 0;
 
 const PAIR_ADDRESS = '0x439B8E49F2b0d9C9824d5AB641D677511f362dA5';
 const XPX_BSC_CONTRACT = '0x6f3aaf802f57d045efdd2ac9c06d8879305542af';
+const MIN_POOL_BNB_RESERVE = 0.05;
+const MIN_POOL_XPX_RESERVE = 1000;
+const MAX_SINGLE_JUMP_RATIO = 0.50; // Reject >50% single-sample spot manipulation spike unless sustained
+
+function isPositiveFinite(v) {
+  return typeof v === 'number' && Number.isFinite(v) && v > 0;
+}
+
+function applyOracleJumpGuard(candidate) {
+  if (!isPositiveFinite(candidate.priceBnb) || !isPositiveFinite(candidate.priceUsdt)) {
+    throw new Error('Oracle returned non-finite or non-positive price');
+  }
+  if (
+    cachedPancakeOracle &&
+    !cachedPancakeOracle.isFallback &&
+    isPositiveFinite(cachedPancakeOracle.priceBnb) &&
+    isPositiveFinite(cachedPancakeOracle.priceUsdt)
+  ) {
+    const bnbDiff = Math.abs(candidate.priceBnb - cachedPancakeOracle.priceBnb) / cachedPancakeOracle.priceBnb;
+    const usdDiff = Math.abs(candidate.priceUsdt - cachedPancakeOracle.priceUsdt) / cachedPancakeOracle.priceUsdt;
+    if (bnbDiff > MAX_SINGLE_JUMP_RATIO || usdDiff > MAX_SINGLE_JUMP_RATIO) {
+      consecutiveSpikeCount += 1;
+      if (consecutiveSpikeCount < 3) {
+        console.warn(
+          `⚠️ [Oracle Guard] Rejected single-sample spot spike (bnbDiff=${(bnbDiff * 100).toFixed(1)}%, usdDiff=${(usdDiff * 100).toFixed(1)}%, count=${consecutiveSpikeCount}/3). Keeping last verified price.`
+        );
+        return { ...cachedPancakeOracle, spikeRejected: true };
+      }
+      consecutiveSpikeCount = 0;
+    } else {
+      consecutiveSpikeCount = 0;
+    }
+  }
+  return candidate;
+}
 
 async function getPancakeSwapPriceCached(forceRefresh = false) {
   const now = Date.now();
@@ -36,7 +72,18 @@ async function getPancakeSwapPriceCached(forceRefresh = false) {
     const isXpx0 = token0.toLowerCase() === XPX_BSC_CONTRACT.toLowerCase();
     const xpxReserve = isXpx0 ? Number(reserves[0]) / 1e6 : Number(reserves[1]) / 1e6;
     const bnbReserve = isXpx0 ? Number(reserves[1]) / 1e18 : Number(reserves[0]) / 1e18;
+    if (
+      !isPositiveFinite(xpxReserve) ||
+      !isPositiveFinite(bnbReserve) ||
+      xpxReserve < MIN_POOL_XPX_RESERVE ||
+      bnbReserve < MIN_POOL_BNB_RESERVE
+    ) {
+      throw new Error(`PancakeSwap pool liquidity below safety threshold (xpx=${xpxReserve}, bnb=${bnbReserve})`);
+    }
     const priceBnbPerXpx = bnbReserve / xpxReserve;
+    if (!isPositiveFinite(priceBnbPerXpx)) {
+      throw new Error(`Invalid computed priceBnbPerXpx: ${priceBnbPerXpx}`);
+    }
 
     let bnbUsd = 650;
     try {
@@ -44,8 +91,9 @@ async function getPancakeSwapPriceCached(forceRefresh = false) {
         signal: AbortSignal.timeout(3500)
       }).then(r => r.json());
 
-      if (resDex && resDex.pair && resDex.pair.priceUsd) {
-        cachedPancakeOracle = {
+      const parsedUsd = resDex && resDex.pair ? parseFloat(resDex.pair.priceUsd) : NaN;
+      if (resDex && resDex.pair && isPositiveFinite(parsedUsd)) {
+        const guarded = applyOracleJumpGuard({
           ok: true,
           source: 'PancakeSwap V2 (BSC On-Chain + DexScreener)',
           pairAddress: PAIR_ADDRESS,
@@ -54,18 +102,21 @@ async function getPancakeSwapPriceCached(forceRefresh = false) {
           xpxReserve,
           bnbReserve,
           priceBnb: priceBnbPerXpx,
-          priceUsdt: parseFloat(resDex.pair.priceUsd),
+          priceUsdt: parsedUsd,
           liquidityUsd: resDex.pair.liquidity ? resDex.pair.liquidity.usd : (bnbReserve * bnbUsd * 2),
           volume24hUsd: resDex.pair.volume ? resDex.pair.volume.h24 : 0,
           priceChange24h: resDex.pair.priceChange ? resDex.pair.priceChange.h24 : 0,
+          isFallback: false,
+          stale: false,
           timestamp: now
-        };
+        });
+        cachedPancakeOracle = guarded;
         lastPancakeOracleFetch = now;
         return cachedPancakeOracle;
       }
     } catch (_) {}
 
-    cachedPancakeOracle = {
+    const guardedOnChain = applyOracleJumpGuard({
       ok: true,
       source: 'PancakeSwap V2 (BSC On-Chain)',
       pairAddress: PAIR_ADDRESS,
@@ -75,8 +126,11 @@ async function getPancakeSwapPriceCached(forceRefresh = false) {
       bnbReserve,
       priceBnb: priceBnbPerXpx,
       priceUsdt: priceBnbPerXpx * bnbUsd,
+      isFallback: false,
+      stale: false,
       timestamp: now
-    };
+    });
+    cachedPancakeOracle = guardedOnChain;
     lastPancakeOracleFetch = now;
     return cachedPancakeOracle;
   } catch (err) {
@@ -88,27 +142,35 @@ async function getPancakeSwapPriceCached(forceRefresh = false) {
 
       if (resDex && resDex.pair) {
         const p = resDex.pair;
-        cachedPancakeOracle = {
-          ok: true,
-          source: 'DexScreener API (PancakeSwap V2 Failover)',
-          pairAddress: p.pairAddress,
-          baseToken: 'XPX',
-          quoteToken: 'WBNB',
-          priceBnb: parseFloat(p.priceNative || '0.0000001389'),
-          priceUsdt: parseFloat(p.priceUsd || '0.00007597'),
-          liquidityUsd: p.liquidity ? p.liquidity.usd : 8500,
-          volume24hUsd: p.volume ? p.volume.h24 : 500,
-          priceChange24h: p.priceChange ? p.priceChange.h24 : 0,
-          timestamp: now
-        };
-        lastPancakeOracleFetch = now;
-        return cachedPancakeOracle;
+        const parsedBnb = parseFloat(p.priceNative);
+        const parsedUsd = parseFloat(p.priceUsd);
+        const liqUsd = p.liquidity ? Number(p.liquidity.usd) : 0;
+        if (isPositiveFinite(parsedBnb) && isPositiveFinite(parsedUsd) && (!Number.isFinite(liqUsd) || liqUsd >= 100)) {
+          const guardedDex = applyOracleJumpGuard({
+            ok: true,
+            source: 'DexScreener API (PancakeSwap V2 Failover)',
+            pairAddress: p.pairAddress,
+            baseToken: 'XPX',
+            quoteToken: 'WBNB',
+            priceBnb: parsedBnb,
+            priceUsdt: parsedUsd,
+            liquidityUsd: liqUsd || 8500,
+            volume24hUsd: p.volume ? p.volume.h24 : 500,
+            priceChange24h: p.priceChange ? p.priceChange.h24 : 0,
+            isFallback: false,
+            stale: false,
+            timestamp: now
+          });
+          cachedPancakeOracle = guardedDex;
+          lastPancakeOracleFetch = now;
+          return cachedPancakeOracle;
+        }
       }
     } catch (_) {}
 
-    // 3. Fallback to last known cache or safe baseline
+    // 3. Fallback to last known cache or safe baseline (marked stale/isFallback)
     if (cachedPancakeOracle) {
-      return cachedPancakeOracle;
+      return { ...cachedPancakeOracle, stale: true };
     }
 
     cachedPancakeOracle = {
@@ -122,6 +184,8 @@ async function getPancakeSwapPriceCached(forceRefresh = false) {
       liquidityUsd: 8500,
       volume24hUsd: 500,
       priceChange24h: 0,
+      isFallback: true,
+      stale: true,
       timestamp: now
     };
     lastPancakeOracleFetch = now;

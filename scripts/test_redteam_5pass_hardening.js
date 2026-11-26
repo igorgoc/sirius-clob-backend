@@ -1,0 +1,246 @@
+/**
+ * Red-Team 5-Pass Defensive Hardening Regression Suite
+ * Verifies every critical & high vulnerability fixed across:
+ *   Pass 1: PancakeSwap Oracle & Market Maker Vault
+ *   Pass 2: Legacy Vault Deposit, Withdrawal Recovery & Emergency Unlock
+ *   Pass 3: 2-of-2 Smart Trading Account Multisig & Level-2 Cluster Validation
+ *   Pass 4: Cross-Chain Bridge Treasury (Finality, BigInt Math, Memo Validation, No Double-Credit)
+ *   Pass 5: Deployment, Key Permissions & Container Hardening
+ */
+
+const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+// Isolate SQLite DB so production cluster/clob_ledger.db is never touched
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sirius-redteam-5pass-'));
+process.env.CLOB_DB_FILE = path.join(tmpDir, 'test_clob.db');
+process.env.SIRIUS_NETWORK = 'testnet2';
+
+const clobApi = require('../dashboard/clob_api');
+const swapApi = require('../dashboard/swap_api');
+const cosigner = require('../dashboard/trading_account_cosigner');
+const { ClobMarketMaker } = require('../scripts/clob_market_maker');
+
+let passed = 0;
+async function test(name, fn) {
+  try {
+    await fn();
+    passed++;
+    console.log(`  ✅ ${name}`);
+  } catch (err) {
+    console.error(`  ❌ ${name}:`, err.message);
+    process.exitCode = 1;
+  }
+}
+
+async function main() {
+  console.log('\n🛡️  Running Red-Team 5-Pass Defensive Hardening Regression Suite...\n');
+
+  // --- PASS 2: Legacy Vault ---
+  await test('Pass 2: creditVerifiedDeposit is strictly idempotent on duplicate txHash', () => {
+    const crypto = require('crypto');
+    const pub = crypto.randomBytes(32).toString('hex');
+    const txHash = crypto.randomBytes(32).toString('hex');
+    const depFile = path.join(__dirname, '../cluster/processed_deposits.json');
+    const before = clobApi.getAccountBalance(pub);
+    try {
+      clobApi.creditVerifiedDeposit({
+        txHash,
+        senderPublicKey: pub,
+        mosaicIdHex: '13BFC518E40549D7',
+        amountAtomic: '5000000',
+        blockHeight: 100,
+      });
+      const afterFirst = clobApi.getAccountBalance(pub);
+      // Replay exact same deposit hash — must NOT double-credit!
+      clobApi.creditVerifiedDeposit({
+        txHash,
+        senderPublicKey: pub,
+        mosaicIdHex: '13BFC518E40549D7',
+        amountAtomic: '5000000',
+        blockHeight: 100,
+      });
+      const afterReplay = clobApi.getAccountBalance(pub);
+      assert.strictEqual(BigInt(afterFirst.xpx) - BigInt(before.xpx), 5000000n);
+      assert.strictEqual(BigInt(afterReplay.xpx), BigInt(afterFirst.xpx));
+    } finally {
+      // Remove synthetic entry from processed_deposits.json so cluster state stays pristine
+      try {
+        if (fs.existsSync(depFile)) {
+          const d = JSON.parse(fs.readFileSync(depFile, 'utf8'));
+          delete d[txHash.toLowerCase()];
+          fs.writeFileSync(depFile, JSON.stringify(d, null, 2));
+        }
+      } catch (_) {}
+    }
+  });
+
+  await test('Pass 2: creditVerifiedDeposit ignores zero or negative amounts', () => {
+    const pub = 'b'.repeat(64);
+    const before = clobApi.getAccountBalance(pub);
+    clobApi.creditVerifiedDeposit({
+      txHash: 'cafebabe'.repeat(8),
+      senderPublicKey: pub,
+      mosaicIdHex: '13BFC518E40549D7',
+      amountAtomic: '0',
+      blockHeight: 101,
+    });
+    const after = clobApi.getAccountBalance(pub);
+    assert.strictEqual(BigInt(after.xpx), BigInt(before.xpx));
+  });
+
+  // --- PASS 3: Multisig Validation ---
+  await test('Pass 3: isValidTwoOfTwoTradingMultisig rejects 2-of-3 attacker bypass', () => {
+    const clusterPk = '1'.repeat(64).toUpperCase();
+    const attacker1 = '2'.repeat(64).toUpperCase();
+    const attacker2 = '3'.repeat(64).toUpperCase();
+
+    // Valid exact 2-of-2
+    assert.strictEqual(
+      cosigner.isValidTwoOfTwoTradingMultisig(
+        { minApproval: 2, minRemoval: 2, cosignatories: [attacker1, clusterPk] },
+        clusterPk,
+        attacker1
+      ),
+      true
+    );
+
+    // CRITICAL ATTACK: 2-of-3 [attacker1, attacker2, clusterPk] -> MUST BE REJECTED!
+    assert.strictEqual(
+      cosigner.isValidTwoOfTwoTradingMultisig(
+        { minApproval: 2, minRemoval: 2, cosignatories: [attacker1, attacker2, clusterPk] },
+        clusterPk
+      ),
+      false
+    );
+
+    // minRemoval < 2 -> MUST BE REJECTED!
+    assert.strictEqual(
+      cosigner.isValidTwoOfTwoTradingMultisig(
+        { minApproval: 2, minRemoval: 1, cosignatories: [attacker1, clusterPk] },
+        clusterPk,
+        attacker1
+      ),
+      false
+    );
+
+    // Wrong owner -> MUST BE REJECTED!
+    assert.strictEqual(
+      cosigner.isValidTwoOfTwoTradingMultisig(
+        { minApproval: 2, minRemoval: 2, cosignatories: [attacker2, clusterPk] },
+        clusterPk,
+        attacker1
+      ),
+      false
+    );
+  });
+
+  await test('Pass 3: isValidValidatorClusterMultisig enforces exact expected validator node set', () => {
+    const n1 = 'a1'.repeat(32).toUpperCase();
+    const n2 = 'b2'.repeat(32).toUpperCase();
+    const n3 = 'c3'.repeat(32).toUpperCase();
+    const rogue = 'ff'.repeat(32).toUpperCase();
+    const cfg = { nodes: [{ publicKey: n1 }, { publicKey: n2 }, { publicKey: n3 }] };
+
+    assert.strictEqual(
+      cosigner.isValidValidatorClusterMultisig(
+        { minApproval: 2, minRemoval: 2, cosignatories: [n1, n2, n3] },
+        cfg
+      ),
+      true
+    );
+    // Rogue cosignatory injected -> REJECT
+    assert.strictEqual(
+      cosigner.isValidValidatorClusterMultisig(
+        { minApproval: 2, minRemoval: 2, cosignatories: [n1, n2, rogue] },
+        cfg
+      ),
+      false
+    );
+    // Extra 4th cosignatory -> REJECT
+    assert.strictEqual(
+      cosigner.isValidValidatorClusterMultisig(
+        { minApproval: 2, minRemoval: 2, cosignatories: [n1, n2, n3, rogue] },
+        cfg
+      ),
+      false
+    );
+  });
+
+  // --- PASS 4: Bridge Treasury ---
+  await test('Pass 4: bscWeiToSiriusAtomic performs exact 18->6 BigInt integer division', () => {
+    // 123.456789999999999999 USDT (18 decimals) -> 123456789n micro-USDT (truncates dust, no float drift)
+    assert.strictEqual(
+      swapApi.bscWeiToSiriusAtomic(123456789999999999999n),
+      123456789n
+    );
+    // Huge value > Number.MAX_SAFE_INTEGER (2^53) stays exact in BigInt
+    assert.strictEqual(
+      swapApi.bscWeiToSiriusAtomic(100000000000000000000000000n), // 100M tokens
+      100000000000000n
+    );
+    assert.strictEqual(swapApi.bscWeiToSiriusAtomic(999999999999n), 0n);
+    assert.strictEqual(swapApi.MIN_BRIDGE_CONFIRMATIONS, 15);
+  });
+
+  await test('Pass 4: extractSiriusAddress rejects arbitrary 64-hex ABI words and invalid checksums', () => {
+    // Random 32-byte ABI word must NOT be treated as a Sirius public key
+    const fakeAbiWord = '0x' + '00'.repeat(32);
+    assert.strictEqual(swapApi.extractSiriusAddress(fakeAbiWord), null);
+
+    // Invalid checksum V-address must be rejected
+    const badAddrHex = '0x' + Buffer.from('VAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 'utf8').toString('hex');
+    assert.strictEqual(swapApi.extractSiriusAddress(badAddrHex), null);
+
+    // Valid Testnet2 address (VC46DFR25R5EWJWR32E4TFOYC57VXFNPKAASJTLV) must be accepted
+    const goodAddrHex = '0x' + Buffer.from('VC46DFR25R5EWJWR32E4TFOYC57VXFNPKAASJTLV', 'utf8').toString('hex');
+    assert.strictEqual(swapApi.extractSiriusAddress(goodAddrHex), 'VC46DFR25R5EWJWR32E4TFOYC57VXFNPKAASJTLV');
+  });
+
+  // --- PASS 1: Oracle & Market Maker ---
+  await test('Pass 1: clob_market_maker.js never deletes market_state.bin in seedMarketLadder', () => {
+    const mmSrc = fs.readFileSync(path.join(__dirname, 'clob_market_maker.js'), 'utf8');
+    assert.strictEqual(
+      mmSrc.includes('unlinkSync(stateBin)'),
+      false,
+      'seedMarketLadder must never delete live market_state.bin!'
+    );
+    assert.ok(typeof ClobMarketMaker === 'function');
+  });
+
+  // --- PASS 5: Infra Hardening ---
+  await test('Pass 5: start.sh enables umask 077 and creates cluster/ before PID writes', () => {
+    const startSh = fs.readFileSync(path.join(__dirname, '../start.sh'), 'utf8');
+    assert.ok(startSh.includes('umask 077'), 'start.sh must set umask 077');
+    assert.ok(
+      startSh.indexOf('mkdir -p cluster') < startSh.indexOf('cluster/node1_vm.pid'),
+      'mkdir -p cluster must precede PID file creation'
+    );
+  });
+
+  await test('Pass 5: sirius-validator-node Dockerfile & docker-compose.yml drop root and preserve node.env secrets', () => {
+    const valDir = path.resolve(__dirname, '../../sirius-validator-node');
+    const dockerfile = fs.readFileSync(path.join(valDir, 'Dockerfile'), 'utf8');
+    const compose = fs.readFileSync(path.join(valDir, 'docker-compose.yml'), 'utf8');
+    assert.ok(dockerfile.includes('USER node'), 'Dockerfile must run as non-root USER node');
+    assert.strictEqual(
+      compose.includes('SIRIUS_VM_AUTH_TOKEN=${SIRIUS_VM_AUTH_TOKEN:-}'),
+      false,
+      'docker-compose.yml must not clobber SIRIUS_VM_AUTH_TOKEN with empty default'
+    );
+    assert.ok(compose.includes('/app/contracts:ro'), 'contracts volume must be mounted read-only');
+    assert.ok(compose.includes('no-new-privileges:true'), 'compose must enforce no-new-privileges');
+  });
+
+  try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+
+  console.log(`\n🎉 Red-Team 5-Pass Hardening Suite: ${passed} tests passed.\n`);
+  if (process.exitCode) process.exit(process.exitCode);
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

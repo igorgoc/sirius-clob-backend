@@ -5000,17 +5000,64 @@ async function resumeBroadcastAndConfirm(record, withdrawReq = {}) {
     };
   }
 
+  // Pre-broadcast idempotency check: if a previous attempt already recorded a txHash,
+  // verify on-chain status before ever broadcasting a second transfer.
+  if (record.txHash) {
+    try {
+      const existingOnChain = await queryTxWithTestnet2Fallback(record.txHash);
+      if (existingOnChain && existingOnChain.ok && (existingOnChain.confirmed || existingOnChain.found)) {
+        record.status = existingOnChain.height > 0 ? 'confirmed' : 'broadcast';
+        if (existingOnChain.height > 0) {
+          record.blockHeight = existingOnChain.height;
+          record.confirmedAt = Date.now();
+        }
+        saveWithdrawals();
+        return {
+          ok: true,
+          success: true,
+          status: record.status,
+          mosaicId: record.mosaicId,
+          amount: record.amount,
+          amountAtomic: record.amountAtomic,
+          txHash: record.txHash,
+          onChainTxHash: record.txHash,
+          blockHeight: record.blockHeight,
+          recovered: true,
+          balances: getAccountBalance(record.callerKey),
+        };
+      }
+    } catch (_) {}
+  }
+
   let onChainTxHash = null;
-  if (fs.existsSync(path.join(CLUSTER_DIR, 'vault_account.json'))) {
+  const hasVaultKey =
+    fs.existsSync(path.join(CLUSTER_DIR, 'vault_account.json')) ||
+    Boolean(process.env.SIRIUS_VAULT_PRIVATE_KEY);
+
+  if (hasVaultKey) {
     try {
       const t2Client = require('./testnet2_client');
       const t2Config = require('./testnet2_config');
       const vault = t2Client.getOrInitVaultAccount();
-      const recipientAddr = withdrawReq.recipient || record.recipient || Address.createFromPublicKey(record.callerKey, t2Config.NETWORK_TYPE).plain();
+      // Security: Never allow retry payload to override the originally signed recipient
+      const recipientAddr =
+        record.recipient ||
+        Address.createFromPublicKey(record.callerKey, t2Config.NETWORK_TYPE).plain();
       let t2MosaicHex = t2Config.XPX_MOSAIC_ID;
       if (String(record.mosaicId) === USDT_MOSAIC_ID) t2MosaicHex = t2Config.USDT_MOSAIC_ID;
       if (String(record.mosaicId) === BNB_MOSAIC_ID) t2MosaicHex = t2Config.BNB_MOSAIC_ID;
-      const bRes = await t2Client.broadcastVaultTransfer(vault, recipientAddr, t2MosaicHex, BigInt(record.amountAtomic), 'CLOB_WITHDRAW_RECOVERY');
+      // Security: Always pay netPayoutAtomic (after withdrawal fee), never gross amountAtomic
+      const payoutAtomic = BigInt(record.netPayoutAtomic || record.amountAtomic);
+      record.recoveryAttempts = (record.recoveryAttempts || 0) + 1;
+      record.lastRecoveryAt = Date.now();
+      saveWithdrawals();
+      const bRes = await t2Client.broadcastVaultTransfer(
+        vault,
+        recipientAddr,
+        t2MosaicHex,
+        payoutAtomic,
+        'CLOB_WITHDRAW_RECOVERY'
+      );
       onChainTxHash = bRes.txHash;
     } catch (settleErr) {
       console.error('Warning: Sirius L1 withdrawal broadcast failed during recovery:', settleErr.message);
@@ -5154,11 +5201,17 @@ async function _withdrawTokensUnlocked(withdrawReq) {
     const reqAmountStr = amountAtomic.toString();
     const reqMosaicId = mosaicId;
 
-    // Strict same-nonce-different-payload check:
-    if (existing.amountAtomic !== reqAmountStr || existing.mosaicId !== reqMosaicId) {
+    // Strict same-nonce-different-payload check (including recipient binding):
+    const reqRecipient = sigInfo.recipient || null;
+    if (
+      existing.amountAtomic !== reqAmountStr ||
+      existing.mosaicId !== reqMosaicId ||
+      (existing.recipient || null) !== reqRecipient
+    ) {
       throw new Error(
         `Same-nonce replay rejected: Payload does not match initial withdrawal request for nonce ${nonce}. ` +
-        `Existing: (${existing.mosaicId}, ${existing.amountAtomic} atomic) vs Submitted: (${reqMosaicId}, ${reqAmountStr} atomic). ` +
+        `Existing: (${existing.mosaicId}, ${existing.amountAtomic} atomic, recipient=${existing.recipient || 'self'}) vs ` +
+        `Submitted: (${reqMosaicId}, ${reqAmountStr} atomic, recipient=${reqRecipient || 'self'}). ` +
         `Nonce reuse with altered payload is strictly forbidden.`
       );
     }
@@ -5479,7 +5532,15 @@ function creditVerifiedDeposit(deposit) {
   }
   const mosaicIdHex = (deposit.mosaicIdHex || '').toLowerCase().replace(/^0x/, '');
   const amount = BigInt(deposit.amountAtomic || 0n);
+  if (amount <= 0n) {
+    return getAccountBalance(senderKey);
+  }
   const txHash = String(deposit.txHash || crypto.randomBytes(32).toString('hex')).toLowerCase();
+
+  // Security: Exactly-once idempotency guard — never double-credit an already processed txHash
+  if (processedDeposits.has(txHash)) {
+    return getAccountBalance(senderKey);
+  }
 
   processedDeposits.set(txHash, {
     txHash,
@@ -5551,6 +5612,15 @@ async function _emergencyUnlockUnlocked(req, callerKey) {
 
   const unlockMsg = `${DOMAIN_SEPARATOR}:EMERGENCY_UNLOCK:${callerKey}:${nonce}:${expiry}`;
   verifyEd25519Signature(callerKey, unlockMsg, req.signature);
+
+  // Non-custodial Smart Trading Account funds live on L1 (2-of-2 multisig), not in the legacy vault
+  const activeSmartAcc = clobDb.getTradingAccountByOwner(callerKey);
+  if (activeSmartAcc && activeSmartAcc.status === 'active') {
+    throw new Error(
+      `Your account uses a non-custodial 2-of-2 Smart Trading Account (${activeSmartAcc.trading_address}). Use co-signed withdrawal instead of legacy vault emergency unlock.`
+    );
+  }
+
   checkAndRecordNonce(callerKey, nonce, expiry);
 
   const currentHeight = getLatestCommittedHeight('node1');
@@ -5599,7 +5669,15 @@ async function _emergencyUnlockUnlocked(req, callerKey) {
         const mosaicId = payloadBuf.readBigUInt64LE(48);
         const payoutAmount = payloadBuf.readBigUInt64LE(56);
         if (payoutAmount > 0n) {
-          const mosaicHex = mosaicId.toString(16).toUpperCase().padStart(16, '0');
+          const mosaicIdDec = mosaicId.toString(10);
+          // Enforce 24-hour global withdrawal ceiling on emergency unlock payouts too
+          checkWithdrawalCeiling(mosaicIdDec, payoutAmount);
+          let mosaicHex = testnet2Config.XPX_MOSAIC_ID || '13BFC518E40549D7';
+          if (mosaicIdDec === USDT_MOSAIC_ID) mosaicHex = testnet2Config.USDT_MOSAIC_ID;
+          else if (mosaicIdDec === BNB_MOSAIC_ID) mosaicHex = testnet2Config.BNB_MOSAIC_ID;
+          else if (mosaicIdDec !== XPX_MOSAIC_ID) {
+            mosaicHex = mosaicId.toString(16).toUpperCase().padStart(16, '0');
+          }
           try {
             const txRes = await testnet2Client.broadcastVaultTransfer(
               vault,
@@ -5609,6 +5687,23 @@ async function _emergencyUnlockUnlocked(req, callerKey) {
               `CLOB_EMERGENCY_UNLOCK:${contractCallId}`
             );
             broadcastedTxHashes.push(txRes.txHash);
+            // Record emergency unlock payout in withdrawals ledger for accurate net-deposit accounting
+            const unlockKey = `${callerKey.toLowerCase()}:emergency:${nonce}:${mosaicIdDec}`;
+            withdrawals.set(unlockKey, {
+              id: unlockKey,
+              callerKey,
+              recipient: recipientAddr,
+              mosaicId: mosaicIdDec,
+              amount: formatAtomicUnits(payoutAmount, 6),
+              amountAtomic: payoutAmount.toString(),
+              netPayout: formatAtomicUnits(payoutAmount, 6),
+              netPayoutAtomic: payoutAmount.toString(),
+              nonce: String(nonce),
+              status: 'broadcast',
+              broadcastAt: Date.now(),
+              txHash: txRes.txHash,
+            });
+            saveWithdrawals();
           } catch (e) {
             console.error('Emergency unlock broadcast error:', e.message);
           }

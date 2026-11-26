@@ -237,6 +237,37 @@ async function findFundedBackendSponsor(xpxHex, minBalanceAtomic = 700_000n) {
   return null;
 }
 
+function isValidValidatorClusterMultisig(msObj, cfg) {
+  if (!msObj || !Array.isArray(msObj.cosignatories)) return false;
+  if (Number(msObj.minApproval) < VALIDATOR_QUORUM || Number(msObj.minRemoval) < VALIDATOR_QUORUM) {
+    return false;
+  }
+  const onChainCosigs = new Set(msObj.cosignatories.map((c) => String(c).toUpperCase()));
+  const expectedNodes = (cfg && Array.isArray(cfg.nodes) ? cfg.nodes : [])
+    .map((n) => String(n.publicKey || '').toUpperCase())
+    .filter((pk) => /^[0-9A-F]{64}$/.test(pk));
+  if (expectedNodes.length < VALIDATOR_QUORUM) return false;
+  // Every expected validator node must be registered, and no unexpected extra cosignatories
+  if (onChainCosigs.size !== expectedNodes.length) return false;
+  return expectedNodes.every((pk) => onChainCosigs.has(pk));
+}
+
+function isValidTwoOfTwoTradingMultisig(msObj, clusterPubHex, expectedOwnerPubHex = null) {
+  if (!msObj || !Array.isArray(msObj.cosignatories)) return false;
+  if (Number(msObj.minApproval) !== 2 || Number(msObj.minRemoval) !== 2) return false;
+  const cosigs = msObj.cosignatories.map((c) => String(c).toUpperCase());
+  // CRITICAL: Strictly require EXACTLY 2 cosignatories (blocks 2-of-3 Attacker1+Attacker2+Cluster bypass!)
+  if (cosigs.length !== 2) return false;
+  const clusterUpper = String(clusterPubHex || '').toUpperCase();
+  if (!cosigs.includes(clusterUpper)) return false;
+  const otherCosig = cosigs.find((pk) => pk !== clusterUpper);
+  if (!otherCosig || !/^[0-9A-F]{64}$/.test(otherCosig)) return false;
+  if (expectedOwnerPubHex && otherCosig !== String(expectedOwnerPubHex).toUpperCase()) {
+    return false;
+  }
+  return true;
+}
+
 /**
  * Verify that the Level 2 Validator Cluster Account is converted to 2-of-3 multisig on Sirius L1.
  * Never broadcasts an unfunded transaction: returns { ok: false, needsFunding: true } if no sponsor has >= 0.7 XPX.
@@ -245,11 +276,11 @@ async function ensureValidatorClusterOnChain(waitForConfirmation = true) {
   const cfg = getOrInitValidatorClusterConfig();
   const clusterAddr = cfg.clusterAddress;
 
-  // 1. Check live L1 multisig status
+  // 1. Check live L1 multisig status (must match exact threshold AND expected validator node cosignatories)
   try {
     const nodeUrl = testnetClient.getActiveNodeUrl();
     const info = await testnetClient.fetchJson(`${nodeUrl}/account/${clusterAddr}/multisig`, 4000);
-    if (info && info.multisig && info.multisig.minApproval >= 2 && Array.isArray(info.multisig.cosignatories)) {
+    if (info && isValidValidatorClusterMultisig(info.multisig, cfg)) {
       if (!cfg.isMultisigConfirmedOnChain) {
         cfg.isMultisigConfirmedOnChain = true;
         delete cfg.bootstrapPrivateKey;
@@ -295,7 +326,7 @@ async function ensureValidatorClusterOnChain(waitForConfirmation = true) {
           await new Promise((r) => setTimeout(r, 2500));
           try {
             const info = await testnetClient.fetchJson(`${testnetClient.getActiveNodeUrl()}/account/${clusterAddr}/multisig`, 3000);
-            if (info && info.multisig && info.multisig.minApproval >= 2) {
+            if (info && isValidValidatorClusterMultisig(info.multisig, cfg)) {
               cfg.isMultisigConfirmedOnChain = true;
               delete cfg.bootstrapPrivateKey;
               try {
@@ -419,7 +450,7 @@ async function ensureValidatorClusterOnChain(waitForConfirmation = true) {
       await new Promise((r) => setTimeout(r, 2500));
       try {
         const info = await testnetClient.fetchJson(`${testnetClient.getActiveNodeUrl()}/account/${clusterAddr}/multisig`, 3000);
-        if (info && info.multisig && info.multisig.minApproval >= 2) {
+        if (info && isValidValidatorClusterMultisig(info.multisig, cfg)) {
           cfg.isMultisigConfirmedOnChain = true;
           delete cfg.bootstrapPrivateKey;
           try {
@@ -649,14 +680,17 @@ async function discoverTradingAccountStatus(ownerPublicKeyOrAddress, existingLoc
     record = clobDb.getTradingAccountByTradingKey(ownerPublicKey || ownerAddress);
   }
 
-  // If record is 'pending', check if confirmed on-chain
+  // If record is 'pending', check if confirmed on-chain with exact 2-of-2 [owner, cluster] cosignatories
   if (record && record.status === 'pending') {
     try {
       const msInfo = await testnetClient.fetchJson(
         `${testnetClient.getActiveNodeUrl()}/account/${record.trading_address}/multisig`,
         3000
       );
-      if (msInfo && msInfo.multisig && msInfo.multisig.minApproval >= 2) {
+      if (
+        msInfo &&
+        isValidTwoOfTwoTradingMultisig(msInfo.multisig, cfg.clusterPublicKey, record.owner_public_key)
+      ) {
         clobDb.updateTradingAccountStatus(record.trading_public_key, 'active', record.activation_tx_hash);
         record = clobDb.getTradingAccountByTradingKey(record.trading_public_key);
       }
@@ -672,7 +706,7 @@ async function discoverTradingAccountStatus(ownerPublicKeyOrAddress, existingLoc
       const inputCosigs = ((msObj && msObj.cosignatories) || []).map((c) => String(c).toUpperCase());
 
       // Case 1: Queried directly with the 2-of-2 Trading Account address/publicKey
-      if (msObj && msObj.minApproval === 2 && inputCosigs.includes(cfg.clusterPublicKey.toUpperCase())) {
+      if (isValidTwoOfTwoTradingMultisig(msObj, cfg.clusterPublicKey)) {
         const realOwnerPk = inputCosigs.find((pk) => pk !== cfg.clusterPublicKey.toUpperCase());
         const tradingPk = (msObj.account && String(msObj.account).length === 64 ? String(msObj.account) : ownerPublicKey) || '';
         if (realOwnerPk && tradingPk) {
@@ -697,13 +731,9 @@ async function discoverTradingAccountStatus(ownerPublicKeyOrAddress, existingLoc
           const candAddr = Address.createFromPublicKey(candPub, config.NETWORK_TYPE).plain();
           try {
             const candMs = await testnetClient.fetchJson(`${nodeUrl}/account/${candAddr}/multisig`, 3500);
-            const cosigs = ((candMs && candMs.multisig && candMs.multisig.cosignatories) || []).map((c) =>
-              String(c).toUpperCase()
-            );
-            if (
-              candMs.multisig.minApproval === 2 &&
-              cosigs.includes(cfg.clusterPublicKey.toUpperCase())
-            ) {
+            const candMsObj = candMs && candMs.multisig;
+            if (isValidTwoOfTwoTradingMultisig(candMsObj, cfg.clusterPublicKey, ownerPublicKey || null)) {
+              const cosigs = candMsObj.cosignatories.map((c) => String(c).toUpperCase());
               const otherPk = cosigs.find((pk) => pk !== cfg.clusterPublicKey.toUpperCase()) || ownerPublicKey;
               record = clobDb.saveTradingAccount({
                 tradingPublicKey: candPub.toLowerCase(),
@@ -886,6 +916,8 @@ async function computeTradingAccountBalances(record, lockedOverrides = null, for
   };
 }
 
+const activationLocks = new Map();
+
 /**
  * Activate a User's Native 2-of-2 Co-Signed Smart Trading Account on Sirius L1.
  */
@@ -901,127 +933,149 @@ async function activateTradingAccount(reqBody) {
   if (!signedByInitiatorPayload || !tradingAccountCosig || !ownerPublicKey || !tradingAccountPublicKey) {
     throw new Error('Missing required fields: signedByInitiatorPayload, tradingAccountCosig, ownerPublicKey, tradingAccountPublicKey');
   }
-
-  const existingStatus = await discoverTradingAccountStatus(ownerPublicKey);
-  if (
-    existingStatus &&
-    existingStatus.hasTradingAccount &&
-    existingStatus.tradingAccount &&
-    (existingStatus.status === 'active' || existingStatus.status === 'pending')
-  ) {
-    throw new Error(
-      `Account already has an ${existingStatus.status} Smart Trading Account (${existingStatus.tradingAccount.tradingAddress}).`
-    );
+  if (!/^[0-9a-fA-F]{64}$/.test(String(ownerPublicKey)) || !/^[0-9a-fA-F]{64}$/.test(String(tradingAccountPublicKey))) {
+    throw new Error('Invalid ownerPublicKey or tradingAccountPublicKey: expected 64-character hex');
+  }
+  if (ownerPublicKey.toUpperCase() === tradingAccountPublicKey.toUpperCase()) {
+    throw new Error('tradingAccountPublicKey must be distinct from ownerPublicKey');
   }
 
-  // Ensure Level 2 Validator Cluster is ready on-chain first
-  const clusterBoot = await ensureValidatorClusterOnChain(true);
-  if (!clusterBoot.ok) {
-    return {
-      ok: false,
-      needsFunding: Boolean(clusterBoot.needsFunding),
-      clusterAddress: clusterBoot.clusterAddress,
-      requiredAtomic: clusterBoot.requiredAtomic || '500000',
-      error: clusterBoot.message || 'Level-2 Validator Cluster is not yet ready on-chain.',
-    };
-  }
-  const cfg = getOrInitValidatorClusterConfig();
-
-  const { txHashHex, initiatorPubHex } = verifyOuterInitiatorSignature(signedByInitiatorPayload);
-
-  // Decode & inspect inner ModifyMultisigAccountTransaction
-  const decoded = TransactionMapping.createFromPayload(signedByInitiatorPayload);
-  if (decoded.type !== TransactionType.AGGREGATE_COMPLETE_V1) {
-    throw new Error(`Expected AGGREGATE_COMPLETE_V1, got type ${decoded.type}`);
-  }
-  if (!Array.isArray(decoded.innerTransactions) || decoded.innerTransactions.length !== 1) {
-    throw new Error('Activation aggregate must contain strictly 1 ModifyMultisigAccountTransaction');
-  }
-  const inner = decoded.innerTransactions[0];
-  if (inner.type !== TransactionType.MODIFY_MULTISIG_ACCOUNT) {
-    throw new Error('Inner transaction must be MODIFY_MULTISIG_ACCOUNT');
-  }
-  if (!inner.signer || inner.signer.publicKey.toUpperCase() !== tradingAccountPublicKey.toUpperCase()) {
-    throw new Error('ModifyMultisigAccountTransaction signer must be tradingAccountPublicKey');
-  }
-  if (inner.minApprovalDelta !== 2 || inner.minRemovalDelta !== 2) {
-    throw new Error(`Invalid thresholds: expected 2-of-2 (got ${inner.minApprovalDelta}/${inner.minRemovalDelta})`);
-  }
-
-  const modPks = (inner.modifications || []).map((m) => {
-    if (m.type !== 0) throw new Error('Only Add modifications allowed during Trading Account activation');
-    return m.cosignatoryPublicAccount.publicKey.toUpperCase();
-  });
-  if (
-    modPks.length !== 2 ||
-    !modPks.includes(ownerPublicKey.toUpperCase()) ||
-    !modPks.includes(cfg.clusterPublicKey.toUpperCase())
-  ) {
-    throw new Error('Trading Account cosignatories must strictly match [ownerPublicKey, validatorClusterPublicKey]');
-  }
-
-  // Verify tradingAccountCosig and optional ownerCosig
-  const verifiedTradingCosig = verifyCosignatureObject(
-    tradingAccountCosig,
-    signedByInitiatorPayload,
-    tradingAccountPublicKey
-  );
-
-  const clientCosigs = [verifiedTradingCosig];
-  if (initiatorPubHex !== ownerPublicKey.toUpperCase()) {
-    if (!ownerCosig) {
-      throw new Error('ownerCosig required when initiator is not ownerPublicKey');
+  return withKeyedLock(activationLocks, ownerPublicKey.toLowerCase(), async () => {
+    const existingTrading = clobDb.getTradingAccountByTradingKey(tradingAccountPublicKey);
+    if (existingTrading && (existingTrading.status === 'active' || existingTrading.status === 'pending')) {
+      throw new Error(`Trading Account ${tradingAccountPublicKey} is already registered (${existingTrading.status}).`);
     }
-    clientCosigs.push(verifyCosignatureObject(ownerCosig, signedByInitiatorPayload, ownerPublicKey));
-  }
 
-  // Collect 2-of-3 BFT cosignatures across independent Validator Servers over gRPC
-  const validatorCosigs = await requestBftNodeCosignatures({
-    action: 'ACTIVATE_TRADING_ACCOUNT',
-    aggregatePayloadHex: signedByInitiatorPayload,
-    callerPublicKey: ownerPublicKey,
-    tradingAccountPublicKey,
-    metadata: {
-      ownerPublicKey,
-      validatorClusterPublicKey: cfg.clusterPublicKey,
-    },
+    const existingStatus = await discoverTradingAccountStatus(ownerPublicKey);
+    if (
+      existingStatus &&
+      existingStatus.hasTradingAccount &&
+      existingStatus.tradingAccount &&
+      (existingStatus.status === 'active' || existingStatus.status === 'pending')
+    ) {
+      throw new Error(
+        `Account already has an ${existingStatus.status} Smart Trading Account (${existingStatus.tradingAccount.tradingAddress}).`
+      );
+    }
+
+    // Ensure Level 2 Validator Cluster is ready on-chain first
+    const clusterBoot = await ensureValidatorClusterOnChain(true);
+    if (!clusterBoot.ok) {
+      return {
+        ok: false,
+        needsFunding: Boolean(clusterBoot.needsFunding),
+        clusterAddress: clusterBoot.clusterAddress,
+        requiredAtomic: clusterBoot.requiredAtomic || '500000',
+        error: clusterBoot.message || 'Level-2 Validator Cluster is not yet ready on-chain.',
+      };
+    }
+    const cfg = getOrInitValidatorClusterConfig();
+    if (
+      ownerPublicKey.toUpperCase() === cfg.clusterPublicKey.toUpperCase() ||
+      tradingAccountPublicKey.toUpperCase() === cfg.clusterPublicKey.toUpperCase()
+    ) {
+      throw new Error('ownerPublicKey and tradingAccountPublicKey must be distinct from validatorClusterPublicKey');
+    }
+
+    const { txHashHex, initiatorPubHex } = verifyOuterInitiatorSignature(signedByInitiatorPayload);
+
+    // Decode & inspect inner ModifyMultisigAccountTransaction
+    const decoded = TransactionMapping.createFromPayload(signedByInitiatorPayload);
+    if (decoded.type !== TransactionType.AGGREGATE_COMPLETE_V1) {
+      throw new Error(`Expected AGGREGATE_COMPLETE_V1, got type ${decoded.type}`);
+    }
+    if (decoded.networkType !== config.NETWORK_TYPE) {
+      throw new Error(`Network mismatch: expected ${config.NETWORK_TYPE}, got ${decoded.networkType}`);
+    }
+    if (!Array.isArray(decoded.innerTransactions) || decoded.innerTransactions.length !== 1) {
+      throw new Error('Activation aggregate must contain strictly 1 ModifyMultisigAccountTransaction');
+    }
+    const inner = decoded.innerTransactions[0];
+    if (inner.type !== TransactionType.MODIFY_MULTISIG_ACCOUNT) {
+      throw new Error('Inner transaction must be MODIFY_MULTISIG_ACCOUNT');
+    }
+    if (!inner.signer || inner.signer.publicKey.toUpperCase() !== tradingAccountPublicKey.toUpperCase()) {
+      throw new Error('ModifyMultisigAccountTransaction signer must be tradingAccountPublicKey');
+    }
+    if (inner.minApprovalDelta !== 2 || inner.minRemovalDelta !== 2) {
+      throw new Error(`Invalid thresholds: expected 2-of-2 (got ${inner.minApprovalDelta}/${inner.minRemovalDelta})`);
+    }
+
+    const modPks = (inner.modifications || []).map((m) => {
+      if (m.type !== 0) throw new Error('Only Add modifications allowed during Trading Account activation');
+      return m.cosignatoryPublicAccount.publicKey.toUpperCase();
+    });
+    if (
+      modPks.length !== 2 ||
+      !modPks.includes(ownerPublicKey.toUpperCase()) ||
+      !modPks.includes(cfg.clusterPublicKey.toUpperCase())
+    ) {
+      throw new Error('Trading Account cosignatories must strictly match [ownerPublicKey, validatorClusterPublicKey]');
+    }
+
+    // Verify tradingAccountCosig and optional ownerCosig
+    const verifiedTradingCosig = verifyCosignatureObject(
+      tradingAccountCosig,
+      signedByInitiatorPayload,
+      tradingAccountPublicKey
+    );
+
+    const clientCosigs = [verifiedTradingCosig];
+    if (initiatorPubHex !== ownerPublicKey.toUpperCase()) {
+      if (!ownerCosig) {
+        throw new Error('ownerCosig required when initiator is not ownerPublicKey');
+      }
+      clientCosigs.push(verifyCosignatureObject(ownerCosig, signedByInitiatorPayload, ownerPublicKey));
+    }
+
+    // Collect 2-of-3 BFT cosignatures across independent Validator Servers over gRPC
+    const validatorCosigs = await requestBftNodeCosignatures({
+      action: 'ACTIVATE_TRADING_ACCOUNT',
+      aggregatePayloadHex: signedByInitiatorPayload,
+      callerPublicKey: ownerPublicKey,
+      tradingAccountPublicKey,
+      metadata: {
+        ownerPublicKey,
+        validatorClusterPublicKey: cfg.clusterPublicKey,
+      },
+    });
+
+    const finalCosigs = combineAndDedupeCosignatures(signedByInitiatorPayload, initiatorPubHex, [
+      ...clientCosigs,
+      ...validatorCosigs,
+    ]);
+
+    const completedSigned = BuilderAgg.appendSignaturesV1(
+      { payload: signedByInitiatorPayload, hash: txHashHex },
+      finalCosigs
+    );
+
+    await testnetClient.announceSignedTransaction(completedSigned);
+    await testnetClient.verifyTransactionAccepted(completedSigned.hash, 8000);
+
+    const tradingAddress = Address.createFromPublicKey(tradingAccountPublicKey, config.NETWORK_TYPE).plain();
+    const ownerAddress = Address.createFromPublicKey(ownerPublicKey, config.NETWORK_TYPE).plain();
+
+    const saved = clobDb.saveTradingAccount({
+      tradingPublicKey: tradingAccountPublicKey.toLowerCase(),
+      tradingAddress,
+      ownerPublicKey: ownerPublicKey.toLowerCase(),
+      ownerAddress,
+      validatorClusterPublicKey: cfg.clusterPublicKey.toLowerCase(),
+      validatorClusterAddress: cfg.clusterAddress,
+      minApproval: 2,
+      activationTxHash: completedSigned.hash,
+      status: 'pending',
+    });
+
+    return {
+      ok: true,
+      txHash: completedSigned.hash,
+      status: 'pending',
+      tradingAccount: saved,
+      approvedByNodes: validatorCosigs.map((v) => v.nodeName),
+    };
   });
-
-  const finalCosigs = combineAndDedupeCosignatures(signedByInitiatorPayload, initiatorPubHex, [
-    ...clientCosigs,
-    ...validatorCosigs,
-  ]);
-
-  const completedSigned = BuilderAgg.appendSignaturesV1(
-    { payload: signedByInitiatorPayload, hash: txHashHex },
-    finalCosigs
-  );
-
-  await testnetClient.announceSignedTransaction(completedSigned);
-  await testnetClient.verifyTransactionAccepted(completedSigned.hash, 8000);
-
-  const tradingAddress = Address.createFromPublicKey(tradingAccountPublicKey, config.NETWORK_TYPE).plain();
-  const ownerAddress = Address.createFromPublicKey(ownerPublicKey, config.NETWORK_TYPE).plain();
-
-  const saved = clobDb.saveTradingAccount({
-    tradingPublicKey: tradingAccountPublicKey.toLowerCase(),
-    tradingAddress,
-    ownerPublicKey: ownerPublicKey.toLowerCase(),
-    ownerAddress,
-    validatorClusterPublicKey: cfg.clusterPublicKey.toLowerCase(),
-    validatorClusterAddress: cfg.clusterAddress,
-    minApproval: 2,
-    activationTxHash: completedSigned.hash,
-    status: 'pending',
-  });
-
-  return {
-    ok: true,
-    txHash: completedSigned.hash,
-    status: 'pending',
-    tradingAccount: saved,
-    approvedByNodes: validatorCosigs.map((v) => v.nodeName),
-  };
 }
 
 const withdrawalLocks = new Map();
@@ -1680,4 +1734,6 @@ module.exports = {
   reconcileInFlightL1Txs,
   verifyOuterInitiatorSignature,
   verifyCosignatureObject,
+  isValidValidatorClusterMultisig,
+  isValidTwoOfTwoTradingMultisig,
 };

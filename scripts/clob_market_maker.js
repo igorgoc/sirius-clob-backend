@@ -180,22 +180,43 @@ class ClobMarketMaker {
     }
     try {
       const data = await getPancakeSwapPriceCached(force);
-      if (data && data.priceUsdt && data.priceBnb) {
+      if (
+        data &&
+        !data.isFallback &&
+        !data.stale &&
+        Number.isFinite(data.priceUsdt) &&
+        data.priceUsdt > 0 &&
+        Number.isFinite(data.priceBnb) &&
+        data.priceBnb > 0
+      ) {
         this.oracleData = data;
         this.lastOracleCheck = now;
 
-        // Calculate mid prices anchored to PancakeSwap
-        const usdtTicks = Math.round(data.priceUsdt * 1e8);
-        const bnbTicks = Math.round(data.priceBnb * 1e8);
+        // Calculate mid prices anchored to PancakeSwap with ±15% single-step circuit-breaker clamp
+        const rawUsdtTicks = Math.round(data.priceUsdt * 1e8);
+        const rawBnbTicks = Math.round(data.priceBnb * 1e8);
 
-        // Snap to tick size
-        this.markets.xpx_usdt.currentMidPrice = Math.max(
+        const clampMid = (prev, next, minFloor, tickSize) => {
+          let target = next;
+          if (!force && prev > 0) {
+            const maxStep = Math.max(tickSize, Math.round(prev * 0.15));
+            if (target > prev + maxStep) target = prev + maxStep;
+            if (target < prev - maxStep) target = prev - maxStep;
+          }
+          return Math.max(minFloor, Math.round(target / tickSize) * tickSize);
+        };
+
+        this.markets.xpx_usdt.currentMidPrice = clampMid(
+          this.markets.xpx_usdt.currentMidPrice,
+          rawUsdtTicks,
           200,
-          Math.round(usdtTicks / this.markets.xpx_usdt.tickSize) * this.markets.xpx_usdt.tickSize
+          this.markets.xpx_usdt.tickSize
         );
-        this.markets.xpx_bnb.currentMidPrice = Math.max(
+        this.markets.xpx_bnb.currentMidPrice = clampMid(
+          this.markets.xpx_bnb.currentMidPrice,
+          rawBnbTicks,
           2,
-          Math.round(bnbTicks / this.markets.xpx_bnb.tickSize) * this.markets.xpx_bnb.tickSize
+          this.markets.xpx_bnb.tickSize
         );
       }
     } catch (err) {
@@ -302,7 +323,17 @@ class ClobMarketMaker {
     let needReseed = Boolean(forceReseed);
     if (!needReseed) {
       const existing = this.getCanonicalMarketDepth(marketKey);
-      if (existing && existing.bids && existing.bids.length >= 2 && existing.asks && existing.asks.length >= 2) {
+      if (
+        existing &&
+        existing.bids &&
+        existing.bids.length >= 2 &&
+        existing.asks &&
+        existing.asks.length >= 2 &&
+        Number.isFinite(existing.best_bid) &&
+        Number.isFinite(existing.best_ask) &&
+        existing.best_bid > 0 &&
+        existing.best_ask > existing.best_bid
+      ) {
         const existingMid = Math.floor((existing.best_bid + existing.best_ask) / 2);
         // Check if existing book price deviates wildly (>25%) from PancakeSwap oracle price
         const priceDiffRatio = Math.abs(existingMid - m.currentMidPrice) / m.currentMidPrice;
@@ -311,7 +342,7 @@ class ClobMarketMaker {
           m.currentMidPrice = existingMid;
           needReseed = false;
         } else {
-          console.log(`⚠️ [${m.symbol}] Existing book price (${existingMid}) deviates ${(priceDiffRatio * 100).toFixed(1)}% from PancakeSwap (${m.currentMidPrice}). Purging stale book for fresh alignment...`);
+          console.log(`⚠️ [${m.symbol}] Existing book price (${existingMid}) deviates ${(priceDiffRatio * 100).toFixed(1)}% from PancakeSwap (${m.currentMidPrice}). Replenishing quotes non-destructively...`);
           needReseed = true;
         }
       } else {
@@ -322,15 +353,11 @@ class ClobMarketMaker {
     if (needReseed) {
       console.log(`🌊 [${m.symbol}] Seeding fresh ${m.levels}-level Bid & Ask ladder centered at PancakeSwap ($${(m.currentMidPrice / 1e8).toFixed(6)})...`);
 
-      // Clear ONLY market_state.bin on all nodes if a clean book reset is needed.
-      // NEVER delete trades.json, trades.bin, or depth.json!
+      // Security: NEVER delete market_state.bin during normal operation — it holds live user limit orders!
+      // Only ensure market directories exist and place fresh MM liquidity non-destructively.
       for (const node of NODES) {
         const mDir = path.join(CLUSTER_DIR, node.name, 'data', 'drives', DRIVE_KEY_HEX, 'drive', 'markets', marketKey);
         fs.mkdirSync(mDir, { recursive: true });
-        try {
-          const stateBin = path.join(mDir, 'market_state.bin');
-          if (fs.existsSync(stateBin)) fs.unlinkSync(stateBin);
-        } catch (_) {}
       }
       this.syncDriveReplicas();
 

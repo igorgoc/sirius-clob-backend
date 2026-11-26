@@ -117,6 +117,50 @@ const TOKENS_CONFIG = {
  * Extract recipient Sirius address from raw EVM input/memo data
  */
 const inFlightTxs = new Set();
+const MIN_BRIDGE_CONFIRMATIONS = 15;
+const BSC_TO_SIRIUS_SCALE = 1_000_000_000_000n; // 10^(18 - 6)
+
+function bscWeiToSiriusAtomic(weiBigInt) {
+  const wei = typeof weiBigInt === 'bigint' ? weiBigInt : BigInt(weiBigInt || 0n);
+  if (wei <= 0n) return 0n;
+  return wei / BSC_TO_SIRIUS_SCALE;
+}
+
+function getSiriusSdk() {
+  try {
+    return require('tsjs-xpx-chain-sdk');
+  } catch (_) {
+    try {
+      return require(path.resolve(__dirname, '../../web-wallet-vuejs/node_modules/tsjs-xpx-chain-sdk'));
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+function isValidSiriusAddressForActiveNetwork(rawAddr) {
+  const clean = String(rawAddr || '').replace(/[- ]/g, '').trim().toUpperCase();
+  const expectedPrefix = config.NETWORK_TYPE === 184 ? 'X' : 'V';
+  if (!clean.startsWith(expectedPrefix) || !/^[VX][A-Z2-7]{39}$/.test(clean)) {
+    return false;
+  }
+  const sdk = getSiriusSdk();
+  if (sdk && sdk.Address) {
+    try {
+      if (sdk.RawAddress && typeof sdk.RawAddress.isValidAddress === 'function') {
+        if (!sdk.RawAddress.isValidAddress(sdk.RawAddress.stringToAddress(clean))) {
+          return false;
+        }
+      }
+      const parsed = sdk.Address.createFromRawAddress(clean);
+      if (parsed.networkType !== (config.NETWORK_TYPE || 168)) return false;
+      return parsed.plain() === clean;
+    } catch (_) {
+      return false;
+    }
+  }
+  return true;
+}
 
 function extractSiriusAddress(input) {
   if (!input || typeof input !== 'string') return null;
@@ -129,45 +173,36 @@ function extractSiriusAddress(input) {
     hex = hex.slice(136);
   }
 
-  try {
-    const text = Buffer.from(hex, 'hex').toString('utf8');
-    const cleanMatch = text.match(/\b([VX][A-Z0-9]{39})\b/i);
-    if (cleanMatch) {
-      return cleanMatch[1].toUpperCase();
-    }
-    const dashedMatch = text.match(/\b([VX][A-Z0-9]{5}-[A-Z0-9]{6}-[A-Z0-9]{6}-[A-Z0-9]{6}-[A-Z0-9]{6}-[A-Z0-9]{6}-[A-Z0-9]{4})\b/i);
-    if (dashedMatch) {
-      return dashedMatch[1].replace(/-/g, '').toUpperCase();
-    }
-  } catch (_) {}
+  const expectedPrefix = config.NETWORK_TYPE === 184 ? 'X' : 'V';
+  const cleanRegex = new RegExp(`\\b(${expectedPrefix}[A-Z2-7]{39})\\b`, 'i');
+  const dashedRegex = new RegExp(
+    `\\b(${expectedPrefix}[A-Z2-7]{5}-[A-Z2-7]{6}-[A-Z2-7]{6}-[A-Z2-7]{6}-[A-Z2-7]{6}-[A-Z2-7]{6}-[A-Z2-7]{4})\\b`,
+    'i'
+  );
 
-  try {
-    const ascii = Buffer.from(hex, 'hex').toString('ascii');
-    const m = ascii.match(/\b([VX][A-Z0-9]{39})\b/i);
-    if (m) {
-      return m[1].toUpperCase();
-    }
-    const mDashed = ascii.match(/\b([VX][A-Z0-9]{5}-[A-Z0-9]{6}-[A-Z0-9]{6}-[A-Z0-9]{6}-[A-Z0-9]{6}-[A-Z0-9]{6}-[A-Z0-9]{4})\b/i);
-    if (mDashed) {
-      return mDashed[1].replace(/-/g, '').toUpperCase();
-    }
-  } catch (_) {}
-
-  // 64-character Ed25519 public key hex fallback (isolated hex word)
-  try {
-    const pkMatch = hex.match(/\b([a-fA-F0-9]{64})\b/);
-    if (pkMatch) {
-      let sdk;
-      try {
-        sdk = require('tsjs-xpx-chain-sdk');
-      } catch (_) {
-        sdk = require(path.resolve(__dirname, '../../web-wallet-vuejs/node_modules/tsjs-xpx-chain-sdk'));
+  for (const encoding of ['utf8', 'ascii']) {
+    try {
+      const text = Buffer.from(hex, 'hex').toString(encoding);
+      const cleanMatch = text.match(cleanRegex);
+      if (cleanMatch) {
+        const candidate = cleanMatch[1].toUpperCase();
+        if (isValidSiriusAddressForActiveNetwork(candidate)) return candidate;
       }
-      if (sdk && sdk.Address) {
-        return sdk.Address.createFromPublicKey(pkMatch[1], config.NETWORK_TYPE || 168).plain();
+      const dashedMatch = text.match(dashedRegex);
+      if (dashedMatch) {
+        const candidate = dashedMatch[1].replace(/-/g, '').toUpperCase();
+        if (isValidSiriusAddressForActiveNetwork(candidate)) return candidate;
       }
-    }
-  } catch (_) {}
+      // Explicit PUB:<64-hex> memo format (never match arbitrary 32-byte ABI words)
+      const pubMatch = text.match(/\bPUB:([a-fA-F0-9]{64})\b/i);
+      if (pubMatch) {
+        const sdk = getSiriusSdk();
+        if (sdk && sdk.Address) {
+          return sdk.Address.createFromPublicKey(pubMatch[1], config.NETWORK_TYPE || 168).plain();
+        }
+      }
+    } catch (_) {}
+  }
 
   return null;
 }
@@ -175,7 +210,7 @@ function extractSiriusAddress(input) {
 /**
  * Deliver backed tokens on Sirius Testnet 2 from Treasury to the user's personal wallet
  */
-async function deliverTokensOnSirius(recipientAddress, tokenName, amountTokens, bscTxHash) {
+async function deliverTokensOnSirius(recipientAddress, tokenName, amountTokens, bscTxHash, amountAtomicOverride = null) {
   try {
     const treasuryAccount = testnetClient.getOrInitTreasuryAccount();
     if (!treasuryAccount) {
@@ -185,7 +220,14 @@ async function deliverTokensOnSirius(recipientAddress, tokenName, amountTokens, 
 
     const key = (tokenName || 'usdt').toLowerCase();
     const token = TOKENS_CONFIG[key] || TOKENS_CONFIG.usdt;
-    const atomicUnits = BigInt(Math.floor(Number(amountTokens) * 1e6));
+    let atomicUnits;
+    if (typeof amountAtomicOverride === 'bigint') {
+      atomicUnits = amountAtomicOverride;
+    } else if (typeof amountAtomicOverride === 'string' && /^\d+$/.test(amountAtomicOverride)) {
+      atomicUnits = BigInt(amountAtomicOverride);
+    } else {
+      atomicUnits = BigInt(Math.floor(Number(amountTokens) * 1e6));
+    }
     if (atomicUnits <= 0n) {
       console.warn(`[Bridge Relayer] Cannot deliver 0 amount of ${tokenName}`);
       return null;
@@ -291,9 +333,11 @@ async function verifyBscOnChainTx(txHash) {
     const isSuccess = receipt.status === '0x1';
 
     let nativeBnbValue = 0;
+    let nativeBnbWei = 0n;
     if (txDetails && txDetails.value && txDetails.value !== '0x0') {
       try {
-        nativeBnbValue = Number(BigInt(txDetails.value)) / 1e18;
+        nativeBnbWei = BigInt(txDetails.value);
+        nativeBnbValue = Number(bscWeiToSiriusAtomic(nativeBnbWei)) / 1e6;
       } catch (_) {}
     }
 
@@ -303,10 +347,11 @@ async function verifyBscOnChainTx(txHash) {
       txBlock,
       currentBlock,
       confirmations,
-      confirmed: isSuccess && confirmations >= 1,
+      confirmed: isSuccess && confirmations >= MIN_BRIDGE_CONFIRMATIONS,
       from: receipt.from || (txDetails && txDetails.from),
       to: receipt.to || (txDetails && txDetails.to),
       valueBnb: nativeBnbValue,
+      valueWei: nativeBnbWei.toString(),
       contractAddress: receipt.contractAddress,
       logs: Array.isArray(receipt.logs) ? receipt.logs : [],
       logsCount: receipt.logs ? receipt.logs.length : 0,
@@ -356,20 +401,33 @@ async function autoCreditTx(tx, blockNumber) {
       return;
     }
 
-    // Verify transaction receipt status === '0x1' so reverted BSC txs are never credited
-    const receipt = await queryBscRpc('eth_getTransactionReceipt', [tx.hash]);
+    // Verify transaction receipt status === '0x1' AND minimum BSC finality confirmations
+    const [receipt, currentBlockHex] = await Promise.all([
+      queryBscRpc('eth_getTransactionReceipt', [tx.hash]),
+      queryBscRpc('eth_blockNumber', []),
+    ]);
     if (!receipt || receipt.status !== '0x1') {
+      return;
+    }
+    const txBlockNum = receipt.blockNumber ? parseInt(receipt.blockNumber, 16) : blockNumber;
+    const latestBlockNum = currentBlockHex ? parseInt(currentBlockHex, 16) : 0;
+    const confirmations = Number.isFinite(latestBlockNum) && Number.isFinite(txBlockNum)
+      ? Math.max(0, latestBlockNum - txBlockNum)
+      : 0;
+    if (confirmations < MIN_BRIDGE_CONFIRMATIONS) {
       return;
     }
 
     let tokenName = 'BNB';
     let transferAmount = 0;
+    let transferAtomicSirius = 0n;
 
     if (tx.to && tx.to.toLowerCase() === BRIDGE_SINK_ADDRESS.toLowerCase()) {
       tokenName = 'BNB';
       if (tx.value && tx.value !== '0x0') {
         try {
-          transferAmount = Number(BigInt(tx.value)) / 1e18;
+          transferAtomicSirius = bscWeiToSiriusAtomic(BigInt(tx.value));
+          transferAmount = Number(transferAtomicSirius) / 1e6;
         } catch (_) {}
       }
     } else if (tx.to && tx.to.toLowerCase() === BSC_TESTNET_USDT_CONTRACT.toLowerCase()) {
@@ -399,11 +457,12 @@ async function autoCreditTx(tx, blockNumber) {
         }
       }
       if (totalLogAtomic > 0n) {
-        transferAmount = Number(totalLogAtomic) / 1e18;
+        transferAtomicSirius = bscWeiToSiriusAtomic(totalLogAtomic);
+        transferAmount = Number(transferAtomicSirius) / 1e6;
       }
     }
 
-    if (transferAmount <= 0) return;
+    if (transferAtomicSirius <= 0n || transferAmount <= 0) return;
 
     // Enforce 24-hour bridge limit and circuit breaker
     try {
@@ -432,10 +491,10 @@ async function autoCreditTx(tx, blockNumber) {
     const swapId = 'AUTO-BSC-' + Date.now();
     const timestamp = new Date().toISOString();
 
-    // Deliver backed tokens on Sirius Testnet 2
+    // Deliver backed tokens on Sirius Testnet 2 using exact BigInt atomic units
     let siriusTxHash = null;
     try {
-      siriusTxHash = await deliverTokensOnSirius(recipient, tokenName, transferAmount, tx.hash);
+      siriusTxHash = await deliverTokensOnSirius(recipient, tokenName, transferAmount, tx.hash, transferAtomicSirius);
     } catch (err) {
       console.error(`[Bridge Relayer] autoCreditTx on-chain delivery error:`, err.message);
     }
@@ -456,8 +515,8 @@ async function autoCreditTx(tx, blockNumber) {
       token: tokenName,
       status: 'CONFIRMED',
       onChain: true,
-      confirmations: 15,
-      blockNumber,
+      confirmations,
+      blockNumber: txBlockNum,
       autoDetected: true,
       siriusTxHash,
     };
@@ -481,8 +540,9 @@ async function startAutoRelayer() {
   try {
     const currentHex = await queryBscRpc('eth_blockNumber', []);
     if (currentHex) {
-      lastScannedBlock = Math.max(0, parseInt(currentHex, 16) - 5);
-      console.log(`[Bridge Relayer] Starting block indexer from block #${lastScannedBlock}`);
+      const tip = parseInt(currentHex, 16);
+      lastScannedBlock = Math.max(0, tip - MIN_BRIDGE_CONFIRMATIONS - 5);
+      console.log(`[Bridge Relayer] Starting finalized block indexer from block #${lastScannedBlock} (tip #${tip}, minConf=${MIN_BRIDGE_CONFIRMATIONS})`);
     }
   } catch (err) {
     console.error('[Bridge Relayer] Init error:', err.message);
@@ -498,16 +558,17 @@ async function startAutoRelayer() {
       }
       const currentBlock = parseInt(currentHex, 16);
       if (!Number.isFinite(currentBlock)) return;
+      const finalizedBlock = Math.max(0, currentBlock - MIN_BRIDGE_CONFIRMATIONS);
       if (lastScannedBlock === null) {
-        lastScannedBlock = Math.max(0, currentBlock - 5);
-        console.log(`[Bridge Relayer] Lazy-initialized block indexer at block #${lastScannedBlock}`);
+        lastScannedBlock = Math.max(0, finalizedBlock - 5);
+        console.log(`[Bridge Relayer] Lazy-initialized finalized block indexer at block #${lastScannedBlock}`);
         return;
       }
-      if (currentBlock <= lastScannedBlock) {
+      if (finalizedBlock <= lastScannedBlock) {
         return;
       }
 
-      const endBlock = Math.min(currentBlock, lastScannedBlock + 5);
+      const endBlock = Math.min(finalizedBlock, lastScannedBlock + 5);
       for (let b = lastScannedBlock + 1; b <= endBlock; b++) {
         const block = await queryBscRpc('eth_getBlockByNumber', ['0x' + b.toString(16), true]);
         if (block && block.transactions) {
@@ -689,6 +750,7 @@ const swapApi = {
 
       // Verify Destination Sink & Derive Transfer Amount Authority directly from On-Chain state
       let transferAmount = 0;
+      let transferAtomicSirius = 0n;
       let verifiedToken = tokenConfig.name;
 
       const toAddr = (onChainResult.to || '').toLowerCase();
@@ -698,48 +760,41 @@ const swapApi = {
       if (toAddr === sinkAddr) {
         // Native BNB deposit to sink
         verifiedToken = 'BNB';
-        transferAmount = onChainResult.valueBnb;
-        if (!transferAmount || transferAmount <= 0) {
+        if (onChainResult.valueWei) {
+          transferAtomicSirius = bscWeiToSiriusAtomic(BigInt(onChainResult.valueWei));
+          transferAmount = Number(transferAtomicSirius) / 1e6;
+        } else {
+          transferAmount = Number(onChainResult.valueBnb) || 0;
+          transferAtomicSirius = BigInt(Math.floor(transferAmount * 1e6));
+        }
+        if (transferAtomicSirius <= 0n || !transferAmount || transferAmount <= 0) {
           throw new Error(`Native BNB deposit transaction contains 0 BNB value`);
         }
       } else if (toAddr === usdtContract) {
-        // ERC20 USDT transfer to sink: prefer verified on-chain Transfer event logs from receipt
+        // ERC20 USDT transfer to sink: strictly require verified Transfer event logs from receipt
         verifiedToken = 'USDT';
         const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
-        if (Array.isArray(onChainResult.logs)) {
-          let totalLogAtomic = 0n;
-          for (const log of onChainResult.logs) {
-            if (!log || !Array.isArray(log.topics) || log.topics.length < 3) continue;
-            if (String(log.address || '').toLowerCase() !== usdtContract) continue;
-            if (String(log.topics[0] || '').toLowerCase() !== TRANSFER_TOPIC) continue;
-            const logRecipient = '0x' + String(log.topics[2] || '').slice(-40).toLowerCase();
-            if (logRecipient !== sinkAddr) continue;
-            try {
-              totalLogAtomic += BigInt(log.data || '0x0');
-            } catch (_) {}
-          }
-          if (totalLogAtomic <= 0n) {
-            throw new Error(`No verified ERC-20 Transfer log to Bridge Sink (${sinkAddr}) found in transaction receipt`);
-          }
-          transferAmount = Number(totalLogAtomic) / 1e18;
-        } else {
-          const input = onChainResult.input || '';
-          if (!input.toLowerCase().startsWith('0xa9059cbb')) {
-            throw new Error(`USDT contract interaction is not a standard transfer() call`);
-          }
-          const recipientParam = '0x' + input.slice(34, 74).toLowerCase();
-          if (recipientParam !== sinkAddr) {
-            throw new Error(`USDT transfer recipient (${recipientParam}) does not match Bridge Sink (${sinkAddr})`);
-          }
+        if (!Array.isArray(onChainResult.logs)) {
+          throw new Error(`Transaction receipt missing verified event logs for USDT transfer`);
+        }
+        let totalLogAtomic = 0n;
+        for (const log of onChainResult.logs) {
+          if (!log || !Array.isArray(log.topics) || log.topics.length < 3) continue;
+          if (String(log.address || '').toLowerCase() !== usdtContract) continue;
+          if (String(log.topics[0] || '').toLowerCase() !== TRANSFER_TOPIC) continue;
+          const logRecipient = '0x' + String(log.topics[2] || '').slice(-40).toLowerCase();
+          if (logRecipient !== sinkAddr) continue;
           try {
-            const valHex = '0x' + input.slice(74, 138);
-            transferAmount = Number(BigInt(valHex)) / 1e18;
-          } catch (_) {
-            throw new Error(`Failed to decode USDT transfer amount from input data`);
-          }
-          if (!transferAmount || transferAmount <= 0) {
-            throw new Error(`USDT transfer amount must be strictly greater than 0`);
-          }
+            totalLogAtomic += BigInt(log.data || '0x0');
+          } catch (_) {}
+        }
+        if (totalLogAtomic <= 0n) {
+          throw new Error(`No verified ERC-20 Transfer log to Bridge Sink (${sinkAddr}) found in transaction receipt`);
+        }
+        transferAtomicSirius = bscWeiToSiriusAtomic(totalLogAtomic);
+        transferAmount = Number(transferAtomicSirius) / 1e6;
+        if (transferAtomicSirius <= 0n) {
+          throw new Error(`USDT transfer amount is below minimum Sirius atomic precision (0.000001 USDT)`);
         }
       } else {
         throw new Error(`Transaction target ${onChainResult.to} is neither the Bridge Sink nor the USDT Contract`);
@@ -780,10 +835,16 @@ const swapApi = {
         targetRecipient = normClaimRecipient;
       }
 
-      // Deliver backed tokens on Sirius Testnet 2
+      // Deliver backed tokens on Sirius Testnet 2 using exact BigInt atomic units
       let siriusTxHash = null;
       try {
-        siriusTxHash = await deliverTokensOnSirius(targetRecipient, verifiedToken, transferAmount, txnHash);
+        siriusTxHash = await deliverTokensOnSirius(
+          targetRecipient,
+          verifiedToken,
+          transferAmount,
+          txnHash,
+          transferAtomicSirius
+        );
       } catch (err) {
         console.error('[Bridge Relayer] processTransfer on-chain delivery error:', err.message);
       }
@@ -819,26 +880,9 @@ const swapApi = {
       }
       clobDb.saveBridgeSwapRecord(record);
 
-      // Update local trading balance in CLOB
-      let targetKey = payload.publicKey || targetRecipient;
-      if (targetKey && targetKey.length !== 64 && typeof clobApi.resolvePublicKeyFromAddress === 'function') {
-        const resolved = clobApi.resolvePublicKeyFromAddress(targetKey);
-        if (resolved) targetKey = resolved;
-      }
-      if (targetKey) {
-        try {
-          clobApi.updateAccountBalance(targetKey, (bal) => {
-            const atomicUnits = BigInt(Math.floor(Number(transferAmount) * 1e6));
-            if (verifiedToken === 'BNB') {
-              bal.bnb = (bal.bnb || 0n) + atomicUnits;
-            } else {
-              bal.usdt = (bal.usdt || 0n) + atomicUnits;
-            }
-          }, { source: 'BRIDGE_DELIVERY' });
-        } catch (err) {
-          console.warn('[Bridge Relayer] Could not update local trading balance:', err.message);
-        }
-      }
+      // Security: Do NOT also credit the legacy CLOB Vault balance here — tokens were already
+      // delivered directly to the user's personal Sirius L1 wallet via deliverTokensOnSirius().
+      // Crediting local CLOB balance here would double-credit the bridge deposit.
 
       return {
         transactionId: swapId,
@@ -944,19 +988,7 @@ const swapApi = {
     history.unshift(record);
     saveSwapHistory(history);
 
-    // Credit Sirius balance
-    if (targetAddress) {
-      try {
-        clobApi.updateAccountBalance(targetAddress, (bal) => {
-          const atomicUnits = BigInt(Math.floor(Number(finalAmount) * 1e6));
-          if (tokenConfig.name === 'BNB') {
-            bal.bnb = (bal.bnb || 0n) + atomicUnits;
-          } else {
-            bal.usdt = (bal.usdt || 0n) + atomicUnits;
-          }
-        }, { source: 'BRIDGE_DELIVERY' });
-      } catch (_) {}
-    }
+    // Security: Do NOT also credit local CLOB Vault balance — faucet tokens are delivered on Sirius L1.
 
     return {
       ok: true,
@@ -978,6 +1010,9 @@ const swapApi = {
   MAX_SINGLE_BRIDGE_TRANSFER,
   BRIDGE_SINK_ADDRESS,
   BSC_TESTNET_USDT_CONTRACT,
+  MIN_BRIDGE_CONFIRMATIONS,
+  bscWeiToSiriusAtomic,
+  extractSiriusAddress,
 };
 
 module.exports = swapApi;
