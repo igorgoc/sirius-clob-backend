@@ -4689,6 +4689,31 @@ async function claimFaucet(publicKey, addressOverride = null) {
   }
   const callerKey = normalizeKey(publicKey).toLowerCase();
   let recipientAddress = addressOverride;
+  let deliveredToTradingAccount = false;
+
+  // If the user has an active 2-of-2 Smart Trading Account, send faucet coins directly
+  // to their Trading Account so they can trade immediately without a manual Top-Up step!
+  let activeTradingAcc = null;
+  if (callerKey && callerKey.length === 64) {
+    try {
+      const acc = clobDb.getTradingAccountByOwner(callerKey);
+      if (acc && acc.status === 'active' && acc.trading_address) {
+        activeTradingAcc = acc;
+      }
+    } catch (_) {}
+  }
+
+  if (activeTradingAcc) {
+    const cleanOverride = typeof recipientAddress === 'string'
+      ? recipientAddress.replace(/[- ]/g, '').toUpperCase()
+      : '';
+    const cleanOwner = String(activeTradingAcc.owner_address || '').replace(/[- ]/g, '').toUpperCase();
+    const cleanTrading = String(activeTradingAcc.trading_address).replace(/[- ]/g, '').toUpperCase();
+    if (!cleanOverride || cleanOverride === cleanOwner || cleanOverride === cleanTrading) {
+      recipientAddress = activeTradingAcc.trading_address;
+      deliveredToTradingAccount = true;
+    }
+  }
 
   if (!recipientAddress || typeof recipientAddress !== 'string') {
     if (callerKey && callerKey.length === 64) {
@@ -4760,12 +4785,14 @@ async function claimFaucet(publicKey, addressOverride = null) {
 
   global.faucetClaimsMap.set(recipientAddress, now);
   clobDb.recordFaucetClaim(recipientAddress, amountXpx, now);
+  if (typeof testnetClient.invalidateAccountBalanceCache === 'function') {
+    testnetClient.invalidateAccountBalanceCache(recipientAddress);
+  }
 
   // Immediately credit CLOB internal trading ledger for instant zero-friction exchange trading
-  const userPubKey = callerKey && callerKey.length === 64 ? callerKey : normalizeKey(faucetReq.publicKey || faucetReq.callerPublicKey);
-  if (userPubKey && userPubKey.length === 64) {
+  if (callerKey && callerKey.length === 64) {
     try {
-      updateAccountBalance(userPubKey, (b) => {
+      updateAccountBalance(callerKey, (b) => {
         b.xpx = BigInt(b.xpx || 0n) + BigInt(amountXpx) * 1_000_000n;
         b.usdt = BigInt(b.usdt || 0n) + BigInt(amountUsdt) * 1_000_000n;
         b.bnb = BigInt(b.bnb || 0n) + BigInt(Math.round(amountBnb * 1_000_000));
@@ -4778,10 +4805,11 @@ async function claimFaucet(publicKey, addressOverride = null) {
     success: true,
     txHash: signedTx.hash,
     recipient: recipientAddress,
+    deliveredToTradingAccount,
     amountXpx,
     amountUsdt,
     amountBnb,
-    message: `Delivered ${amountXpx} XPX, ${amountUsdt} USDT, and ${amountBnb} BNB on-chain to ${recipientAddress}`,
+    message: `Delivered ${amountXpx} XPX, ${amountUsdt} USDT, and ${amountBnb} BNB on-chain to ${deliveredToTradingAccount ? 'Trading Account ' : ''}${recipientAddress}`,
   };
 }
 
