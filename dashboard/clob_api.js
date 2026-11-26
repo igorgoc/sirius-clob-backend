@@ -1099,7 +1099,7 @@ function getOpenOrders(publicKey, pair = null) {
   const normTargetPair = pair ? normalizePair(pair) : null;
   const list = [];
   for (const o of activeOrders.values()) {
-    if ((!callerKey || o.callerKey.toLowerCase() === callerKey) && o.status === 'Open') {
+    if ((!callerKey || o.callerKey.toLowerCase() === callerKey) && (o.status === 'Open' || o.status === 'PartiallyFilled')) {
       if (!normTargetPair || normalizePair(o.pair) === normTargetPair) {
         list.push(o);
       }

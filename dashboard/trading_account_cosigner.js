@@ -55,7 +55,7 @@ const { supercontractserver, getOrInitNodeValidatorAccount } = require('../execu
 const { createGrpcClientCredentials } = require('../executor/grpc_tls');
 
 const VALIDATOR_QUORUM = 2; // 2-of-3 BFT Threshold
-const GRPC_COSIGN_TIMEOUT_MS = 6000;
+const GRPC_COSIGN_TIMEOUT_MS = Number(process.env.GRPC_COSIGN_TIMEOUT_MS || 15000);
 const DEFAULT_CLUSTER_SEED = process.env.DRIVE_KEY_HEX || 'bd1d100a98c34f62e170a8395b4498dc1e730286f5a12c489b37d01562f0cb23';
 let cachedClusterCfg = null;
 let lastClusterProbeAt = 0;
