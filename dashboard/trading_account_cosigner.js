@@ -984,8 +984,12 @@ async function activateTradingAccount(reqBody) {
     if (decoded.type !== TransactionType.AGGREGATE_COMPLETE_V1) {
       throw new Error(`Expected AGGREGATE_COMPLETE_V1, got type ${decoded.type}`);
     }
-    if (decoded.networkType !== config.NETWORK_TYPE) {
-      throw new Error(`Network mismatch: expected ${config.NETWORK_TYPE}, got ${decoded.networkType}`);
+    const decodedNetworkType =
+      decoded.networkType !== undefined
+        ? decoded.networkType
+        : (decoded.version && decoded.version.networkType);
+    if (decodedNetworkType !== config.NETWORK_TYPE) {
+      throw new Error(`Network mismatch: expected ${config.NETWORK_TYPE}, got ${decodedNetworkType}`);
     }
     if (!Array.isArray(decoded.innerTransactions) || decoded.innerTransactions.length !== 1) {
       throw new Error('Activation aggregate must contain strictly 1 ModifyMultisigAccountTransaction');
