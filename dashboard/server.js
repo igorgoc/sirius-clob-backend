@@ -18,6 +18,8 @@ const { defaultBatchSettlerTestnet2: defaultBatchSettler } = require('./batch_se
 const l1Config = require('./testnet2_config');
 const testnet2Config = l1Config;
 const l1Client = require('./testnet2_client');
+const { attachClobWebSocketHub } = require('./ws_hub');
+let clobWsHub = null;
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8088;
 const ROOT_DIR = path.resolve(__dirname, '..');
@@ -1514,6 +1516,12 @@ const server = http.createServer((req, res) => {
       .then(async (body) => {
         try {
           const result = await clobApi.placeOrder(body);
+          if (clobWsHub) {
+            clobWsHub.broadcastMarketUpdate(body?.pair || body?.market || 'xpx_usdt', { force: true });
+            if (body?.publicKey || body?.callerPublicKey) {
+              clobWsHub.notifyUserEvent(body.publicKey || body.callerPublicKey, 'order_updated', { orderId: result?.orderId });
+            }
+          }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(result));
         } catch (err) {
@@ -1534,6 +1542,12 @@ const server = http.createServer((req, res) => {
       .then(async (body) => {
         try {
           const result = await clobApi.cancelOrder(body);
+          if (clobWsHub) {
+            clobWsHub.broadcastMarketUpdate(body?.pair || body?.market || 'xpx_usdt', { force: true });
+            if (body?.publicKey || body?.callerPublicKey) {
+              clobWsHub.notifyUserEvent(body.publicKey || body.callerPublicKey, 'order_updated', { cancelled: true });
+            }
+          }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(result));
         } catch (err) {
@@ -1556,6 +1570,10 @@ const server = http.createServer((req, res) => {
       .then(async (body) => {
         try {
           const result = await clobApi.batchCancelOrders(body);
+          if (clobWsHub) {
+            clobWsHub.broadcastMarketUpdate('xpx_usdt', { force: true });
+            clobWsHub.broadcastMarketUpdate('xpx_bnb', { force: true });
+          }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(result));
         } catch (err) {
@@ -1578,6 +1596,10 @@ const server = http.createServer((req, res) => {
       .then(async (body) => {
         try {
           const result = await clobApi.cancelAllOrders(body);
+          if (clobWsHub) {
+            clobWsHub.broadcastMarketUpdate('xpx_usdt', { force: true });
+            clobWsHub.broadcastMarketUpdate('xpx_bnb', { force: true });
+          }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(result));
         } catch (err) {
@@ -3448,6 +3470,18 @@ server.listen(PORT, HOST, () => {
     }
   } catch (vmInitErr) {
     console.warn('[BFT Engine] Embedded VM startup skipped:', vmInitErr.message);
+  }
+
+  // Attach Real-Time WebSocket Streaming Hub (/ws/clob)
+  try {
+    clobWsHub = attachClobWebSocketHub(server, {
+      clusterDir: CLUSTER_DIR,
+      clobApi,
+      enrichTradeWithTimestamp,
+    });
+    console.log('[WebSocket Hub] Real-time CLOB streaming active on /ws/clob');
+  } catch (wsErr) {
+    console.warn('[WebSocket Hub] Could not attach WebSocket server:', wsErr.message);
   }
 
   // Start autonomous BSC Testnet block watcher & relayer

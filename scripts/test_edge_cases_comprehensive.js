@@ -444,6 +444,45 @@ async function runTests() {
       assert(elapsed < 500, `Cached /trades responses should be fast (took ${elapsed}ms)`);
 
       console.log(`✅ Test 7 passed: HTTP Gateway CORS, malformed Host, 2MB DoS protection & cached hot reads (${elapsed}ms)`);
+
+      // ========================================================================
+      // TEST 8: Live Real-Time WebSocket Streaming Hub (/ws/clob)
+      // ========================================================================
+      const { WebSocket } = require('ws');
+      const wsClient = new WebSocket(`ws://127.0.0.1:${gwPort}/ws/clob?pair=xpx_usdt`);
+      const frames = [];
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('WebSocket test timed out')), 5000);
+        wsClient.on('error', (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+        wsClient.on('message', (raw) => {
+          const msg = JSON.parse(raw.toString('utf8'));
+          frames.push(msg);
+          if (msg.type === 'snapshot' && msg.market === 'xpx_usdt') {
+            wsClient.send(JSON.stringify({ type: 'ping' }));
+          } else if (msg.type === 'pong') {
+            wsClient.send(JSON.stringify({ type: 'subscribe', pair: 'xpx_bnb' }));
+          } else if (msg.type === 'snapshot' && msg.market === 'xpx_bnb') {
+            clearTimeout(timer);
+            resolve();
+          }
+        });
+      });
+      wsClient.close();
+      assert(frames.some((f) => f.type === 'snapshot' && f.market === 'xpx_usdt' && Number(f.seq) >= 1), 'Must receive initial xpx_usdt snapshot with seq');
+      assert(frames.some((f) => f.type === 'pong'), 'Must respond to ping with pong');
+      assert(frames.some((f) => f.type === 'snapshot' && f.market === 'xpx_bnb'), 'Must switch market on subscribe and push xpx_bnb snapshot');
+
+      // Verify unknown WS path is rejected cleanly
+      const badWsRejected = await new Promise((resolve) => {
+        const bad = new WebSocket(`ws://127.0.0.1:${gwPort}/ws/invalid`);
+        bad.on('error', () => resolve(true));
+        bad.on('open', () => { bad.close(); resolve(false); });
+      });
+      assert.strictEqual(badWsRejected, true, 'Unknown WebSocket path must be rejected');
+      console.log('✅ Test 8 passed: Live /ws/clob WebSocket snapshot, ping/pong, pair switch & invalid path rejection');
     } finally {
       gwProc.kill('SIGTERM');
     }
