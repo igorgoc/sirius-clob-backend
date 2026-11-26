@@ -231,7 +231,8 @@ function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub
   if (!signerPub || !/^[0-9A-F]{64}$/.test(signerPub)) {
     throw new Error(`Security rejection on ${nodeName}: invalid orderContext publicKey`);
   }
-  const domainSep = String(ctx.domainSeparator || `${networkType}:SiriusCLOB-v1`);
+  // Security: Always derive domain separator from the validator's own networkType (blocks cross-network replay)
+  const domainSep = `${networkType}:SiriusCLOB-v1`;
   const normPair = String(ctx.pair || 'XPX/USDT').trim().toUpperCase().replace('_', '/');
   if (!/^XPX\/(USDT|BNB)$/.test(normPair)) {
     throw new Error(`Security rejection on ${nodeName}: unsupported orderContext pair '${normPair}'`);
@@ -264,7 +265,9 @@ function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub
     const rAddr = recipObj && typeof recipObj.plain === 'function' ? recipObj.plain().replace(/[- ]/g, '').toUpperCase() : '';
     for (const m of (inner.mosaics || [])) {
       const mHex = m.id.toHex().toUpperCase();
-      const amt = BigInt(m.amount.compact ? m.amount.compact() : m.amount);
+      const amt = m.amount && typeof m.amount.toHex === 'function'
+        ? BigInt('0x' + m.amount.toHex())
+        : BigInt(m.amount.compact ? m.amount.compact() : m.amount);
       if (amt <= 0n) {
         throw new Error(`Security rejection on ${nodeName}: settlement transfer mosaic amount must be > 0`);
       }
@@ -514,12 +517,19 @@ async function verifyAndCosignOnNode(nodeName, req) {
 }
 
 function verifyVmAuthMetadata(callOrStream) {
-  const expectedToken = process.env.SIRIUS_VM_AUTH_TOKEN;
-  if (!expectedToken) return true; // Local dev backward-compatibility when unset
+  const expectedToken = (process.env.SIRIUS_VM_AUTH_TOKEN || '').trim();
+  const isMainnet =
+    String(process.env.SIRIUS_NETWORK || '').toLowerCase() === 'mainnet' ||
+    String(process.env.NETWORK_ENV || '').toLowerCase() === 'mainnet' ||
+    String(process.env.SIRIUS_NETWORK_TYPE || '') === '184';
+  if (!expectedToken) {
+    // Fail-closed on Mainnet: never allow unauthenticated validator RPCs without a token
+    return !isMainnet;
+  }
   const metaVals = callOrStream && callOrStream.metadata ? callOrStream.metadata.get('x-sirius-vm-token') : [];
   const provided = String((metaVals && metaVals[0]) || '');
   const a = Buffer.from(provided, 'utf8');
-  const b = Buffer.from(String(expectedToken), 'utf8');
+  const b = Buffer.from(expectedToken, 'utf8');
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
 }

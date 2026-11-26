@@ -212,15 +212,20 @@ class BatchSettlerTestnet2 {
         const inflight = this.inFlightChunks[0];
         try {
           const existingOnChain = await testnetClient.queryTransaction(inflight.signedTx.hash);
-          if (!existingOnChain || !existingOnChain.found) {
+          if (!existingOnChain || !existingOnChain.found || !(existingOnChain.height > 0)) {
             await testnetClient.announceSignedTransaction(inflight.signedTx);
             await verifyTxAcceptedOnTestnet2(inflight.signedTx.hash);
           }
           txHashes.push(inflight.signedTx.hash);
           this.inFlightChunks.shift();
         } catch (retryErr) {
-          if (retryErr.message && retryErr.message.includes('Sirius node rejected transaction')) {
-            console.warn(`[BatchSettler Testnet2] Evicting permanently rejected in-flight chunk (${inflight.signedTx.hash}): ${retryErr.message}`);
+          const errMsg = retryErr && retryErr.message ? retryErr.message : '';
+          if (errMsg.includes('Past_Deadline')) {
+            console.warn(`[BatchSettler Testnet2] In-flight chunk (${inflight.signedTx.hash}) expired (Past_Deadline); re-queuing ${inflight.chunk.length} payouts for fresh signing.`);
+            this.inFlightChunks.shift();
+            this.pendingQueue = [...inflight.chunk, ...this.pendingQueue];
+          } else if (errMsg.includes('Sirius node rejected transaction')) {
+            console.warn(`[BatchSettler Testnet2] Evicting permanently rejected in-flight chunk (${inflight.signedTx.hash}): ${errMsg}`);
             this.inFlightChunks.shift();
           } else {
             throw retryErr;

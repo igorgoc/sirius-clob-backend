@@ -358,6 +358,29 @@ async function main() {
     }
   });
 
+  await test('Round 3: grpc_vm_server verifyVmAuthMetadata fails closed on Mainnet when token unset', () => {
+    const vmServer = require('../executor/grpc_vm_server');
+    const prevNet = process.env.SIRIUS_NETWORK;
+    const prevTok = process.env.SIRIUS_VM_AUTH_TOKEN;
+    process.env.SIRIUS_NETWORK = 'mainnet';
+    delete process.env.SIRIUS_VM_AUTH_TOKEN;
+    try {
+      assert.strictEqual(vmServer.verifyVmAuthMetadata({ metadata: { get: () => [] } }), false);
+    } finally {
+      if (prevNet === undefined) delete process.env.SIRIUS_NETWORK;
+      else process.env.SIRIUS_NETWORK = prevNet;
+      if (prevTok !== undefined) process.env.SIRIUS_VM_AUTH_TOKEN = prevTok;
+    }
+  });
+
+  await test('Round 3: wasm_worker write_file_stream enforces assertWasmBounds', () => {
+    const workerSrc = fs.readFileSync(path.join(__dirname, '../executor/wasm_worker.js'), 'utf8');
+    const idx = workerSrc.indexOf('write_file_stream:');
+    assert.ok(idx > 0);
+    const snippet = workerSrc.slice(idx, idx + 200);
+    assert.ok(snippet.includes('assertWasmBounds(bufPtr, bufLen)'), 'write_file_stream must call assertWasmBounds');
+  });
+
   try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
 
   console.log(`\n🎉 Red-Team 5-Pass Hardening Suite: ${passed} tests passed.\n`);

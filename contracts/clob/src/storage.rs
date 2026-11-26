@@ -97,36 +97,41 @@ struct MarketPairV1 {
 pub fn load_or_init_market(quote_mosaic_id: u64) -> Result<MarketPair, &'static str> {
     let (_, state_file, _, _, _) = get_market_paths(quote_mosaic_id)?;
     if path_exists(state_file) {
-        if let Ok(mut reader) = FileReader::new(state_file) {
-            let mut buf = Vec::new();
-            if reader.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
-                if let Ok(mut market) = bincode::deserialize::<MarketPair>(&buf) {
-                    if market.order_index.is_empty() && (!market.bids.is_empty() || !market.asks.is_empty()) {
-                        market.rebuild_order_index();
-                    }
-                    return Ok(market);
-                }
-                if let Ok(v1) = bincode::deserialize::<MarketPairV1>(&buf) {
-                    let mut market = MarketPair {
-                        base_mosaic_id: v1.base_mosaic_id,
-                        quote_mosaic_id: v1.quote_mosaic_id,
-                        tick_size: v1.tick_size,
-                        min_order_size: v1.min_order_size,
-                        next_order_id: v1.next_order_id,
-                        maker_fee_bps: v1.maker_fee_bps,
-                        taker_fee_bps: v1.taker_fee_bps,
-                        bids: v1.bids,
-                        asks: v1.asks,
-                        order_index: std::collections::BTreeMap::new(),
-                    };
-                    market.rebuild_order_index();
-                    return Ok(market);
-                }
-            }
+        let mut reader = FileReader::new(state_file)
+            .map_err(|_| "Corrupt or unreadable market_state.bin: failed to open")?;
+        let mut buf = Vec::new();
+        reader
+            .read_to_end(&mut buf)
+            .map_err(|_| "Corrupt or unreadable market_state.bin: failed to read")?;
+        if buf.is_empty() {
+            return Err("Corrupt market_state.bin: empty file — refusing to silently reset orderbook");
         }
+        if let Ok(mut market) = bincode::deserialize::<MarketPair>(&buf) {
+            if market.order_index.is_empty() && (!market.bids.is_empty() || !market.asks.is_empty()) {
+                market.rebuild_order_index();
+            }
+            return Ok(market);
+        }
+        if let Ok(v1) = bincode::deserialize::<MarketPairV1>(&buf) {
+            let mut market = MarketPair {
+                base_mosaic_id: v1.base_mosaic_id,
+                quote_mosaic_id: v1.quote_mosaic_id,
+                tick_size: v1.tick_size,
+                min_order_size: v1.min_order_size,
+                next_order_id: v1.next_order_id,
+                maker_fee_bps: v1.maker_fee_bps,
+                taker_fee_bps: v1.taker_fee_bps,
+                bids: v1.bids,
+                asks: v1.asks,
+                order_index: std::collections::BTreeMap::new(),
+            };
+            market.rebuild_order_index();
+            return Ok(market);
+        }
+        return Err("Corrupt market_state.bin: bincode deserialization failed — refusing to silently reset orderbook");
     }
 
-    // Default Market initialized on first boot
+    // Default Market initialized ONLY on true first boot (when state_file does not exist)
     let tick_size = if quote_mosaic_id == BNB_MOSAIC_ID { 1 } else { 100 };
     Ok(MarketPair::new(
         XPX_MOSAIC_ID,

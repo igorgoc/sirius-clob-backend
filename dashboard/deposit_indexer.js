@@ -36,14 +36,15 @@ function loadProcessedDeposits() {
   if (fs.existsSync(config.PROCESSED_DEPOSITS_FILE)) {
     try {
       const data = JSON.parse(fs.readFileSync(config.PROCESSED_DEPOSITS_FILE, 'utf8'));
-      if (Array.isArray(data)) {
-        for (const item of data) {
-          const hash = typeof item === 'string' ? item : item.txHash;
-          if (hash) {
-            processedHashes.add(hash.toLowerCase());
-            if (typeof item === 'object' && item.mosaicIdHex) {
-              processedHashes.add(`${hash.toLowerCase()}:${item.mosaicIdHex.toLowerCase()}`);
-            }
+      const entries = Array.isArray(data)
+        ? data
+        : (data && typeof data === 'object' ? Object.entries(data).map(([k, v]) => (typeof v === 'object' && v ? { txHash: k, ...v } : k)) : []);
+      for (const item of entries) {
+        const hash = typeof item === 'string' ? item : item.txHash;
+        if (hash) {
+          processedHashes.add(hash.toLowerCase());
+          if (typeof item === 'object' && item.mosaicIdHex) {
+            processedHashes.add(`${hash.toLowerCase()}:${item.mosaicIdHex.toLowerCase()}`);
           }
         }
       }
@@ -59,8 +60,10 @@ function loadProcessedDeposits() {
 function recordProcessedDeposit(record) {
   const txKey = record.txHash.toLowerCase();
   const mosaicKey = record.mosaicIdHex ? `${txKey}:${record.mosaicIdHex.toLowerCase()}` : txKey;
-  processedHashes.add(txKey);
   processedHashes.add(mosaicKey);
+  if (!record.mosaicIdHex) {
+    processedHashes.add(txKey);
+  }
   try {
     let list = null;
     const filePath = config.PROCESSED_DEPOSITS_FILE;
@@ -182,6 +185,13 @@ async function syncVaultBalances() {
  */
 async function scanDeposits(onDepositCallback) {
   if (!vaultAddress || isScanning) return;
+  const isMainnet =
+    config.NETWORK_TYPE === 184 ||
+    String(config.NETWORK_ENV || '').toLowerCase() === 'mainnet' ||
+    String(process.env.SIRIUS_NETWORK || '').toLowerCase() === 'mainnet';
+  if (isMainnet && process.env.ALLOW_MAINNET_LEGACY_VAULT !== 'true') {
+    return;
+  }
   isScanning = true;
 
   try {
@@ -238,7 +248,9 @@ async function scanDeposits(onDepositCallback) {
             const mosaicKey = `${txHash}:${mosaicIdHex}`;
             if (processedHashes.has(mosaicKey)) continue;
 
-            const amountAtomic = BigInt(m.amount.compact());
+            const amountAtomic = m.amount && typeof m.amount.toHex === 'function'
+              ? BigInt('0x' + m.amount.toHex())
+              : BigInt(m.amount.compact());
 
             if (amountAtomic <= 0n) continue;
 

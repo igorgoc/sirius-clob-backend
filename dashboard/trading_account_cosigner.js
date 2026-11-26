@@ -1151,8 +1151,25 @@ async function _cosignWithdrawalUnlocked(reqBody, getLocksForOwnerFn = null) {
   if (decoded.type !== TransactionType.AGGREGATE_COMPLETE_V1) {
     throw new Error(`Expected AGGREGATE_COMPLETE_V1, got ${decoded.type}`);
   }
+  const decodedNetType = decoded.networkType !== undefined ? decoded.networkType : (decoded.version && decoded.version.networkType);
+  if (decodedNetType !== config.NETWORK_TYPE) {
+    throw new Error(`Withdrawal network mismatch: expected ${config.NETWORK_TYPE}, got ${decodedNetType}`);
+  }
   if (!Array.isArray(decoded.innerTransactions) || decoded.innerTransactions.length === 0) {
     throw new Error('Withdrawal aggregate has no inner transactions');
+  }
+
+  // Idempotency guard: if this exact signed withdrawal txHash is already broadcast/confirmed, return it without duplicate DB rows
+  const existingPending = clobDb.getPendingTradingWithdrawals(record.owner_public_key) || [];
+  const dup = existingPending.find((w) => String(w.tx_hash || '').toUpperCase() === txHashHex.toUpperCase());
+  if (dup) {
+    return {
+      ok: true,
+      idempotentReplay: true,
+      txHash: dup.tx_hash,
+      withdrawalId: dup.withdrawal_id,
+      status: dup.status,
+    };
   }
 
   const xpxHex = (config.XPX_MOSAIC_ID || '13BFC518E40549D7').toUpperCase();
@@ -1180,7 +1197,9 @@ async function _cosignWithdrawalUnlocked(reqBody, getLocksForOwnerFn = null) {
     }
     for (const m of (inner.mosaics || [])) {
       const mHex = m.id.toHex().toUpperCase();
-      const amt = BigInt(m.amount.compact ? m.amount.compact() : m.amount);
+      const amt = m.amount && typeof m.amount.toHex === 'function'
+        ? BigInt('0x' + m.amount.toHex())
+        : BigInt(m.amount.compact ? m.amount.compact() : m.amount);
       if (amt <= 0n) throw new Error('Transfer mosaic amount must be > 0');
       if (mHex === xpxHex) { outXpx += amt; primaryMosaicHex = primaryMosaicHex || xpxHex; }
       else if (mHex === usdtHex) { outUsdt += amt; primaryMosaicHex = primaryMosaicHex || usdtHex; }
@@ -1270,8 +1289,8 @@ async function _cosignWithdrawalUnlocked(reqBody, getLocksForOwnerFn = null) {
     finalCosigs
   );
 
-  // Record BEFORE L1 broadcast so concurrent mempool double-withdrawals are blocked immediately!
-  const withdrawalId = `TW_${txHashHex.slice(0, 16)}_${Date.now()}`;
+  // Record deterministically by txHash BEFORE L1 broadcast so retries never create duplicate DB rows!
+  const withdrawalId = `TW_${txHashHex.slice(0, 32)}`;
   const assetsToRecord = [];
   if (outXpx > 0n) assetsToRecord.push({ sym: 'XPX', hex: xpxHex, amt: outXpx });
   if (outUsdt > 0n) assetsToRecord.push({ sym: 'USDT', hex: usdtHex, amt: outUsdt });
@@ -1530,6 +1549,9 @@ async function _submitSettlementCosignatureUnlocked({ settlementId, cosignature 
   if (s.status === 'broadcast' || s.status === 'confirmed') {
     return { ok: true, alreadySubmitted: true, txHash: s.txHash, status: s.status };
   }
+  if (s.status === 'failed') {
+    throw new Error(`Settlement ${settlementId} permanently failed and cannot be re-signed`);
+  }
 
   // If the AggregateComplete L1 deadline expired (or is about to expire) while waiting for an offline user,
   // automatically rebuild with a fresh deadline and ask the client to re-sign the refreshed payload.
@@ -1655,6 +1677,7 @@ async function _submitSettlementCosignatureUnlocked({ settlementId, cosignature 
 async function reconcileInFlightL1Txs() {
   // 1. Pending Trading Account Activations
   try {
+    const cfg = getOrInitValidatorClusterConfig();
     const pendingAccs = clobDb.getTradingAccountsByStatus('pending');
     for (const acc of pendingAccs) {
       try {
@@ -1662,7 +1685,7 @@ async function reconcileInFlightL1Txs() {
           `${testnetClient.getActiveNodeUrl()}/account/${acc.trading_address}/multisig`,
           3000
         );
-        if (ms && ms.multisig && ms.multisig.minApproval >= 2) {
+        if (ms && isValidTwoOfTwoTradingMultisig(ms.multisig, cfg.clusterPublicKey, acc.owner_public_key)) {
           clobDb.updateTradingAccountStatus(acc.trading_public_key, 'active', acc.activation_tx_hash);
           console.log(`[TradingCosigner] ✅ Trading Account confirmed active on L1: ${acc.trading_address}`);
         }
@@ -1705,6 +1728,10 @@ async function reconcileInFlightL1Txs() {
           if (st && st.group === 'confirmed') {
             const rec = clobDb.getTradingAccountByTradingKey(s.tradingPublicKey);
             if (rec) testnetClient.invalidateAccountBalanceCache(rec.trading_address);
+            if (s.counterpartyKey) {
+              const cpRec = clobDb.getTradingAccountByOwner(s.counterpartyKey);
+              if (cpRec) testnetClient.invalidateAccountBalanceCache(cpRec.trading_address);
+            }
             clobDb.updateTradingSettlementStatus(s.settlementId, 'confirmed', s.txHash, null);
           } else if (st && st.group === 'failed') {
             if (String(st.status || '').includes('Past_Deadline')) {

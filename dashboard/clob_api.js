@@ -4356,30 +4356,37 @@ async function _placeOrderUnlocked(orderReq) {
   }
 
   // Safety reconciliation for Market (IOC) orders:
-  // A Market (IOC) order never rests on the book. If any portion of the initial escrow remains in locked
-  // state (e.g. unfilled or partially filled order), immediately return it to the caller's available balance
-  // and clear locked balance to 0!
+  // A Market (IOC) order never rests on the book. Refund ONLY up to this IOC order's
+  // remaining unfilled escrow — NEVER zero out locked balances belonging to resting Limit orders!
   if (orderType === 1) {
+    const quoteConsumedByIoc = takerBaseFilled > 0n
+      ? (requiredQuote * takerBaseFilled + amountAtomic - 1n) / amountAtomic
+      : 0n;
+    const maxIocQuoteRefund = requiredQuote > quoteConsumedByIoc ? requiredQuote - quoteConsumedByIoc : 0n;
+    const maxIocXpxRefund = requiredXpx > takerBaseFilled ? requiredXpx - takerBaseFilled : 0n;
     updateAccountBalance(callerKey, (b) => {
       if (side === 0) {
         if (isBnb) {
           const lockedRem = BigInt(b.lockedBnb || 0n);
-          if (lockedRem > 0n) {
-            b.bnb = BigInt(b.bnb || 0n) + lockedRem;
-            b.lockedBnb = 0n;
+          const toUnlock = lockedRem < maxIocQuoteRefund ? lockedRem : maxIocQuoteRefund;
+          if (toUnlock > 0n) {
+            b.bnb = BigInt(b.bnb || 0n) + toUnlock;
+            b.lockedBnb = lockedRem - toUnlock;
           }
         } else {
           const lockedRem = BigInt(b.lockedUsdt || 0n);
-          if (lockedRem > 0n) {
-            b.usdt = BigInt(b.usdt || 0n) + lockedRem;
-            b.lockedUsdt = 0n;
+          const toUnlock = lockedRem < maxIocQuoteRefund ? lockedRem : maxIocQuoteRefund;
+          if (toUnlock > 0n) {
+            b.usdt = BigInt(b.usdt || 0n) + toUnlock;
+            b.lockedUsdt = lockedRem - toUnlock;
           }
         }
       } else {
         const lockedRem = BigInt(b.lockedXpx || 0n);
-        if (lockedRem > 0n) {
-          b.xpx = BigInt(b.xpx || 0n) + lockedRem;
-          b.lockedXpx = 0n;
+        const toUnlock = lockedRem < maxIocXpxRefund ? lockedRem : maxIocXpxRefund;
+        if (toUnlock > 0n) {
+          b.xpx = BigInt(b.xpx || 0n) + toUnlock;
+          b.lockedXpx = lockedRem - toUnlock;
         }
       }
     }, { source: 'ESCROW_REFUND' });
