@@ -1259,6 +1259,9 @@ const SETTLEMENT_EXPIRY_BUFFER_MS = Math.max(
   30_000,
   Number(process.env.SETTLEMENT_EXPIRY_BUFFER_MS || 5 * 60 * 1000)
 );
+const MIN_SETTLEMENT_REBUILD_INTERVAL_MS = 60_000;
+const MAX_SETTLEMENT_REBUILDS = 24;
+const settlementRebuildMeta = new Map();
 
 /**
  * Decode the Sirius L1 deadline (Unix epoch ms) embedded inside an AggregateComplete payload.
@@ -1352,6 +1355,17 @@ function rebuildExpiredSettlement(settlement, { force = false, bufferMs = SETTLE
     return { rebuilt: false, settlement };
   }
 
+  // Anti-griefing & anti-loop guard: cap total rebuilds and enforce cooldown on non-forced rebuilds
+  const metaKey = String(settlement.settlementId);
+  const meta = settlementRebuildMeta.get(metaKey) || { count: 0, lastRebuiltAt: 0 };
+  if (meta.count >= MAX_SETTLEMENT_REBUILDS) {
+    console.warn(`[TradingCosigner] Settlement ${metaKey} hit max rebuild limit (${MAX_SETTLEMENT_REBUILDS}); skipping rebuild`);
+    return { rebuilt: false, settlement };
+  }
+  if (!force && meta.lastRebuiltAt > 0 && Date.now() - meta.lastRebuiltAt < MIN_SETTLEMENT_REBUILD_INTERVAL_MS) {
+    return { rebuilt: false, settlement };
+  }
+
   const built = buildSettlementAggregateTx({
     orderId: settlement.orderId,
     transfers: settlement.transfers,
@@ -1365,10 +1379,11 @@ function rebuildExpiredSettlement(settlement, { force = false, bufferMs = SETTLE
     collectedCosigs: [],
     status: 'pending_cosign',
   });
+  settlementRebuildMeta.set(metaKey, { count: meta.count + 1, lastRebuiltAt: Date.now() });
 
   console.log(
     `[TradingCosigner] 🔄 Auto-rebuilt expired settlement ${settlement.settlementId}: ` +
-    `oldHash=${oldHash ? oldHash.slice(0, 12) : 'none'} -> newHash=${built.signedByVault.hash.slice(0, 12)}`
+    `oldHash=${oldHash ? oldHash.slice(0, 12) : 'none'} -> newHash=${built.signedByVault.hash.slice(0, 12)} (rebuild #${meta.count + 1})`
   );
 
   return { rebuilt: true, settlement: updated };
@@ -1383,7 +1398,8 @@ function getPendingSettlementsWithAutoRebuild(publicKey, options = {}) {
   return rows.map((s) => {
     let current = s;
     let rebuilt = false;
-    if (s.status === 'pending_cosign') {
+    // Skip rebuild if a cosignature submission is actively holding the settlement lock (prevents race)
+    if (s.status === 'pending_cosign' && !settlementLocks.has(String(s.settlementId || '').toLowerCase())) {
       try {
         const res = rebuildExpiredSettlement(s, options);
         current = res.settlement || s;
@@ -1419,7 +1435,7 @@ async function createTradeSettlement({
   if (!built) return null;
   const { signedByVault, requiredUserSigners } = built;
 
-  const settlementId = `SET_${signedByVault.hash.slice(0, 16)}_${crypto.randomBytes(3).toString('hex')}`;
+  const settlementId = `SET_${signedByVault.hash.slice(0, 16)}_${crypto.randomBytes(8).toString('hex')}`;
 
   const saved = clobDb.saveTradingSettlement({
     settlementId,
