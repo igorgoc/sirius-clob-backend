@@ -1670,11 +1670,10 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // SiriusCLOB DEX Endpoint: Solvency Sentinel Proof-of-Reserves Audit
+  // SiriusCLOB DEX Endpoint: Solvency Sentinel Proof-of-Reserves Audit (strictly read-only on GET)
   if (pathname === '/api/clob/solvency/audit' && req.method === 'GET') {
-    const tripOnBreach = parsedUrl.searchParams.get('trip') === 'true';
     clobApi
-      .runSolvencySentinelAudit({ forceSync: true, tripOnBreach })
+      .runSolvencySentinelAudit({ forceSync: true, tripOnBreach: false })
       .then((audit) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, audit }));

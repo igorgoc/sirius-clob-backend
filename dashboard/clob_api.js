@@ -2922,35 +2922,8 @@ function assertSolvencyReconciliation(mosaicId, forceSync = false) {
   }
 
   // Allow a 100 XPX gas tolerance buffer for network transaction fees spent by Vault during activations/batch settlements
+  // Security: assertSolvencyReconciliation is STRICTLY READ-ONLY — never mutate or clamp user balances here.
   const GAS_TOLERANCE = 100_000_000n;
-  if (onChainVaultBalance > 0n && ledgerTotal > 0n && (onChainVaultBalance + GAS_TOLERANCE < ledgerTotal)) {
-    if (isTestnet2) {
-      // In live Testnet 2 / Mainnet mode, stale sandbox test balances must not block real trading:
-      // Auto-reconcile user's ledger balance to match actual verified on-chain vault backing
-      console.warn(`[Solvency Auto-Reconciler] Auto-aligning stale sandbox balance (${ledgerTotal}) with verified on-chain vault balance (${onChainVaultBalance})...`);
-      const testnetDepositsFile = path.join(CLUSTER_DIR, 'processed_deposits.json');
-      if (fs.existsSync(testnetDepositsFile)) {
-        try {
-          const deps = JSON.parse(fs.readFileSync(testnetDepositsFile, 'utf8'));
-          const testnetList = Array.isArray(deps) ? deps : Object.values(deps);
-          const localBals = loadBalances();
-          const excludedKeys = getExcludedOperatorKeys();
-          for (const d of testnetList) {
-            const k = (d.senderPublicKey || d.callerKey || '').toLowerCase();
-            if (k && !excludedKeys.has(k) && localBals[k]) {
-              if (tokenSymbol === 'XPX' && BigInt(localBals[k].xpx || 0) > onChainVaultBalance) {
-                localBals[k].xpx = onChainVaultBalance.toString();
-                localBals[k].lockedXpx = '0';
-              }
-            }
-          }
-          saveBalances(localBals);
-          ledgerTotal = getTestnet2LiabilitiesAtomic(normMosaic);
-        } catch (_) {}
-      }
-    }
-  }
-
   if (onChainVaultBalance > 0n && ledgerTotal > 0n && (onChainVaultBalance + GAS_TOLERANCE < ledgerTotal)) {
     throw new Error(
       `Solvency reconciliation check failed for ${tokenSymbol} (${mosaicHex}): ` +

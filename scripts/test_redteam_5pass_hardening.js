@@ -234,6 +234,25 @@ async function main() {
     assert.ok(compose.includes('no-new-privileges:true'), 'compose must enforce no-new-privileges');
   });
 
+  await test('Pass 5: GET /api/clob/solvency and /api/clob/solvency/audit are strictly read-only', () => {
+    const clobApiSrc = fs.readFileSync(path.join(__dirname, '../dashboard/clob_api.js'), 'utf8');
+    const serverSrc = fs.readFileSync(path.join(__dirname, '../dashboard/server.js'), 'utf8');
+    const fnStart = clobApiSrc.indexOf('function assertSolvencyReconciliation(');
+    const fnEnd = clobApiSrc.indexOf('function encodePlaceOrder(', fnStart);
+    assert.ok(fnStart > 0 && fnEnd > fnStart, 'Could not locate assertSolvencyReconciliation');
+    const fnBody = clobApiSrc.slice(fnStart, fnEnd);
+    assert.strictEqual(
+      fnBody.includes('saveBalances('),
+      false,
+      'assertSolvencyReconciliation must never mutate balances via saveBalances()'
+    );
+    assert.strictEqual(
+      serverSrc.includes("parsedUrl.searchParams.get('trip') === 'true'"),
+      false,
+      'GET /api/clob/solvency/audit must never allow public ?trip=true mutation'
+    );
+  });
+
   try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
 
   console.log(`\n🎉 Red-Team 5-Pass Hardening Suite: ${passed} tests passed.\n`);
