@@ -25,9 +25,34 @@ const ROOT_DIR = path.resolve(__dirname, '..');
 const CLUSTER_DIR = path.join(ROOT_DIR, 'cluster');
 const SWAP_HISTORY_FILE = path.join(CLUSTER_DIR, 'swap_history.json');
 
-// BSC Testnet Official Contracts & Sink
-const BSC_TESTNET_USDT_CONTRACT = '0x337610d27c682E347C9cD60BD4b3b107C9d34dDd';
-const BRIDGE_SINK_ADDRESS = '0x71c8363837918a02B9131939994522411A8373B0';
+// Network-aware BSC Contracts, Sink & Fail-Closed Mainnet Guard
+const IS_SIRIUS_MAINNET =
+  config.NETWORK_TYPE === 184 ||
+  String(config.NETWORK_ENV || '').toLowerCase() === 'mainnet' ||
+  String(process.env.SIRIUS_NETWORK || '').toLowerCase() === 'mainnet';
+
+const BSC_MAINNET_BRIDGE_READY = Boolean(
+  process.env.BSC_MAINNET_BRIDGE_ENABLED === 'true' &&
+  /^0x[0-9a-fA-F]{40}$/.test(String(process.env.BSC_MAINNET_SINK_ADDRESS || '').trim()) &&
+  /^0x[0-9a-fA-F]{40}$/.test(String(process.env.BSC_MAINNET_USDT_CONTRACT || '').trim()) &&
+  String(process.env.BSC_MAINNET_RPC_URL || '').trim().startsWith('https://')
+);
+
+const ACTIVE_BSC_CHAIN_ID = IS_SIRIUS_MAINNET ? 56 : 97;
+const BSC_TESTNET_USDT_CONTRACT = IS_SIRIUS_MAINNET
+  ? String(process.env.BSC_MAINNET_USDT_CONTRACT || '').trim()
+  : (process.env.BSC_TESTNET_USDT_CONTRACT || '0x337610d27c682E347C9cD60BD4b3b107C9d34dDd');
+const BRIDGE_SINK_ADDRESS = IS_SIRIUS_MAINNET
+  ? String(process.env.BSC_MAINNET_SINK_ADDRESS || '').trim()
+  : (process.env.BSC_TESTNET_SINK_ADDRESS || '0x71c8363837918a02B9131939994522411A8373B0');
+
+function assertBridgeNetworkConfigured() {
+  if (IS_SIRIUS_MAINNET && !BSC_MAINNET_BRIDGE_READY) {
+    throw new Error(
+      'Cross-chain bridge disabled on Sirius Mainnet: BSC Mainnet sink, USDT contract, HTTPS RPC, and BSC_MAINNET_BRIDGE_ENABLED=true must be explicitly configured (BSC Testnet deposits are strictly blocked on Mainnet).'
+    );
+  }
+}
 
 // Global 24-Hour Bridge Outflow Ceilings (Prevents Treasury Drain & Trips Circuit Breaker)
 const BRIDGE_LIMITS_24H = {
@@ -273,13 +298,18 @@ function saveSwapHistory(history) {
   } catch (_) {}
 }
 
-const BSC_TESTNET_RPCS = [
-  'https://data-seed-prebsc-1-s1.binance.org:8545/',
-  'https://data-seed-prebsc-2-s1.binance.org:8545/',
-  'https://data-seed-prebsc-1-s2.binance.org:8545/',
-  'https://data-seed-prebsc-2-s2.binance.org:8545/',
-  'https://bsc-testnet.publicnode.com',
-];
+const BSC_TESTNET_RPCS = IS_SIRIUS_MAINNET
+  ? String(process.env.BSC_MAINNET_RPC_URL || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.startsWith('https://'))
+  : [
+      'https://data-seed-prebsc-1-s1.binance.org:8545/',
+      'https://data-seed-prebsc-2-s1.binance.org:8545/',
+      'https://data-seed-prebsc-1-s2.binance.org:8545/',
+      'https://data-seed-prebsc-2-s2.binance.org:8545/',
+      'https://bsc-testnet.publicnode.com',
+    ];
 
 async function queryBscRpc(method, params = []) {
   for (const rpcUrl of BSC_TESTNET_RPCS) {
@@ -491,7 +521,25 @@ async function autoCreditTx(tx, blockNumber) {
     const swapId = 'AUTO-BSC-' + Date.now();
     const timestamp = new Date().toISOString();
 
-    // Deliver backed tokens on Sirius Testnet 2 using exact BigInt atomic units
+    // Durable crash-safe PENDING reservation in SQLite BEFORE broadcasting L1 delivery
+    // Prevents double-delivery if the process crashes between deliverTokensOnSirius() and DB commit!
+    clobDb.saveBridgeSwapRecord({
+      swapId,
+      timestamp,
+      network: IS_SIRIUS_MAINNET ? 'BSC_MAINNET' : 'BSC_TESTNET',
+      txnHash: tx.hash,
+      from: tx.from,
+      recipient,
+      amount: transferAmount,
+      token: tokenName,
+      status: 'PENDING',
+      confirmations,
+      blockNumber: txBlockNum,
+      autoDetected: true,
+      siriusTxHash: null,
+    });
+
+    // Deliver backed tokens on Sirius L1 using exact BigInt atomic units
     let siriusTxHash = null;
     try {
       siriusTxHash = await deliverTokensOnSirius(recipient, tokenName, transferAmount, tx.hash, transferAtomicSirius);
@@ -500,7 +548,7 @@ async function autoCreditTx(tx, blockNumber) {
     }
 
     if (!siriusTxHash) {
-      console.warn(`[Bridge Relayer] autoCreditTx: Sirius L1 delivery not completed for ${tx.hash}; will retry on next scan`);
+      console.warn(`[Bridge Relayer] autoCreditTx: Sirius L1 delivery failed after PENDING reservation for ${tx.hash}; held for operator reconciliation to prevent double-spend`);
       return;
     }
 
@@ -535,7 +583,11 @@ async function autoCreditTx(tx, blockNumber) {
 
 async function startAutoRelayer() {
   if (watcherInterval) return;
-  console.log('[Bridge Relayer] Initializing automated BSC Testnet block indexer...');
+  if (IS_SIRIUS_MAINNET && !BSC_MAINNET_BRIDGE_READY) {
+    console.warn('[Bridge Relayer] Disabled on Sirius Mainnet (BSC_MAINNET_BRIDGE_ENABLED/sink/contract/RPC not configured).');
+    return;
+  }
+  console.log(`[Bridge Relayer] Initializing automated ${IS_SIRIUS_MAINNET ? 'BSC Mainnet' : 'BSC Testnet'} block indexer...`);
 
   try {
     const currentHex = await queryBscRpc('eth_blockNumber', []);
@@ -680,6 +732,7 @@ const swapApi = {
   },
 
   async processTransfer(payload) {
+    assertBridgeNetworkConfigured();
     const { recipient, signature, txnInfo, amount } = payload;
     const tokenKey = (payload.token || 'usdt').toLowerCase();
     const tokenConfig = TOKENS_CONFIG[tokenKey] || TOKENS_CONFIG.usdt;
@@ -816,26 +869,54 @@ const swapApi = {
           throw new Error('Transaction has no embedded Sirius address memo; explicit recipient address required');
         }
         const normClaimRecipient = claimRecipient.replace(/-/g, '').trim().toUpperCase();
+        if (!isValidSiriusAddressForActiveNetwork(normClaimRecipient)) {
+          throw new Error(
+            `Invalid Sirius recipient address "${normClaimRecipient}" for active network (${config.NETWORK_TYPE})`
+          );
+        }
         if (!signature) {
           throw new Error(
             `Authentication required: Transaction ${txnHash} does not contain an embedded Sirius recipient address memo. ` +
             `To prevent deposit theft, an EVM signature from the sender wallet (${onChainResult.from}) is strictly required to claim this deposit.`
           );
         }
-        const expectedMessage = `Claim Bridge Deposit ${normHash} to Sirius ${normClaimRecipient}`;
-        const recoveredSigner = verifyEvmSignature(expectedMessage, signature);
-        if (!recoveredSigner || recoveredSigner.toLowerCase() !== onChainResult.from.toLowerCase()) {
-          // Also try case-insensitive or raw hash variant
-          const altMsg = `Claim Bridge Deposit ${txnHash} to Sirius ${claimRecipient}`;
-          const altSigner = verifyEvmSignature(altMsg, signature);
-          if (!altSigner || altSigner.toLowerCase() !== onChainResult.from.toLowerCase()) {
-            throw new Error(`EVM signature verification failed: recovered ${recoveredSigner || 'null'} does not match on-chain sender ${onChainResult.from}`);
+        // Domain-separated claim message prevents cross-network replay (Sirius network + BSC chainId bound)
+        const domainClaimMsg = `Claim Bridge Deposit ${normHash} to Sirius ${normClaimRecipient} (SiriusNetwork:${config.NETWORK_TYPE}, BscChain:${ACTIVE_BSC_CHAIN_ID})`;
+        let recoveredSigner = verifyEvmSignature(domainClaimMsg, signature);
+        const matchesSender = (s) => Boolean(s && s.toLowerCase() === onChainResult.from.toLowerCase());
+        if (!matchesSender(recoveredSigner) && !IS_SIRIUS_MAINNET) {
+          // Testnet backward-compatibility fallback (Mainnet strictly enforces domain-separated message!)
+          const expectedMessage = `Claim Bridge Deposit ${normHash} to Sirius ${normClaimRecipient}`;
+          recoveredSigner = verifyEvmSignature(expectedMessage, signature);
+          if (!matchesSender(recoveredSigner)) {
+            const altMsg = `Claim Bridge Deposit ${txnHash} to Sirius ${claimRecipient}`;
+            recoveredSigner = verifyEvmSignature(altMsg, signature);
           }
+        }
+        if (!matchesSender(recoveredSigner)) {
+          throw new Error(`EVM signature verification failed: recovered ${recoveredSigner || 'null'} does not match on-chain sender ${onChainResult.from}`);
         }
         targetRecipient = normClaimRecipient;
       }
 
-      // Deliver backed tokens on Sirius Testnet 2 using exact BigInt atomic units
+      // Durable crash-safe PENDING reservation in SQLite BEFORE broadcasting Sirius L1 transfer
+      clobDb.saveBridgeSwapRecord({
+        swapId,
+        timestamp,
+        network: txnInfo ? txnInfo.network : (IS_SIRIUS_MAINNET ? 'BSC_MAINNET' : 'BSC_TESTNET'),
+        txnHash,
+        from: onChainResult.from,
+        recipient: targetRecipient,
+        amount: transferAmount,
+        token: verifiedToken,
+        status: 'PENDING',
+        confirmations: onChainResult.confirmations,
+        blockNumber: onChainResult.txBlock,
+        autoDetected: false,
+        siriusTxHash: null,
+      });
+
+      // Deliver backed tokens on Sirius L1 using exact BigInt atomic units
       let siriusTxHash = null;
       try {
         siriusTxHash = await deliverTokensOnSirius(

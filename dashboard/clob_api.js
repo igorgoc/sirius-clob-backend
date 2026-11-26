@@ -1568,9 +1568,17 @@ function checkAndEnforceCircuitBreaker(contextLabel = 'CLOB Operation', options 
 // Initial replicator drive synchronization on start
 ensureDriveSync();
 
-// Global Cluster Consensus Sequencer Lock (prevents packet reordering / interleaving across WAN nodes & child processes)
-let clusterConsensusQueue = Promise.resolve();
+// Fair Per-Pair Round-Robin Cluster Consensus Sequencer Lock
+// Prevents one busy pair (e.g. XPX/USDT) from starving another pair (XPX/BNB) while preserving
+// strict serialized BFT 2PC execution over the shared WASM balances.json state.
 let clusterConsensusSeq = 0;
+const MAX_CONSENSUS_QUEUE_DEPTH = Math.max(20, Number(process.env.CLOB_MAX_CONSENSUS_QUEUE || 120));
+const MAX_CONSENSUS_LANE_DEPTH = Math.max(10, Math.ceil(MAX_CONSENSUS_QUEUE_DEPTH / 2));
+const CONSENSUS_LANES = ['xpx_usdt', 'xpx_bnb', 'default'];
+const consensusLaneQueues = { xpx_usdt: [], xpx_bnb: [], default: [] };
+let consensusDrainRunning = false;
+let consensusRoundRobinIdx = 0;
+let pendingConsensusCount = 0;
 const CONSENSUS_LOCK_DIR = path.join(CLUSTER_DIR, 'consensus_ipc.lock');
 const CONSENSUS_LOCK_OWNER = path.join(CONSENSUS_LOCK_DIR, 'owner.json');
 
@@ -1600,15 +1608,7 @@ try {
   }
 } catch (_) {}
 
-async function withClusterConsensusLock(fn) {
-  const prev = clusterConsensusQueue;
-  let release;
-  const current = new Promise((resolve) => {
-    release = resolve;
-  });
-  clusterConsensusQueue = current;
-  await prev.catch(() => {});
-
+async function runUnderInterProcessConsensusLock(fn) {
   // Inter-process directory mutex: prevents separate node processes (e.g. MM daemon and server) from clashing on VM execution
   const lockStart = Date.now();
   while (true) {
@@ -1648,12 +1648,59 @@ async function withClusterConsensusLock(fn) {
   } finally {
     try { fs.unlinkSync(CONSENSUS_LOCK_OWNER); } catch (_) {}
     try { fs.rmdirSync(CONSENSUS_LOCK_DIR); } catch (_) {}
-    release();
   }
+}
+
+async function drainConsensusLanes() {
+  if (consensusDrainRunning) return;
+  consensusDrainRunning = true;
+  try {
+    while (pendingConsensusCount > 0) {
+      let picked = null;
+      for (let step = 0; step < CONSENSUS_LANES.length; step++) {
+        const laneName = CONSENSUS_LANES[(consensusRoundRobinIdx + step) % CONSENSUS_LANES.length];
+        const q = consensusLaneQueues[laneName];
+        if (q && q.length > 0) {
+          picked = q.shift();
+          consensusRoundRobinIdx = (consensusRoundRobinIdx + step + 1) % CONSENSUS_LANES.length;
+          break;
+        }
+      }
+      if (!picked) break;
+      pendingConsensusCount = Math.max(0, pendingConsensusCount - 1);
+      try {
+        const res = await runUnderInterProcessConsensusLock(picked.fn);
+        picked.resolve(res);
+      } catch (err) {
+        picked.reject(err);
+      }
+    }
+  } finally {
+    consensusDrainRunning = false;
+    if (pendingConsensusCount > 0) {
+      setImmediate(drainConsensusLanes);
+    }
+  }
+}
+
+async function withClusterConsensusLock(fn, lane = 'default') {
+  const normLane = consensusLaneQueues[lane] ? lane : 'default';
+  if (consensusLaneQueues[normLane].length >= MAX_CONSENSUS_LANE_DEPTH) {
+    throw new Error(`Consensus lane ${normLane} busy (depth ${consensusLaneQueues[normLane].length} >= ${MAX_CONSENSUS_LANE_DEPTH}); please retry shortly`);
+  }
+  if (pendingConsensusCount >= MAX_CONSENSUS_QUEUE_DEPTH) {
+    throw new Error(`Consensus sequencer busy (queue depth ${pendingConsensusCount} >= ${MAX_CONSENSUS_QUEUE_DEPTH}); please retry shortly`);
+  }
+  return new Promise((resolve, reject) => {
+    consensusLaneQueues[normLane].push({ fn, resolve, reject });
+    pendingConsensusCount += 1;
+    drainConsensusLanes();
+  });
 }
 
 async function executeConsensusCall(stageName, height, txHashHex, contractCallId, vmOptions = {}) {
   const tCons0 = Date.now();
+  const lane = (vmOptions && vmOptions.marketLane) || 'default';
   return withClusterConsensusLock(async (seqNo) => {
     const tLock = Date.now();
     ensureDriveSync();
@@ -3383,6 +3430,16 @@ async function _placeOrderUnlocked(orderReq) {
     );
   }
   checkAndEnforceCircuitBreaker('Order Placement', { isNonCustodialTradingAccount: isNonCustodialCaller });
+  if (isNonCustodialCaller && typeof tradingCosigner.checkCosignDefaulterCooldown === 'function') {
+    const preKeyNorm = normalizeKey(orderReq && (orderReq.publicKey || orderReq.callerPublicKey));
+    const penalty = tradingCosigner.checkCosignDefaulterCooldown(preKeyNorm);
+    if (penalty.restricted) {
+      const waitSec = Math.max(1, Math.ceil(penalty.remainingMs / 1000));
+      throw new Error(
+        `Order placement temporarily restricted for ${waitSec}s (anti-griefing strike #${penalty.strikes} for abandoning an unsettled P2P cosignature). Cancellations and withdrawals remain open.`
+      );
+    }
+  }
   const pair = (orderReq.pair || orderReq.market || 'XPX/USDT').toUpperCase().replace('_', '/');
   if (!/^XPX\/(USDT|BNB)$/.test(pair)) {
     throw new Error(`Unsupported trading pair "${pair}". Allowed pairs: XPX/USDT, XPX/BNB`);
@@ -3659,6 +3716,7 @@ async function _placeOrderUnlocked(orderReq) {
         parameters: callParams,
         callerKeyHex: callerKey,
         servicePayments,
+        marketLane: marketKey,
       }
     );
   } catch (consensusErr) {
@@ -4069,6 +4127,61 @@ async function _placeOrderUnlocked(orderReq) {
             }
           }
 
+          const participantContexts = {};
+          const takerOrderContext = {
+            orderId: expectedOrderId,
+            pair: (pair || 'XPX/USDT').toUpperCase().replace('_', '/'),
+            side: side === 1 ? 'sell' : 'buy',
+            type: normalizeOrderTypeLabel(orderType),
+            price: canonicalizeDecimalString(priceInput, 8),
+            amount: canonicalizeDecimalString(amountInput, 6),
+            nonce: orderReq.nonce,
+            expiry: orderReq.expiry,
+            signature: orderReq.signature,
+            publicKey: callerKey.toLowerCase(),
+            domainSeparator: DOMAIN_SEPARATOR,
+          };
+          participantContexts[callerKey.toLowerCase()] = { ...takerOrderContext };
+
+          // Attach each matched Maker's OWN cryptographically signed resting order context so Makers in
+          // the Web Wallet verify settlement outflows against their own Ed25519 signature (never blind-signing
+          // and never failing because settlement.orderId belongs to the Taker!).
+          const makerSideExpected = side === 0 ? 'Sell' : 'Buy';
+          const normMarketPair = normalizePair(pair);
+          const matchedMakerPubs = new Set(
+            smartFillLegs
+              .filter((l) => l.recipientTradingAcc && l.recipientPub && l.recipientPub.toLowerCase() !== callerKey.toLowerCase())
+              .map((l) => l.recipientPub.toLowerCase())
+          );
+          for (const mkPub of matchedMakerPubs) {
+            let bestMakerCtx = null;
+            for (const ao of activeOrders.values()) {
+              if (
+                ao &&
+                ao.callerKey &&
+                ao.callerKey.toLowerCase() === mkPub &&
+                normalizePair(ao.pair) === normMarketPair &&
+                ao.side === makerSideExpected &&
+                ao.signedOrderContext &&
+                ao.signedOrderContext.signature &&
+                (ao.status === 'Open' || ao.status === 'PartiallyFilled')
+              ) {
+                // Prefer best price (lowest ask for sell maker, highest bid for buy maker), then earliest FIFO
+                if (
+                  !bestMakerCtx ||
+                  (makerSideExpected === 'Sell' && Number(ao.priceTicks) < Number(bestMakerCtx._priceTicks)) ||
+                  (makerSideExpected === 'Buy' && Number(ao.priceTicks) > Number(bestMakerCtx._priceTicks))
+                ) {
+                  bestMakerCtx = { ...ao.signedOrderContext, _priceTicks: ao.priceTicks };
+                }
+              }
+            }
+            if (bestMakerCtx) {
+              delete bestMakerCtx._priceTicks;
+              participantContexts[mkPub] = bestMakerCtx;
+            }
+          }
+
           pendingSettlement = await tradingCosigner.createTradeSettlement({
             orderId: expectedOrderId,
             ownerPublicKey: callerKey.toLowerCase(),
@@ -4080,16 +4193,8 @@ async function _placeOrderUnlocked(orderReq) {
               bnb: ownerDelta.bnb.toString(),
             },
             orderContext: {
-              pair: (pair || 'XPX/USDT').toUpperCase().replace('_', '/'),
-              side: side === 1 ? 'sell' : 'buy',
-              type: normalizeOrderTypeLabel(orderType),
-              price: canonicalizeDecimalString(priceInput, 8),
-              amount: canonicalizeDecimalString(amountInput, 6),
-              nonce: orderReq.nonce,
-              expiry: orderReq.expiry,
-              signature: orderReq.signature,
-              publicKey: callerKey.toLowerCase(),
-              domainSeparator: DOMAIN_SEPARATOR,
+              ...takerOrderContext,
+              participantContexts,
             },
           });
         } catch (settleErr) {
@@ -4212,6 +4317,19 @@ async function _placeOrderUnlocked(orderReq) {
       remainingAmount: formatAtomicUnits(remainingAtomic, 6),
       filled: `${clampedPct}%`,
       status: isFilled ? 'Filled' : (takerBaseFilled > 0n ? 'PartiallyFilled' : 'Open'),
+      signedOrderContext: {
+        orderId,
+        pair: (pair || 'XPX/USDT').toUpperCase().replace('_', '/'),
+        side: side === 1 ? 'sell' : 'buy',
+        type: orderTypeLabel,
+        price: canonicalizeDecimalString(priceInput, 8),
+        amount: canonicalizeDecimalString(amountInput, 6),
+        nonce: orderReq.nonce,
+        expiry: orderReq.expiry,
+        signature: orderReq.signature,
+        publicKey: callerKey.toLowerCase(),
+        domainSeparator: DOMAIN_SEPARATOR,
+      },
       timestamp: Date.now(),
       expiry: orderReq.orderExpiry && Number(orderReq.orderExpiry) > 0
         ? Number(orderReq.orderExpiry)

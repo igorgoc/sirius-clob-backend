@@ -857,7 +857,7 @@ async function computeTradingAccountBalances(record, lockedOverrides = null, for
   let deltaBnb = 0n;
 
   for (const s of settlements) {
-    if (s.status === 'confirmed' || s.status === 'failed') continue;
+    if (s.status === 'confirmed' || s.status === 'failed' || s.status === 'expired') continue;
     if (Array.isArray(s.transfers) && s.transfers.length > 0 && tradingPubUpper) {
       // Compute exact per-participant delta directly from settlement transfer legs so BOTH
       // taker (owner_public_key) and maker/counterparty pending outflows are strictly deducted!
@@ -1376,9 +1376,97 @@ const SETTLEMENT_EXPIRY_BUFFER_MS = Math.max(
   30_000,
   Number(process.env.SETTLEMENT_EXPIRY_BUFFER_MS || 5 * 60 * 1000)
 );
+const SETTLEMENT_COSIGN_TTL_MS = Math.max(
+  60_000,
+  Number(process.env.SETTLEMENT_COSIGN_TTL_MS || 24 * 60 * 60 * 1000)
+); // 24h max cosign window before releasing honest counterparty's pending delta
+const COSIGN_DEFAULTER_BASE_COOLDOWN_MS = Math.max(
+  10_000,
+  Number(process.env.COSIGN_DEFAULTER_BASE_COOLDOWN_MS || 5 * 60 * 1000)
+); // 5m / 15m / 60m escalating order-placement cooldown for non-cosigning griefers
 const MIN_SETTLEMENT_REBUILD_INTERVAL_MS = 60_000;
 const MAX_SETTLEMENT_REBUILDS = 24;
 const settlementRebuildMeta = new Map();
+const cosignDefaulterPenalties = new Map(); // ownerPubLower -> { strikes, cooldownUntil, lastDefaultAt }
+
+function recordCosignDefaulterStrike(ownerPublicKey, now = Date.now()) {
+  const key = String(ownerPublicKey || '').trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(key)) return null;
+  const prev = cosignDefaulterPenalties.get(key) || { strikes: 0, cooldownUntil: 0, lastDefaultAt: 0 };
+  // Decay strikes if >24h since last default
+  const decayedStrikes = prev.lastDefaultAt > 0 && now - prev.lastDefaultAt > 24 * 60 * 60 * 1000 ? 0 : prev.strikes;
+  const strikes = decayedStrikes + 1;
+  const mult = strikes === 1 ? 1 : (strikes === 2 ? 3 : 12);
+  const cooldownMs = Math.min(60 * 60 * 1000, COSIGN_DEFAULTER_BASE_COOLDOWN_MS * mult);
+  const entry = { strikes, cooldownUntil: now + cooldownMs, lastDefaultAt: now };
+  cosignDefaulterPenalties.set(key, entry);
+  return entry;
+}
+
+function checkCosignDefaulterCooldown(ownerPublicKey, now = Date.now()) {
+  const key = String(ownerPublicKey || '').trim().toLowerCase();
+  const entry = cosignDefaulterPenalties.get(key);
+  if (!entry || now >= entry.cooldownUntil) {
+    return { restricted: false, strikes: entry ? entry.strikes : 0, remainingMs: 0 };
+  }
+  return {
+    restricted: true,
+    strikes: entry.strikes,
+    remainingMs: entry.cooldownUntil - now,
+    cooldownUntil: entry.cooldownUntil,
+  };
+}
+
+/**
+ * Safely expire stalled pending_cosign settlements that exceeded SETTLEMENT_COSIGN_TTL_MS
+ * or MAX_SETTLEMENT_REBUILDS. Releases both parties' pendingSettlementDelta atomically
+ * and applies an anti-griefing order-placement cooldown ONLY to the non-cosigning defaulter(s).
+ */
+async function expireStalePendingSettlements({ ttlMs = SETTLEMENT_COSIGN_TTL_MS, now = Date.now() } = {}) {
+  const rows = clobDb.getAllPendingCosignSettlements();
+  const expired = [];
+  for (const row of rows) {
+    const meta = settlementRebuildMeta.get(String(row.settlementId)) || { count: 0 };
+    const ageMs = now - Number(row.createdAt || now);
+    const hitTtl = ageMs >= ttlMs;
+    const hitRebuildCap = meta.count >= MAX_SETTLEMENT_REBUILDS;
+    const malformed = !Array.isArray(row.transfers) || row.transfers.length === 0;
+    if (!hitTtl && !hitRebuildCap && !malformed) continue;
+
+    await withKeyedLock(settlementLocks, row.settlementId, async () => {
+      const fresh = clobDb.getTradingSettlement(row.settlementId);
+      if (!fresh || fresh.status !== 'pending_cosign') return;
+
+      const reqSet = (Array.isArray(fresh.requiredCosigners) ? fresh.requiredCosigners : [])
+        .map((pk) => String(pk || '').toUpperCase())
+        .filter(Boolean);
+      const signedSet = new Set(
+        (Array.isArray(fresh.collectedCosigs) ? fresh.collectedCosigs : [])
+          .map((c) => String(c && c.signer ? c.signer : '').toUpperCase())
+          .filter(Boolean)
+      );
+      const defaulters = reqSet.filter((pk) => !signedSet.has(pk));
+
+      const didExpire = clobDb.expirePendingCosignSettlement(fresh.settlementId);
+      if (!didExpire) return;
+
+      settlementRebuildMeta.delete(String(fresh.settlementId));
+      for (const defPk of defaulters) {
+        recordCosignDefaulterStrike(defPk, now);
+      }
+      expired.push({
+        settlementId: fresh.settlementId,
+        reason: malformed ? 'malformed_transfers' : (hitRebuildCap ? 'max_rebuilds_exhausted' : 'cosign_ttl_expired'),
+        defaulters,
+      });
+      console.warn(
+        `[TradingCosigner] ⏱️ Expired stalled pending_cosign settlement ${fresh.settlementId} ` +
+        `(age=${Math.round(ageMs / 1000)}s, defaulters=${defaulters.length}); pending deltas released.`
+      );
+    });
+  }
+  return expired;
+}
 
 /**
  * Decode the Sirius L1 deadline (Unix epoch ms) embedded inside an AggregateComplete payload.
@@ -1613,8 +1701,8 @@ async function _submitSettlementCosignatureUnlocked({ settlementId, cosignature 
   if (s.status === 'broadcast' || s.status === 'confirmed') {
     return { ok: true, alreadySubmitted: true, txHash: s.txHash, status: s.status };
   }
-  if (s.status === 'failed') {
-    throw new Error(`Settlement ${settlementId} permanently failed and cannot be re-signed`);
+  if (s.status === 'failed' || s.status === 'expired') {
+    throw new Error(`Settlement ${settlementId} is terminal (${s.status}) and cannot be re-signed`);
   }
 
   // If the AggregateComplete L1 deadline expired (or is about to expire) while waiting for an offline user,
@@ -1827,6 +1915,10 @@ async function reconcileInFlightL1Txs() {
       }
     }
   } catch (_) {}
+  // 4. Expire stalled pending_cosign settlements past TTL / MAX_SETTLEMENT_REBUILDS (anti-griefing release)
+  try {
+    await expireStalePendingSettlements();
+  } catch (_) {}
 }
 
 module.exports = {
@@ -1845,6 +1937,9 @@ module.exports = {
   getAggregateDeadlineEpochMs,
   isSettlementPayloadExpired,
   rebuildExpiredSettlement,
+  expireStalePendingSettlements,
+  checkCosignDefaulterCooldown,
+  recordCosignDefaulterStrike,
   getPendingSettlementsWithAutoRebuild,
   requestBftNodeCosignatures,
   reconcileInFlightL1Txs,

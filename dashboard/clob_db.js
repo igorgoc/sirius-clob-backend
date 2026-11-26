@@ -170,7 +170,7 @@ function getDb(customPath = null) {
       transfers_json TEXT NOT NULL,
       delta_json TEXT NOT NULL,
       order_context_json TEXT,
-      status TEXT NOT NULL CHECK(status IN ('pending_cosign', 'ready', 'broadcast', 'confirmed', 'failed')),
+      status TEXT NOT NULL CHECK(status IN ('pending_cosign', 'ready', 'broadcast', 'confirmed', 'failed', 'expired')),
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -1123,6 +1123,40 @@ function getAllInFlightTradingSettlements() {
   return rows.map(hydrateSettlementRow);
 }
 
+function getAllPendingCosignSettlements() {
+  const db = getDb();
+  const rows = db.prepare("SELECT * FROM trading_settlements WHERE status = 'pending_cosign' ORDER BY created_at ASC").all();
+  return rows.map(hydrateSettlementRow);
+}
+
+/**
+ * Atomically expire a stuck pending_cosign settlement.
+ * Guarded by `WHERE status = 'pending_cosign'` so broadcast/confirmed settlements can NEVER be expired.
+ */
+function expirePendingCosignSettlement(settlementId) {
+  const db = getDb();
+  const now = Date.now();
+  try {
+    const res = db.prepare(`
+      UPDATE trading_settlements
+      SET status = 'expired', collected_cosigs_json = '[]', updated_at = ?
+      WHERE settlement_id = ? AND status = 'pending_cosign'
+    `).run(now, settlementId);
+    return res.changes === 1;
+  } catch (err) {
+    if (String(err && err.message || '').includes('CHECK constraint failed')) {
+      // Legacy pre-existing DB whose CHECK constraint predates 'expired': fall back safely to terminal 'failed'
+      const res = db.prepare(`
+        UPDATE trading_settlements
+        SET status = 'failed', collected_cosigs_json = '[]', updated_at = ?
+        WHERE settlement_id = ? AND status = 'pending_cosign'
+      `).run(now, settlementId);
+      return res.changes === 1;
+    }
+    throw err;
+  }
+}
+
 function updateTradingSettlementStatus(settlementId, status, txHash = null, collectedCosigs = null) {
   const db = getDb();
   // Forward-only finality guard: never overwrite an already confirmed settlement
@@ -1190,6 +1224,8 @@ module.exports = {
   getPendingSettlementsForOwner,
   getPendingSettlementsForCosigner,
   getAllInFlightTradingSettlements,
+  getAllPendingCosignSettlements,
+  expirePendingCosignSettlement,
   updateTradingSettlementStatus,
   updateTradingSettlementPayload,
 };

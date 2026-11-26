@@ -16,10 +16,15 @@ const HEARTBEAT_INTERVAL_MS = 25000;
 const WATCH_INTERVAL_MS = 1000;
 const DRIVE_KEY_HEX = 'bd1d100a98c34f62e170a8395b4498dc1e730286f5a12c489b37d01562f0cb23';
 
+const MAX_WS_BUFFERED_BYTES = 256 * 1024; // 256 KB per-socket backpressure cap (prevents slow-client RAM DoS)
+
 function getClientIp(req) {
-  const xff = req && req.headers && req.headers['x-forwarded-for'];
+  const trustProxy = process.env.CLOB_TRUST_PROXY !== 'false';
+  const xff = trustProxy && req && req.headers && req.headers['x-forwarded-for'];
   if (typeof xff === 'string' && xff.trim()) {
-    return xff.split(',')[0].trim().toLowerCase();
+    // Use right-most proxy-appended IP (never the client-spoofable left-most entry)
+    const parts = xff.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+    if (parts.length > 0) return parts[parts.length - 1];
   }
   return String((req && req.socket && req.socket.remoteAddress) || 'unknown').toLowerCase();
 }
@@ -62,6 +67,7 @@ function attachClobWebSocketHub(httpServer, { clusterDir, clobApi, enrichTradeWi
 
   function safeSend(ws, obj) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (ws.bufferedAmount > MAX_WS_BUFFERED_BYTES) return;
     try {
       ws.send(JSON.stringify(obj));
     } catch (_) {}
@@ -147,6 +153,7 @@ function attachClobWebSocketHub(httpServer, { clusterDir, clobApi, enrichTradeWi
     for (const client of wss.clients) {
       if (client.readyState !== WebSocket.OPEN) continue;
       if (client.subscribedMarket !== market) continue;
+      if (client.bufferedAmount > MAX_WS_BUFFERED_BYTES) continue;
       try {
         if (depthFrame) client.send(depthFrame);
         if (tradesFrame) client.send(tradesFrame);
@@ -226,10 +233,18 @@ function attachClobWebSocketHub(httpServer, { clusterDir, clobApi, enrichTradeWi
       return;
     }
     clientsByIp.set(clientIp, curIpCount + 1);
-    ws.on('close', () => {
+    let ipReleased = false;
+    const releaseClientIp = () => {
+      if (ipReleased) return;
+      ipReleased = true;
       const next = (clientsByIp.get(clientIp) || 1) - 1;
       if (next <= 0) clientsByIp.delete(clientIp);
       else clientsByIp.set(clientIp, next);
+    };
+    ws.on('close', releaseClientIp);
+    ws.on('error', () => {
+      releaseClientIp();
+      try { ws.terminate(); } catch (_) {}
     });
     ws.isAlive = true;
     ws.subscribedMarket = 'xpx_usdt';

@@ -9,12 +9,31 @@
 let cachedPancakeOracle = null;
 let lastPancakeOracleFetch = 0;
 let consecutiveSpikeCount = 0;
+let sharedBscProvider = null;
 
 const PAIR_ADDRESS = '0x439B8E49F2b0d9C9824d5AB641D677511f362dA5';
 const XPX_BSC_CONTRACT = '0x6f3aaf802f57d045efdd2ac9c06d8879305542af';
+const BSC_ORACLE_RPC_URL = process.env.BSC_ORACLE_RPC_URL || 'https://bsc-dataseed.binance.org/';
+const BSC_RPC_TIMEOUT_MS = 5000;
 const MIN_POOL_BNB_RESERVE = 0.05;
 const MIN_POOL_XPX_RESERVE = 1000;
 const MAX_SINGLE_JUMP_RATIO = 0.50; // Reject >50% single-sample spot manipulation spike unless sustained
+
+function getSharedBscProvider() {
+  if (!sharedBscProvider) {
+    const { ethers } = require('ethers');
+    sharedBscProvider = new ethers.JsonRpcProvider(BSC_ORACLE_RPC_URL, undefined, { staticNetwork: true });
+  }
+  return sharedBscProvider;
+}
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
+}
 
 function isPositiveFinite(v) {
   return typeof v === 'number' && Number.isFinite(v) && v > 0;
@@ -54,20 +73,21 @@ async function getPancakeSwapPriceCached(forceRefresh = false) {
     return cachedPancakeOracle;
   }
 
-  // 1. Direct BSC RPC On-Chain Reserves
+  // 1. Direct BSC RPC On-Chain Reserves (reusing shared provider with strict RPC timeout)
   try {
     const { ethers } = require('ethers');
-    const provider = new ethers.JsonRpcProvider('https://bsc-dataseed.binance.org/', undefined, { staticNetwork: true });
+    const provider = getSharedBscProvider();
     const pairAbi = [
       'function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)',
       'function token0() external view returns (address)'
     ];
     const pair = new ethers.Contract(PAIR_ADDRESS, pairAbi, provider);
 
-    const [token0, reserves] = await Promise.all([
-      pair.token0(),
-      pair.getReserves()
-    ]);
+    const [token0, reserves] = await withTimeout(
+      Promise.all([pair.token0(), pair.getReserves()]),
+      BSC_RPC_TIMEOUT_MS,
+      'BSC PancakeSwap getReserves'
+    );
 
     const isXpx0 = token0.toLowerCase() === XPX_BSC_CONTRACT.toLowerCase();
     const xpxReserve = isXpx0 ? Number(reserves[0]) / 1e6 : Number(reserves[1]) / 1e6;

@@ -448,6 +448,89 @@ async function main() {
     assert.ok(workerSrc.includes('poolMode = false') && workerSrc.includes("msg.type === 'execute'"), 'poolMode missing from wasm_worker.js');
   });
 
+  await test('Track 1: Maker/Taker participantContexts attached & ViewClobExchange enforces strict publicKey + cumulative cap', () => {
+    const apiSrc = fs.readFileSync(path.join(__dirname, '../dashboard/clob_api.js'), 'utf8');
+    assert.ok(apiSrc.includes('participantContexts[mkPub]') && apiSrc.includes('signedOrderContext:'), 'clob_api.js must persist signedOrderContext and attach participantContexts for Makers');
+    const vuePath = path.resolve(__dirname, '../../web-wallet-exchange/src/modules/services/submodule/clob/views/ViewClobExchange.vue');
+    if (fs.existsSync(vuePath)) {
+      const vueSrc = fs.readFileSync(vuePath, 'utf8');
+      assert.ok(vueSrc.includes('cumulativeOrderOutflows'), 'ViewClobExchange.vue must track cumulative partial-fill outflows');
+      assert.ok(vueSrc.includes('candidateCtx.publicKey &&'), 'ViewClobExchange.vue must strictly require publicKey on orderContext');
+      assert.ok(!vueSrc.includes('(!ctx.publicKey ||'), 'Weak !ctx.publicKey fallback must be removed');
+    }
+  });
+
+  await test('Track 2: Stuck pending_cosign settlement expires safely, releases deltas, rejects stale cosig & penalizes ONLY defaulter', async () => {
+    const clobDb = require('../dashboard/clob_db');
+    const { Account } = require('tsjs-xpx-chain-sdk');
+    const maker = Account.generateNewAccount(168);
+    const taker = Account.generateNewAccount(168);
+    const makerTa = Account.generateNewAccount(168);
+    const takerTa = Account.generateNewAccount(168);
+    const sid = `SET_TEST_EXPIRE_${Date.now()}`;
+    const oldCreatedAt = Date.now() - 48 * 60 * 60 * 1000; // 48h old (> 24h TTL)
+
+    // Taker signed, Maker defaulted!
+    clobDb.saveTradingSettlement({
+      settlementId: sid,
+      orderId: '777',
+      ownerPublicKey: taker.publicKey,
+      tradingPublicKey: takerTa.publicKey,
+      counterpartyKey: maker.publicKey,
+      txHash: 'AA'.repeat(32),
+      aggregatePayload: '00'.repeat(120),
+      requiredCosigners: [taker.publicKey.toUpperCase(), maker.publicKey.toUpperCase()],
+      collectedCosigs: [{ signer: taker.publicKey.toUpperCase(), signature: 'BB'.repeat(64) }],
+      transfers: [{ fromTradingPub: takerTa.publicKey, fromType: 'TRADING', ownerPublicKey: taker.publicKey, toAddress: makerTa.address.plain(), mosaicHex: '4430AEFEF7E15D0C', amountAtomic: '1000', symbol: 'USDT' }],
+      delta: { xpx: '1000000', usdt: '-1000', bnb: '0' },
+      status: 'pending_cosign',
+      createdAt: oldCreatedAt,
+    });
+
+    const expiredList = await cosigner.expireStalePendingSettlements({ ttlMs: 60_000, now: Date.now() });
+    const hit = expiredList.find((e) => e.settlementId === sid);
+    assert.ok(hit, 'Stale pending_cosign settlement must be expired');
+    assert.deepStrictEqual(hit.defaulters, [maker.publicKey.toUpperCase()], 'Only non-cosigning Maker should be flagged as defaulter');
+
+    const after = clobDb.getTradingSettlement(sid);
+    assert.strictEqual(after.status, 'expired');
+    assert.strictEqual(cosigner.checkCosignDefaulterCooldown(taker.publicKey).restricted, false, 'Honest cosigning Taker must NOT be restricted');
+    assert.strictEqual(cosigner.checkCosignDefaulterCooldown(maker.publicKey).restricted, true, 'Defaulting Maker MUST receive order-placement cooldown');
+
+    // Stale late cosignature on expired settlement must be rejected
+    await assert.rejects(
+      () => cosigner.submitSettlementCosignature({ settlementId: sid, cosignature: { signer: maker.publicKey, signature: 'CC'.repeat(64) } }),
+      /terminal \(expired\)/
+    );
+  });
+
+  await test('Track 3: swap_api Mainnet fail-closed guard, durable PENDING reservation, oracle timeout & ws_hub right-most IP', () => {
+    const swapSrc = fs.readFileSync(path.join(__dirname, '../dashboard/swap_api.js'), 'utf8');
+    assert.ok(swapSrc.includes('assertBridgeNetworkConfigured'), 'swap_api.js must fail closed on Mainnet without BSC Mainnet env');
+    assert.ok(swapSrc.includes("status: 'PENDING'") && swapSrc.includes('isValidSiriusAddressForActiveNetwork(normClaimRecipient)'), 'swap_api.js must reserve PENDING before L1 delivery and validate claimRecipient');
+    assert.ok(swapSrc.includes('(SiriusNetwork:${config.NETWORK_TYPE}, BscChain:${ACTIVE_BSC_CHAIN_ID})'), 'swap_api.js must domain-separate EVM claim signatures');
+
+    const oracleSrc = fs.readFileSync(path.join(__dirname, '../dashboard/pancakeswap_oracle.js'), 'utf8');
+    assert.ok(oracleSrc.includes('getSharedBscProvider') && oracleSrc.includes('withTimeout('), 'pancakeswap_oracle.js must reuse provider and enforce RPC timeout');
+
+    const wsSrc = fs.readFileSync(path.join(__dirname, '../dashboard/ws_hub.js'), 'utf8');
+    assert.ok(wsSrc.includes('parts[parts.length - 1]') && wsSrc.includes('MAX_WS_BUFFERED_BYTES') && wsSrc.includes("ws.on('error'"), 'ws_hub.js must use right-most XFF IP, backpressure cap, and error handler');
+  });
+
+  await test('Track 4: Fair per-pair round-robin consensus lanes prevent starvation across XPX/USDT & XPX/BNB', async () => {
+    const clobApi = require('../dashboard/clob_api');
+    const order = [];
+    // Enqueue 3 xpx_usdt tasks + 2 xpx_bnb tasks concurrently while lane drains; xpx_bnb must interleave!
+    const p1 = clobApi.withClusterConsensusLock(async () => { await new Promise((r) => setTimeout(r, 15)); order.push('usdt-1'); }, 'xpx_usdt');
+    const p2 = clobApi.withClusterConsensusLock(async () => { order.push('usdt-2'); }, 'xpx_usdt');
+    const p3 = clobApi.withClusterConsensusLock(async () => { order.push('usdt-3'); }, 'xpx_usdt');
+    const p4 = clobApi.withClusterConsensusLock(async () => { order.push('bnb-1'); }, 'xpx_bnb');
+    const p5 = clobApi.withClusterConsensusLock(async () => { order.push('bnb-2'); }, 'xpx_bnb');
+    await Promise.all([p1, p2, p3, p4, p5]);
+    assert.strictEqual(order.length, 5);
+    assert.ok(order.indexOf('bnb-1') < order.indexOf('usdt-3'), `Expected round-robin interleaving so bnb-1 runs before usdt-3, got: ${JSON.stringify(order)}`);
+  });
+
   try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
 
   console.log(`\n🎉 Red-Team 5-Pass Hardening Suite: ${passed} tests passed.\n`);
