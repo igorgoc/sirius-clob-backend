@@ -9,7 +9,7 @@ const path = require('path');
 const crypto = require('crypto');
 const net = require('net');
 module.paths.push(path.resolve(__dirname, '../../web-wallet-vuejs/node_modules'));
-const { exec, execFile, spawn } = require('child_process');
+const { exec, execFile, execFileSync, spawn } = require('child_process');
 const clobApi = require('./clob_api');
 const clobDb = require('./clob_db');
 const swapApi = require('./swap_api');
@@ -24,6 +24,16 @@ let clobWsHub = null;
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8088;
 const ROOT_DIR = path.resolve(__dirname, '..');
 const CLUSTER_DIR = path.join(ROOT_DIR, 'cluster');
+const SERVER_STARTED_AT = new Date().toISOString();
+const BUILD_COMMIT = (() => {
+  const envCommit = (process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || '').trim();
+  if (envCommit) return envCommit.slice(0, 12);
+  try {
+    return execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: ROOT_DIR, encoding: 'utf8', timeout: 2000 }).trim() || 'unknown';
+  } catch (_) {
+    return 'unknown';
+  }
+})();
 const ADMIN_SECRET_FILE = path.join(CLUSTER_DIR, 'admin_secret.key');
 let clusterAdminKey = process.env.CLOB_ADMIN_KEY || '';
 
@@ -1003,6 +1013,11 @@ const server = http.createServer((req, res) => {
     res.end(
       JSON.stringify({
         ok: !clobApi.exchangeCircuitBreaker.tripped,
+        build: {
+          commit: BUILD_COMMIT,
+          network: testnet2Config.NETWORK_ENV || testnet2Config.NETWORK_NAME || 'testnet2',
+          startedAt: SERVER_STARTED_AT,
+        },
         circuitBreaker: clobApi.exchangeCircuitBreaker,
         majorityCanonicalNode: majorityNode,
         nodeStateRoots: { node1: h1, node2: h2, node3: h3 },
