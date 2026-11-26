@@ -61,9 +61,18 @@ const NETWORK_PROFILES = {
   },
 };
 
-const activeEnv = (process.env.SIRIUS_NETWORK || 'testnet2').toLowerCase();
+const rawEnv = (process.env.SIRIUS_NETWORK || '').trim().toLowerCase();
+const rawNetType = process.env.SIRIUS_NETWORK_TYPE ? Number(process.env.SIRIUS_NETWORK_TYPE) : null;
+const activeEnv = rawEnv || (rawNetType === 184 ? 'mainnet' : 'testnet2');
 const profile = NETWORK_PROFILES[activeEnv] || NETWORK_PROFILES.testnet2;
-const networkType = Number(process.env.SIRIUS_NETWORK_TYPE || profile.NETWORK_TYPE);
+const networkType = rawNetType || profile.NETWORK_TYPE;
+
+if (rawEnv && rawNetType && rawNetType !== profile.NETWORK_TYPE) {
+  throw new Error(
+    `Conflicting Sirius network configuration: SIRIUS_NETWORK=${rawEnv} expects networkType ${profile.NETWORK_TYPE}, but SIRIUS_NETWORK_TYPE=${rawNetType} was set.`
+  );
+}
+const isMainnetEnv = activeEnv === 'mainnet' || networkType === 184;
 
 const SUPERCONTRACT_PUBKEY = process.env.SIRIUS_SUPERCONTRACT_PUBKEY || 'c589bfef210489d3a1bf46b1a05d8b1cf0252bc9fb2e0b53cfd748262b0ce341';
 const SUPERCONTRACT_ADDRESS = deriveAddress(
@@ -92,13 +101,24 @@ module.exports = {
   DOMAIN_SEPARATOR: process.env.SIRIUS_DOMAIN_SEPARATOR || `${networkType}:SiriusCLOB-v1`,
   EXPLORER_BASE_URL: process.env.SIRIUS_EXPLORER_URL || profile.EXPLORER_BASE_URL,
   CONFIRMATION_DEPTH: Number(process.env.SIRIUS_CONFIRMATION_DEPTH || profile.CONFIRMATION_DEPTH || 1),
-  FAUCET_ENABLED: process.env.SIRIUS_FAUCET_ENABLED !== undefined ? process.env.SIRIUS_FAUCET_ENABLED === 'true' : profile.FAUCET_ENABLED,
+  // Faucet is unconditionally disabled on Sirius Mainnet (184) regardless of stale env vars
+  FAUCET_ENABLED: isMainnetEnv
+    ? false
+    : (process.env.SIRIUS_FAUCET_ENABLED !== undefined ? process.env.SIRIUS_FAUCET_ENABLED === 'true' : profile.FAUCET_ENABLED),
 
-  // Canonical Network Mosaics
+  // Canonical Network Mosaics (never let stale TESTNET_* env vars override Mainnet mosaics)
   XPX_MOSAIC_ID: (process.env.SIRIUS_XPX_MOSAIC_ID || profile.XPX_MOSAIC_ID).toUpperCase(),
   XPX_NAMESPACE_ID: (process.env.SIRIUS_XPX_NAMESPACE_ID || profile.XPX_NAMESPACE_ID).toLowerCase(),
-  USDT_MOSAIC_ID: (process.env.TESTNET_USDT_MOSAIC_ID || process.env.SIRIUS_USDT_MOSAIC_ID || profile.USDT_MOSAIC_ID).toUpperCase(),
-  BNB_MOSAIC_ID: (process.env.TESTNET_BNB_MOSAIC_ID || process.env.SIRIUS_BNB_MOSAIC_ID || profile.BNB_MOSAIC_ID).toUpperCase(),
+  USDT_MOSAIC_ID: (
+    process.env.SIRIUS_USDT_MOSAIC_ID ||
+    (!isMainnetEnv ? process.env.TESTNET_USDT_MOSAIC_ID : '') ||
+    profile.USDT_MOSAIC_ID
+  ).toUpperCase(),
+  BNB_MOSAIC_ID: (
+    process.env.SIRIUS_BNB_MOSAIC_ID ||
+    (!isMainnetEnv ? process.env.TESTNET_BNB_MOSAIC_ID : '') ||
+    profile.BNB_MOSAIC_ID
+  ).toUpperCase(),
 
   // Internal WASM SuperContract Mosaic Constants (translated at L1 boundary)
   WASM_XPX_HEX: '0DC67FBE1CAD29E3',
@@ -119,12 +139,12 @@ module.exports = {
   SUPERCONTRACT_PUBKEY,
   SUPERCONTRACT_ADDRESS,
 
-  // Canonical on-chain deposit & escrow target
-  VAULT_ADDRESS: process.env.SIRIUS_VAULT_ADDRESS || 'VAAUXFYQ424I6V3JDVWCBWGWHRTIJGTSX4B2TLSV',
-  LEGACY_VAULT_ADDRESS: process.env.SIRIUS_LEGACY_VAULT_ADDRESS || 'VAAUXFYQ424I6V3JDVWCBWGWHRTIJGTSX4B2TLSV',
+  // Canonical on-chain deposit & escrow target (never fall back to Testnet V... addresses on Mainnet!)
+  VAULT_ADDRESS: process.env.SIRIUS_VAULT_ADDRESS || (isMainnetEnv ? '' : 'VAAUXFYQ424I6V3JDVWCBWGWHRTIJGTSX4B2TLSV'),
+  LEGACY_VAULT_ADDRESS: process.env.SIRIUS_LEGACY_VAULT_ADDRESS || (isMainnetEnv ? '' : 'VAAUXFYQ424I6V3JDVWCBWGWHRTIJGTSX4B2TLSV'),
   VAULT_KEY_FILE: path.join(STATE_DIR, 'vault_account.json'),
   TREASURY_KEY_FILE: path.join(STATE_DIR, 'treasury_account.json'),
-  TREASURY_ADDRESS: process.env.SIRIUS_TREASURY_ADDRESS || 'VC46DFR25R5EWJWR32E4TFOYC57VXFNPKAASJTLV',
+  TREASURY_ADDRESS: process.env.SIRIUS_TREASURY_ADDRESS || (isMainnetEnv ? '' : 'VC46DFR25R5EWJWR32E4TFOYC57VXFNPKAASJTLV'),
   FEE_COLLECTOR_FILE: path.join(STATE_DIR, 'fee_collector_account.json'),
   FEE_COLLECTOR_ADDRESS,
   FEE_COLLECTOR_PUBKEY,

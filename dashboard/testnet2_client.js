@@ -142,6 +142,7 @@ async function getLatestHeight() {
 }
 
 const onChainBalancesCache = new Map();
+const inFlightBalanceFetches = new Map();
 const ONCHAIN_BALANCE_CACHE_TTL_MS = 15000; // 15s TTL to avoid flooding Sirius L1 RPC
 
 function invalidateAccountBalanceCache(rawAddress) {
@@ -153,7 +154,8 @@ function invalidateAccountBalanceCache(rawAddress) {
 }
 
 /**
- * Get on-chain mosaic balances for an account address with automatic failover and memory caching
+ * Get on-chain mosaic balances for an account address with automatic failover, memory caching,
+ * and in-flight promise deduplication (prevents concurrent RPC storms for the same address).
  */
 async function getAccountOnChainBalances(rawAddress, forceRefresh = false) {
   const normAddr = String(rawAddress || '').toUpperCase();
@@ -163,7 +165,12 @@ async function getAccountOnChainBalances(rawAddress, forceRefresh = false) {
     return new Map(cached.balances);
   }
 
-  const balances = await withNodeFailover(
+  if (!forceRefresh && inFlightBalanceFetches.has(normAddr)) {
+    const shared = await inFlightBalanceFetches.get(normAddr);
+    return new Map(shared);
+  }
+
+  const fetchPromise = withNodeFailover(
     ({ accountHttp }) =>
       new Promise((resolve, reject) => {
         try {
@@ -191,9 +198,13 @@ async function getAccountOnChainBalances(rawAddress, forceRefresh = false) {
           reject(e);
         }
       })
-  );
+  ).finally(() => {
+    inFlightBalanceFetches.delete(normAddr);
+  });
 
-  onChainBalancesCache.set(normAddr, { balances, timestamp: now });
+  inFlightBalanceFetches.set(normAddr, fetchPromise);
+  const balances = await fetchPromise;
+  onChainBalancesCache.set(normAddr, { balances, timestamp: Date.now() });
   return new Map(balances);
 }
 

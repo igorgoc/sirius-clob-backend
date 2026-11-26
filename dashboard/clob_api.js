@@ -391,11 +391,21 @@ function loadUsedNonces() {
 
 function saveUsedNonces() {
   try {
+    const now = Date.now();
     const obj = {};
     for (const [key, nonceMap] of usedNonces.entries()) {
-      obj[key] = Object.fromEntries(nonceMap.entries());
+      for (const [nStr, exp] of nonceMap.entries()) {
+        if (exp <= now) nonceMap.delete(nStr);
+      }
+      if (nonceMap.size === 0) {
+        usedNonces.delete(key);
+      } else {
+        obj[key] = Object.fromEntries(nonceMap.entries());
+      }
     }
-    fs.writeFileSync(NONCES_FILE, JSON.stringify(obj, null, 2));
+    const tmpFile = `${NONCES_FILE}.tmp.${process.pid}`;
+    fs.writeFileSync(tmpFile, JSON.stringify(obj, null, 2));
+    fs.renameSync(tmpFile, NONCES_FILE);
   } catch (_) {}
 }
 
