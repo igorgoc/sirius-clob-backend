@@ -253,6 +253,33 @@ async function main() {
     );
   });
 
+  await test('Pass 5: Mainnet hard guard blocks legacy custodial deposits, orders, withdrawals & emergencyUnlock', async () => {
+    const prevNet = process.env.SIRIUS_NETWORK;
+    process.env.SIRIUS_NETWORK = 'mainnet';
+    const dummyPub = 'e'.repeat(64);
+    try {
+      await assert.rejects(
+        () => clobApi.depositTokens({ publicKey: dummyPub, amount: '10', mosaicId: 'XPX' }),
+        /Legacy custodial vault deposits are permanently disabled on Mainnet/
+      );
+      await assert.rejects(
+        () => clobApi.placeOrder({ publicKey: dummyPub, side: 'BUY', price: '0.001', amount: '10', pair: 'XPX/USDT' }),
+        /Mainnet requires an active non-custodial 2-of-2 Smart Trading Account/
+      );
+      await assert.rejects(
+        () => clobApi.withdrawTokens({ publicKey: dummyPub, amount: '10', mosaic: 'XPX', nonce: '1', expiry: Date.now() + 60000 }),
+        /Legacy custodial vault withdrawals are disabled on Mainnet/
+      );
+      await assert.rejects(
+        () => clobApi.emergencyUnlock({ publicKey: dummyPub, nonce: '1', expiry: Date.now() + 60000, signature: '0'.repeat(128) }),
+        /Legacy custodial vault emergency unlock is disabled on Mainnet/
+      );
+    } finally {
+      if (prevNet === undefined) delete process.env.SIRIUS_NETWORK;
+      else process.env.SIRIUS_NETWORK = prevNet;
+    }
+  });
+
   try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
 
   console.log(`\n🎉 Red-Team 5-Pass Hardening Suite: ${passed} tests passed.\n`);

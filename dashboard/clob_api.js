@@ -3580,6 +3580,15 @@ async function syncUserOnChainBalanceToDrive(publicKey) {
   }
 }
 
+function isMainnetNonCustodialOnly() {
+  const isMainnet =
+    testnet2Config.NETWORK_TYPE === 184 ||
+    String(testnet2Config.NETWORK_ENV || '').toLowerCase() === 'mainnet' ||
+    String(process.env.SIRIUS_NETWORK || '').toLowerCase() === 'mainnet' ||
+    String(process.env.NETWORK_ENV || '').toLowerCase() === 'mainnet';
+  return isMainnet && process.env.ALLOW_MAINNET_LEGACY_VAULT !== 'true';
+}
+
 /**
  * Handle Order Placement from Web Wallet (serialized per callerKey via withAccountLock)
  */
@@ -3596,6 +3605,11 @@ async function _placeOrderUnlocked(orderReq) {
     const preAcc = preKey ? clobDb.getTradingAccountByOwner(preKey) : null;
     isNonCustodialCaller = Boolean(preAcc && preAcc.status === 'active');
   } catch (_) {}
+  if (isMainnetNonCustodialOnly() && !isNonCustodialCaller) {
+    throw new Error(
+      'Mainnet requires an active non-custodial 2-of-2 Smart Trading Account. Legacy custodial vault trading is disabled on Mainnet.'
+    );
+  }
   checkAndEnforceCircuitBreaker('Order Placement', { isNonCustodialTradingAccount: isNonCustodialCaller });
   const pair = (orderReq.pair || orderReq.market || 'XPX/USDT').toUpperCase().replace('_', '/');
   const pairParts = pair.split('/');
@@ -4800,6 +4814,11 @@ async function claimFaucet(publicKey, addressOverride = null) {
  * Deposit Tokens into SuperContract Vault & On-Chain BalanceLedger
  */
 async function depositTokens(depositReq, options = {}) {
+  if (isMainnetNonCustodialOnly()) {
+    throw new Error(
+      'Legacy custodial vault deposits are permanently disabled on Mainnet. Please activate and fund your non-custodial 2-of-2 Smart Trading Account directly on Sirius L1.'
+    );
+  }
   const callerKey = normalizeKey(depositReq.publicKey || depositReq.callerPublicKey);
   return withAccountLock(callerKey, async () => {
     checkAndEnforceCircuitBreaker('Token Deposit');
@@ -5146,6 +5165,11 @@ function getVerifiedVaultDepositedBalance(callerKey, mosaicId) {
 }
 
 async function _withdrawTokensUnlocked(withdrawReq) {
+  if (isMainnetNonCustodialOnly()) {
+    throw new Error(
+      'Legacy custodial vault withdrawals are disabled on Mainnet. Please use co-signed 2-of-2 Smart Trading Account withdrawal.'
+    );
+  }
   checkAndEnforceCircuitBreaker('Token Withdrawal');
   const callerKey = normalizeKey(withdrawReq.publicKey || withdrawReq.callerPublicKey);
   const nonce = withdrawReq.nonce;
@@ -5570,6 +5594,11 @@ async function emergencyUnlock(req) {
 }
 
 async function _emergencyUnlockUnlocked(req, callerKey) {
+  if (isMainnetNonCustodialOnly()) {
+    throw new Error(
+      'Legacy custodial vault emergency unlock is disabled on Mainnet. Your funds are held non-custodially in your 2-of-2 Smart Trading Account on Sirius L1.'
+    );
+  }
   // Cryptographic authentication: Require ed25519 signature over (EMERGENCY_UNLOCK, callerKey, nonce, expiry)
   if (!req.signature) {
     throw new Error('Missing ed25519 signature: Emergency unlock must be cryptographically signed by the account owner');
