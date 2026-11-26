@@ -419,7 +419,7 @@ function checkAndRecordNonce(pubKeyHex, nonce, expiry) {
   const expiryNum = Number(expiry);
   const now = Date.now();
   const MAX_EXPIRY_WINDOW_MS = 60 * 60 * 1000; // Max 1 hour into the future
-  if (isNaN(expiryNum) || expiryNum < now) {
+  if (isNaN(expiryNum) || expiryNum <= now) {
     throw new Error(`Request has expired (expiry=${expiryNum}, now=${now})`);
   }
   if (expiryNum > now + MAX_EXPIRY_WINDOW_MS) {
@@ -3095,11 +3095,20 @@ let codWatchdogInterval = null;
 
 function registerHeartbeat(req) {
   const callerKey = normalizeKey(req && (req.publicKey || req.callerPublicKey)).toLowerCase();
-  if (!callerKey || callerKey.length !== 64) {
+  if (!callerKey || !/^[0-9a-f]{64}$/.test(callerKey)) {
     throw new Error('Valid 64-character hex public key required for heartbeat registration');
   }
 
   const timeoutMs = Math.max(1000, Math.min(120000, Number(req.timeoutMs) || 10000));
+  // CRITICAL: Require cryptographic Ed25519 signature + nonce + expiry so attackers cannot
+  // register a 1s Cancel-on-Disconnect timer on a victim's or Market Maker's publicKey!
+  if (!req || !req.signature) {
+    throw new Error('Missing ed25519 signature: Heartbeat registration must be cryptographically signed by the account owner');
+  }
+  const hbMsg = `${DOMAIN_SEPARATOR}:HEARTBEAT_REGISTER:${callerKey}:${timeoutMs}:${req.nonce}:${req.expiry}`;
+  verifyEd25519Signature(callerKey, hbMsg, req.signature);
+  checkAndRecordNonce(callerKey, req.nonce, req.expiry);
+
   const rawMarkets = req.markets || req.pair || req.market || ['XPX/USDT'];
   const markets = Array.isArray(rawMarkets) ? rawMarkets : [String(rawMarkets)];
 
@@ -3138,6 +3147,16 @@ function registerHeartbeat(req) {
 
 function deregisterHeartbeat(req) {
   const callerKey = normalizeKey(req && (req.publicKey || req.callerPublicKey)).toLowerCase();
+  if (!callerKey || !/^[0-9a-f]{64}$/.test(callerKey)) {
+    throw new Error('Valid 64-character hex public key required for heartbeat deregistration');
+  }
+  if (!req || !req.signature) {
+    throw new Error('Missing ed25519 signature: Heartbeat deregistration must be cryptographically signed by the account owner');
+  }
+  const hbMsg = `${DOMAIN_SEPARATOR}:HEARTBEAT_DEREGISTER:${callerKey}:${req.nonce}:${req.expiry}`;
+  verifyEd25519Signature(callerKey, hbMsg, req.signature);
+  checkAndRecordNonce(callerKey, req.nonce, req.expiry);
+
   const deleted = codRegistry.delete(callerKey);
   return {
     ok: true,
@@ -3612,6 +3631,9 @@ async function _placeOrderUnlocked(orderReq) {
   }
   checkAndEnforceCircuitBreaker('Order Placement', { isNonCustodialTradingAccount: isNonCustodialCaller });
   const pair = (orderReq.pair || orderReq.market || 'XPX/USDT').toUpperCase().replace('_', '/');
+  if (!/^XPX\/(USDT|BNB)$/.test(pair)) {
+    throw new Error(`Unsupported trading pair "${pair}". Allowed pairs: XPX/USDT, XPX/BNB`);
+  }
   const pairParts = pair.split('/');
   const baseAsset = (pairParts[0] || 'XPX').trim();
   const quoteAsset = (pairParts[1] || 'USDT').trim();
@@ -3728,13 +3750,17 @@ async function _placeOrderUnlocked(orderReq) {
   assertLedgerReconciliation(callerKey, quoteMosaicId);
 
   // 2. Solvency check: Canonical drive ledger total <= on-chain vault balance
-  try {
-    assertSolvencyReconciliation(baseMosaicId);
-    assertSolvencyReconciliation(quoteMosaicId);
-  } catch (solvErr) {
-    await syncVaultBalancesFromTestnet2();
-    assertSolvencyReconciliation(baseMosaicId, true);
-    assertSolvencyReconciliation(quoteMosaicId, true);
+  // Only applies to legacy custodial Hot Vault callers — non-custodial 2-of-2 Smart Trading Accounts
+  // hold their funds directly on Sirius L1 in their own multisig account (T_user).
+  if (!isNonCustodialCaller) {
+    try {
+      assertSolvencyReconciliation(baseMosaicId);
+      assertSolvencyReconciliation(quoteMosaicId);
+    } catch (solvErr) {
+      await syncVaultBalancesFromTestnet2();
+      assertSolvencyReconciliation(baseMosaicId, true);
+      assertSolvencyReconciliation(quoteMosaicId, true);
+    }
   }
   const tSolv = Date.now();
 
@@ -4656,9 +4682,15 @@ async function _cancelAllOrdersUnlocked(cancelAllReq) {
   // Restore all locked balances to available from canonical drive ledger
   syncGatewayCacheFromDrive(callerKey);
 
+  const targetCancelPair = (cancelAllReq.pair || cancelAllReq.market)
+    ? String(cancelAllReq.pair || cancelAllReq.market).toUpperCase().replace('_', '/')
+    : null;
   for (const [id, o] of activeOrders.entries()) {
     if (o.callerKey.toLowerCase() === callerKey.toLowerCase()) {
-      activeOrders.delete(id);
+      const orderPair = String(o.pair || 'XPX/USDT').toUpperCase().replace('_', '/');
+      if (!targetCancelPair || orderPair === targetCancelPair) {
+        activeOrders.delete(id);
+      }
     }
   }
   saveActiveOrders();

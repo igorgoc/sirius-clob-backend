@@ -885,7 +885,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Admin Action: Restart All Services Cleanly (Admin Protected)
+  // Admin Action: Restart All Services Cleanly (Admin Protected + 30s Cooldown)
   if (pathname === '/api/action/restart' && req.method === 'POST') {
     parseJsonBody(req).catch(() => ({})).then((body) => {
       const auth = verifyAdminAuth(req, body, 'RESTART');
@@ -894,6 +894,13 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ ok: false, success: false, error: auth.error }));
         return;
       }
+      const now = Date.now();
+      if (global.__lastAdminRestartAt && now - global.__lastAdminRestartAt < 30000) {
+        res.writeHead(429, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, success: false, error: 'Restart cooldown active (30s minimum between restarts)' }));
+        return;
+      }
+      global.__lastAdminRestartAt = now;
       const servicesSh = path.join(ROOT_DIR, 'services.sh');
       if (fs.existsSync(servicesSh)) {
         exec(`${servicesSh} restart`, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
@@ -1259,8 +1266,13 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // SiriusCLOB DEX Endpoint: Market Maker Logs
+  // SiriusCLOB DEX Endpoint: Market Maker Logs (Operator Protected)
   if (pathname === '/api/clob/mm/logs' && req.method === 'GET') {
+    if (!isTelemetryAllowed(req)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Forbidden: Market Maker logs are restricted to authorized operators' }));
+      return;
+    }
     const mmLogFile = path.join(CLUSTER_DIR, 'mm.log');
     if (fs.existsSync(mmLogFile)) {
       try {
@@ -1515,6 +1527,14 @@ const server = http.createServer((req, res) => {
     parseJsonBody(req)
       .then(async (body) => {
         try {
+          // Security: Strip unsigned collar-bypass flag from untrusted HTTP payloads on Mainnet
+          if (
+            body &&
+            typeof body === 'object' &&
+            (testnet2Config.NETWORK_TYPE === 184 || String(testnet2Config.NETWORK_ENV || '').toLowerCase() === 'mainnet')
+          ) {
+            delete body.allowWideCollar;
+          }
           const result = await clobApi.placeOrder(body);
           if (clobWsHub) {
             clobWsHub.broadcastMarketUpdate(body?.pair || body?.market || 'xpx_usdt', { force: true });
@@ -1685,18 +1705,26 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // SiriusCLOB DEX Endpoint: Manual Trigger for Sweeping Expired Stale Orders
+  // SiriusCLOB DEX Endpoint: Manual Trigger for Sweeping Expired Stale Orders (Admin Protected)
   if (pathname === '/api/clob/orders/sweep-expired' && req.method === 'POST') {
-    clobApi
-      .sweepExpiredOrders()
-      .then((result) => {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(result));
-      })
-      .catch((err) => {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: err.message }));
-      });
+    parseJsonBody(req).catch(() => ({})).then((body) => {
+      const auth = verifyAdminAuth(req, body, 'SWEEP_EXPIRED_ORDERS');
+      if (!auth.authorized) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: auth.error }));
+        return;
+      }
+      clobApi
+        .sweepExpiredOrders()
+        .then((result) => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(result));
+        })
+        .catch((err) => {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        });
+    });
     return;
   }
 

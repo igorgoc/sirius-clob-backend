@@ -24,6 +24,7 @@ module.paths.push(path.resolve(__dirname, '../../web-wallet-vuejs/node_modules')
 const {
   Account,
   Address,
+  RawAddress,
   ChainHttp,
   AccountHttp,
   TransactionHttp,
@@ -34,6 +35,14 @@ const {
   MosaicId,
   UInt64,
 } = require('tsjs-xpx-chain-sdk');
+
+function uint64ToBigIntExact(u64) {
+  if (!u64) return 0n;
+  if (typeof u64.toHex === 'function') {
+    return BigInt('0x' + u64.toHex());
+  }
+  return BigInt(u64.compact());
+}
 const config = require('./testnet2_config');
 
 const CANDIDATE_NODE_URLS = Array.from(
@@ -144,10 +153,15 @@ async function getLatestHeight() {
 const onChainBalancesCache = new Map();
 const inFlightBalanceFetches = new Map();
 const ONCHAIN_BALANCE_CACHE_TTL_MS = 15000; // 15s TTL to avoid flooding Sirius L1 RPC
+const MAX_ONCHAIN_BALANCE_CACHE_ENTRIES = 2000; // Bound cache size to prevent memory DoS
+
+function normalizeCacheAddress(rawAddress) {
+  return String(rawAddress || '').replace(/[- ]/g, '').trim().toUpperCase();
+}
 
 function invalidateAccountBalanceCache(rawAddress) {
   if (rawAddress) {
-    onChainBalancesCache.delete(String(rawAddress).toUpperCase());
+    onChainBalancesCache.delete(normalizeCacheAddress(rawAddress));
   } else {
     onChainBalancesCache.clear();
   }
@@ -158,7 +172,7 @@ function invalidateAccountBalanceCache(rawAddress) {
  * and in-flight promise deduplication (prevents concurrent RPC storms for the same address).
  */
 async function getAccountOnChainBalances(rawAddress, forceRefresh = false) {
-  const normAddr = String(rawAddress || '').toUpperCase();
+  const normAddr = normalizeCacheAddress(rawAddress);
   const now = Date.now();
   const cached = onChainBalancesCache.get(normAddr);
   if (!forceRefresh && cached && (now - cached.timestamp < ONCHAIN_BALANCE_CACHE_TTL_MS)) {
@@ -174,12 +188,12 @@ async function getAccountOnChainBalances(rawAddress, forceRefresh = false) {
     ({ accountHttp }) =>
       new Promise((resolve, reject) => {
         try {
-          const addr = Address.createFromRawAddress(rawAddress);
+          const addr = Address.createFromRawAddress(normAddr);
           accountHttp.getAccountInfo(addr).subscribe(
             (info) => {
               const res = new Map();
               for (const m of info.mosaics) {
-                res.set(m.id.toHex().toLowerCase(), BigInt(m.amount.compact()));
+                res.set(m.id.toHex().toLowerCase(), uint64ToBigIntExact(m.amount));
               }
               resolve(res);
             },
@@ -204,6 +218,10 @@ async function getAccountOnChainBalances(rawAddress, forceRefresh = false) {
 
   inFlightBalanceFetches.set(normAddr, fetchPromise);
   const balances = await fetchPromise;
+  if (onChainBalancesCache.size >= MAX_ONCHAIN_BALANCE_CACHE_ENTRIES && !onChainBalancesCache.has(normAddr)) {
+    const oldestKey = onChainBalancesCache.keys().next().value;
+    if (oldestKey !== undefined) onChainBalancesCache.delete(oldestKey);
+  }
   onChainBalancesCache.set(normAddr, { balances, timestamp: Date.now() });
   return new Map(balances);
 }
@@ -233,7 +251,7 @@ async function queryTransaction(txHash) {
                   return {
                     mosaicIdHex: hex,
                     mosaicIdDec: BigInt('0x' + hex).toString(10),
-                    amount: BigInt(m.amount.compact()),
+                    amount: uint64ToBigIntExact(m.amount),
                   };
                 }),
               });
@@ -323,7 +341,18 @@ async function broadcastVaultTransfer(vaultAccount, recipientAddressStr, mosaicI
     cleanMosaicHex === config.XPX_MOSAIC_ID
   ) ? config.XPX_MOSAIC_ID : cleanMosaicHex;
 
-  const recipient = Address.createFromRawAddress(recipientAddressStr);
+  const cleanRecipient = String(recipientAddressStr || '').replace(/[- ]/g, '').trim().toUpperCase();
+  if (RawAddress && typeof RawAddress.isValidAddress === 'function') {
+    if (!RawAddress.isValidAddress(RawAddress.stringToAddress(cleanRecipient))) {
+      throw new Error(`Invalid Sirius recipient address checksum: ${recipientAddressStr}`);
+    }
+  }
+  const recipient = Address.createFromRawAddress(cleanRecipient);
+  if (recipient.networkType !== config.NETWORK_TYPE) {
+    throw new Error(
+      `Recipient address network mismatch: address ${cleanRecipient} has networkType ${recipient.networkType}, expected ${config.NETWORK_TYPE}`
+    );
+  }
   const mosaic = new Mosaic(
     new MosaicId(onChainMosaicHex),
     UInt64.fromHex(amt.toString(16).padStart(16, '0'))

@@ -11,9 +11,27 @@ const { WebSocketServer, WebSocket } = require('ws');
 
 const VALID_MARKETS = new Set(['xpx_usdt', 'xpx_bnb']);
 const MAX_WS_CLIENTS = Math.max(20, Number(process.env.CLOB_MAX_WS_CLIENTS || 250));
+const MAX_WS_CLIENTS_PER_IP = Math.max(2, Number(process.env.CLOB_MAX_WS_CLIENTS_PER_IP || 15));
 const HEARTBEAT_INTERVAL_MS = 25000;
 const WATCH_INTERVAL_MS = 1000;
 const DRIVE_KEY_HEX = 'bd1d100a98c34f62e170a8395b4498dc1e730286f5a12c489b37d01562f0cb23';
+
+function getClientIp(req) {
+  const xff = req && req.headers && req.headers['x-forwarded-for'];
+  if (typeof xff === 'string' && xff.trim()) {
+    return xff.split(',')[0].trim().toLowerCase();
+  }
+  return String((req && req.socket && req.socket.remoteAddress) || 'unknown').toLowerCase();
+}
+
+function isWsOriginAllowed(req) {
+  const allowListRaw = String(process.env.CLOB_WS_ALLOWED_ORIGINS || '').trim();
+  if (!allowListRaw) return true;
+  const origin = String((req && req.headers && req.headers.origin) || '').trim().toLowerCase();
+  if (!origin) return true; // Non-browser clients
+  const allowed = allowListRaw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  return allowed.includes(origin);
+}
 
 function normalizeMarket(raw) {
   const s = String(raw || 'xpx_usdt').trim().toLowerCase().replace('/', '_');
@@ -32,6 +50,7 @@ function attachClobWebSocketHub(httpServer, { clusterDir, clobApi, enrichTradeWi
   });
 
   let seq = 0;
+  const clientsByIp = new Map();
   const lastDepthPayload = { xpx_usdt: '', xpx_bnb: '' };
   const lastTradesMeta = { xpx_usdt: '', xpx_bnb: '' };
   const lastTradesPayload = { xpx_usdt: [], xpx_bnb: [] };
@@ -174,22 +193,44 @@ function attachClobWebSocketHub(httpServer, { clusterDir, clobApi, enrichTradeWi
       return;
     }
 
+    if (!isWsOriginAllowed(req)) {
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
     if (wss.clients.size >= MAX_WS_CLIENTS) {
       socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
       socket.destroy();
       return;
     }
 
+    const clientIp = getClientIp(req);
+    if ((clientsByIp.get(clientIp) || 0) >= MAX_WS_CLIENTS_PER_IP) {
+      socket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
     wss.handleUpgrade(req, socket, head, (ws) => {
+      ws._clientIp = clientIp;
       wss.emit('connection', ws, req);
     });
   });
 
   wss.on('connection', (ws, req) => {
-    if (wss.clients.size > MAX_WS_CLIENTS) {
+    const clientIp = ws._clientIp || getClientIp(req);
+    const curIpCount = clientsByIp.get(clientIp) || 0;
+    if (wss.clients.size > MAX_WS_CLIENTS || curIpCount >= MAX_WS_CLIENTS_PER_IP) {
       try { ws.close(1013, 'Server capacity reached'); } catch (_) {}
       return;
     }
+    clientsByIp.set(clientIp, curIpCount + 1);
+    ws.on('close', () => {
+      const next = (clientsByIp.get(clientIp) || 1) - 1;
+      if (next <= 0) clientsByIp.delete(clientIp);
+      else clientsByIp.set(clientIp, next);
+    });
     ws.isAlive = true;
     ws.subscribedMarket = 'xpx_usdt';
     ws.subscribedPublicKey = null;

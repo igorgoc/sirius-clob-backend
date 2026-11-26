@@ -280,6 +280,84 @@ async function main() {
     }
   });
 
+  // --- ROUND 2 HARDENING CHECKS ---
+  await test('Round 2 Pass 1: registerHeartbeat & deregisterHeartbeat reject unauthenticated calls', () => {
+    const victimPub = 'f'.repeat(64);
+    assert.throws(
+      () => clobApi.registerHeartbeat({ publicKey: victimPub, timeoutMs: 1000, markets: ['XPX/USDT'] }),
+      /Missing ed25519 signature/
+    );
+    assert.throws(
+      () => clobApi.deregisterHeartbeat({ publicKey: victimPub }),
+      /Missing ed25519 signature/
+    );
+  });
+
+  await test('Round 2 Pass 2: clob_db enforces forward-only state machine on bridge_swaps & settlements', () => {
+    const clobDb = require('../dashboard/clob_db');
+    const txHash = '0x' + 'ab'.repeat(32);
+    clobDb.saveBridgeSwapRecord({
+      txnHash: txHash,
+      swapId: 'SWAP-TEST-1',
+      network: 'BSC',
+      token: 'USDT',
+      amount: 10,
+      recipient: 'VC46DFR25R5EWJWR32E4TFOYC57VXFNPKAASJTLV',
+      status: 'CONFIRMED',
+      confirmations: 15,
+    });
+    // Backward transition CONFIRMED -> PENDING must be rejected
+    assert.throws(
+      () => clobDb.saveBridgeSwapRecord({
+        txnHash: txHash,
+        swapId: 'SWAP-TEST-1',
+        network: 'BSC',
+        token: 'USDT',
+        amount: 10,
+        recipient: 'VC46DFR25R5EWJWR32E4TFOYC57VXFNPKAASJTLV',
+        status: 'PENDING',
+        confirmations: 0,
+      }),
+      /Invalid backward bridge swap status transition/
+    );
+    // Negative amount must be rejected
+    assert.throws(
+      () => clobDb.saveBridgeSwapRecord({
+        txnHash: '0x' + 'cd'.repeat(32),
+        swapId: 'SWAP-TEST-NEG',
+        network: 'BSC',
+        token: 'USDT',
+        amount: -5,
+        recipient: 'VC46DFR25R5EWJWR32E4TFOYC57VXFNPKAASJTLV',
+        status: 'CONFIRMED',
+      }),
+      /Invalid bridge swap amount/
+    );
+    // LIKE wildcard injection in getPendingSettlementsForCosigner returns []
+    assert.deepStrictEqual(clobDb.getPendingSettlementsForCosigner('%'), []);
+  });
+
+  await test('Round 2 Pass 4: grpc_tls fails closed on non-loopback Mainnet bind without TLS', () => {
+    const grpcTls = require('../executor/grpc_tls');
+    const prevNet = process.env.SIRIUS_NETWORK;
+    const prevAllow = process.env.SIRIUS_VM_ALLOW_INSECURE_REMOTE;
+    process.env.SIRIUS_NETWORK = 'mainnet';
+    delete process.env.SIRIUS_VM_ALLOW_INSECURE_REMOTE;
+    try {
+      assert.throws(
+        () => grpcTls.createGrpcServerCredentials('0.0.0.0:5051'),
+        /Refusing to bind non-loopback validator.*without TLS on Mainnet/
+      );
+      // Loopback bind remains allowed for local development/tests
+      const loop = grpcTls.createGrpcServerCredentials('127.0.0.1:5051');
+      assert.strictEqual(loop.mode, 'insecure');
+    } finally {
+      if (prevNet === undefined) delete process.env.SIRIUS_NETWORK;
+      else process.env.SIRIUS_NETWORK = prevNet;
+      if (prevAllow !== undefined) process.env.SIRIUS_VM_ALLOW_INSECURE_REMOTE = prevAllow;
+    }
+  });
+
   try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
 
   console.log(`\n🎉 Red-Team 5-Pass Hardening Suite: ${passed} tests passed.\n`);

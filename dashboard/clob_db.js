@@ -12,19 +12,20 @@ const Database = require('better-sqlite3');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const CLUSTER_DIR = path.join(ROOT_DIR, 'cluster');
-const DB_FILE = path.join(CLUSTER_DIR, 'clob_state.db');
+const DB_FILE = process.env.CLOB_DB_FILE || path.join(CLUSTER_DIR, 'clob_state.db');
 
 let dbInstance = null;
 
 function getDb(customPath = null) {
   if (dbInstance && !customPath) return dbInstance;
-  const targetPath = customPath || DB_FILE;
+  const targetPath = customPath || process.env.CLOB_DB_FILE || DB_FILE;
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
 
   const db = new Database(targetPath);
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
   db.pragma('foreign_keys = ON');
+  db.pragma('busy_timeout = 5000');
 
   // Initialize schema with strict unique and integrity check constraints
   db.exec(`
@@ -685,33 +686,52 @@ function closeDb() {
 
 function saveBridgeSwapRecord(record, customDb = null) {
   const db = customDb || getDb();
-  const stmt = db.prepare(`
-    INSERT INTO bridge_swaps (
-      txn_hash, swap_id, network, token, amount, sender_address,
-      recipient_address, sirius_tx_hash, block_number, confirmations,
-      status, auto_detected, timestamp, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(txn_hash) DO UPDATE SET
-      status = excluded.status,
-      confirmations = excluded.confirmations,
-      sirius_tx_hash = COALESCE(excluded.sirius_tx_hash, bridge_swaps.sirius_tx_hash)
-  `);
-  stmt.run(
-    (record.txnHash || '').toLowerCase(),
-    record.swapId,
-    record.network || 'BSC',
-    record.token,
-    String(record.amount),
-    record.from || record.sender_address || null,
-    record.recipient || record.recipient_address,
-    record.siriusTxHash || null,
-    record.blockNumber || null,
-    record.confirmations || 0,
-    record.status || 'CONFIRMED',
-    record.autoDetected ? 1 : 0,
-    record.timestamp || new Date().toISOString(),
-    Date.now()
-  );
+  const numAmt = Number(record.amount);
+  if (!Number.isFinite(numAmt) || numAmt <= 0) {
+    throw new Error(`Invalid bridge swap amount: ${record.amount}`);
+  }
+  const normHash = (record.txnHash || '').toLowerCase();
+  const statusRank = { PENDING: 1, CONFIRMED: 2, DELIVERED: 3, FAUCET_DELIVERED: 3 };
+  const nextStatus = String(record.status || 'CONFIRMED').toUpperCase();
+
+  const saveTx = db.transaction(() => {
+    const existing = db.prepare('SELECT status FROM bridge_swaps WHERE txn_hash = ?').get(normHash);
+    if (existing) {
+      const prevRank = statusRank[String(existing.status || '').toUpperCase()] || 0;
+      const nextRank = statusRank[nextStatus] || 0;
+      if (prevRank > nextRank) {
+        throw new Error(`Invalid backward bridge swap status transition for ${normHash}: ${existing.status} -> ${nextStatus}`);
+      }
+    }
+    const stmt = db.prepare(`
+      INSERT INTO bridge_swaps (
+        txn_hash, swap_id, network, token, amount, sender_address,
+        recipient_address, sirius_tx_hash, block_number, confirmations,
+        status, auto_detected, timestamp, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(txn_hash) DO UPDATE SET
+        status = excluded.status,
+        confirmations = MAX(bridge_swaps.confirmations, excluded.confirmations),
+        sirius_tx_hash = COALESCE(excluded.sirius_tx_hash, bridge_swaps.sirius_tx_hash)
+    `);
+    stmt.run(
+      normHash,
+      record.swapId,
+      record.network || 'BSC',
+      record.token,
+      String(record.amount),
+      record.from || record.sender_address || null,
+      record.recipient || record.recipient_address,
+      record.siriusTxHash || null,
+      record.blockNumber || null,
+      record.confirmations || 0,
+      nextStatus,
+      record.autoDetected ? 1 : 0,
+      record.timestamp || new Date().toISOString(),
+      Date.now()
+    );
+  });
+  saveTx();
 }
 
 function getBridgeSwapRecord(txnHash, customDb = null) {
@@ -936,11 +956,21 @@ function getTradingAccountsByStatus(status) {
 
 function updateTradingAccountStatus(tradingPublicKey, status, activationTxHash = null) {
   const db = getDb();
+  const normPk = String(tradingPublicKey).toLowerCase();
+  if (status === 'pending') {
+    // Never downgrade an already active trading account back to pending
+    db.prepare(`
+      UPDATE trading_accounts
+      SET status = ?, activation_tx_hash = COALESCE(?, activation_tx_hash), updated_at = ?
+      WHERE trading_public_key = ? AND status != 'active'
+    `).run(status, activationTxHash, Date.now(), normPk);
+    return;
+  }
   db.prepare(`
     UPDATE trading_accounts
     SET status = ?, activation_tx_hash = COALESCE(?, activation_tx_hash), updated_at = ?
     WHERE trading_public_key = ?
-  `).run(status, activationTxHash, Date.now(), String(tradingPublicKey).toLowerCase());
+  `).run(status, activationTxHash, Date.now(), normPk);
 }
 
 function saveTradingWithdrawal(rec) {
@@ -986,10 +1016,11 @@ function getAllInFlightTradingWithdrawals() {
 
 function updateTradingWithdrawalStatus(withdrawalId, status, txHash = null, blockHeight = null) {
   const db = getDb();
+  // Forward-only finality guard: never revert a confirmed withdrawal
   db.prepare(`
     UPDATE trading_withdrawals
     SET status = ?, tx_hash = COALESCE(?, tx_hash), block_height = COALESCE(?, block_height), updated_at = ?
-    WHERE withdrawal_id = ?
+    WHERE withdrawal_id = ? AND status != 'confirmed'
   `).run(status, txHash, blockHeight, Date.now(), withdrawalId);
 }
 
@@ -1069,8 +1100,8 @@ function getPendingSettlementsForOwner(ownerPublicKey) {
 
 function getPendingSettlementsForCosigner(publicKey) {
   const db = getDb();
-  const pkLower = String(publicKey || '').toLowerCase();
-  if (!pkLower) return [];
+  const pkLower = String(publicKey || '').trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(pkLower)) return [];
   const rows = db.prepare(
     `SELECT * FROM trading_settlements
      WHERE status IN ('pending_cosign', 'ready', 'broadcast')
@@ -1094,27 +1125,29 @@ function getAllInFlightTradingSettlements() {
 
 function updateTradingSettlementStatus(settlementId, status, txHash = null, collectedCosigs = null) {
   const db = getDb();
+  // Forward-only finality guard: never overwrite an already confirmed settlement
   if (collectedCosigs !== null) {
     db.prepare(`
       UPDATE trading_settlements
       SET status = ?, tx_hash = COALESCE(?, tx_hash), collected_cosigs_json = ?, updated_at = ?
-      WHERE settlement_id = ?
+      WHERE settlement_id = ? AND status != 'confirmed'
     `).run(status, txHash, JSON.stringify(collectedCosigs), Date.now(), settlementId);
   } else {
     db.prepare(`
       UPDATE trading_settlements
       SET status = ?, tx_hash = COALESCE(?, tx_hash), updated_at = ?
-      WHERE settlement_id = ?
+      WHERE settlement_id = ? AND status != 'confirmed'
     `).run(status, txHash, Date.now(), settlementId);
   }
 }
 
 function updateTradingSettlementPayload(settlementId, { txHash, aggregatePayload, collectedCosigs = [], status = 'pending_cosign' }) {
   const db = getDb();
+  // Forward-only finality guard: never rebuild/overwrite a confirmed settlement
   db.prepare(`
     UPDATE trading_settlements
     SET tx_hash = ?, aggregate_payload = ?, collected_cosigs_json = ?, status = ?, updated_at = ?
-    WHERE settlement_id = ?
+    WHERE settlement_id = ? AND status != 'confirmed'
   `).run(txHash, aggregatePayload, JSON.stringify(collectedCosigs), status, Date.now(), settlementId);
   return getTradingSettlement(settlementId);
 }
