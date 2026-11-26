@@ -381,6 +381,73 @@ async function main() {
     assert.ok(snippet.includes('assertWasmBounds(bufPtr, bufLen)'), 'write_file_stream must call assertWasmBounds');
   });
 
+  await test('Live10Acc P0-1: buildSettlementAggregateTx attaches 1-micro-XPX Vault anchor on pure P2P swaps', () => {
+    const { Account, TransactionMapping } = require('tsjs-xpx-chain-sdk');
+    const testnetClient = require('../dashboard/testnet2_client');
+    const vaultPub = testnetClient.getOrInitVaultAccount().publicKey.toUpperCase();
+    const ta1 = Account.generateNewAccount(168);
+    const ta2 = Account.generateNewAccount(168);
+    const o1 = Account.generateNewAccount(168);
+    const o2 = Account.generateNewAccount(168);
+
+    const pureP2p = cosigner.buildSettlementAggregateTx({
+      orderId: 999,
+      transfers: [
+        { fromTradingPub: ta1.publicKey, fromType: 'TRADING', ownerPublicKey: o1.publicKey, toAddress: ta2.address.plain(), mosaicHex: '13BFC518E40549D7', amountAtomic: '1000000', symbol: 'XPX' },
+        { fromTradingPub: ta2.publicKey, fromType: 'TRADING', ownerPublicKey: o2.publicKey, toAddress: ta1.address.plain(), mosaicHex: '4430AEFEF7E15D0C', amountAtomic: '85', symbol: 'USDT' },
+      ],
+    });
+    assert.ok(pureP2p && pureP2p.signedByVault && pureP2p.allowedInnerSigners.has(vaultPub), 'Vault must be an eligible inner signer for pure P2P aggregate');
+    const decodedP2p = TransactionMapping.createFromPayload(pureP2p.signedByVault.payload);
+    assert.strictEqual(decodedP2p.innerTransactions.length, 3, 'Pure P2P aggregate must include 1-micro-XPX Vault anchor inner tx');
+    assert.ok(decodedP2p.innerTransactions.some((t) => t.signer.publicKey.toUpperCase() === vaultPub), 'At least one inner tx must be signed by Vault initiator');
+
+    // When a VAULT trade leg already exists, no extra anchor tx should be appended
+    const hybrid = cosigner.buildSettlementAggregateTx({
+      orderId: 1000,
+      transfers: [
+        { fromTradingPub: vaultPub, fromType: 'VAULT', ownerPublicKey: null, toAddress: ta2.address.plain(), mosaicHex: '13BFC518E40549D7', amountAtomic: '1000000', symbol: 'XPX' },
+        { fromTradingPub: ta2.publicKey, fromType: 'TRADING', ownerPublicKey: o2.publicKey, toAddress: ta1.address.plain(), mosaicHex: '4430AEFEF7E15D0C', amountAtomic: '85', symbol: 'USDT' },
+      ],
+    });
+    const decodedHybrid = TransactionMapping.createFromPayload(hybrid.signedByVault.payload);
+    assert.strictEqual(decodedHybrid.innerTransactions.length, 2, 'Hybrid Vault+P2P aggregate should not duplicate anchor leg');
+  });
+
+  await test('Live10Acc P0-2: Smart Trading settlements emit taker fee transfers to FEE_COLLECTOR_ADDRESS on BUY & SELL', () => {
+    const apiSrc = fs.readFileSync(path.join(__dirname, '../dashboard/clob_api.js'), 'utf8');
+    assert.ok(apiSrc.includes('if (baseLeg.legFee > 0n && testnet2Config.FEE_COLLECTOR_ADDRESS)'), 'BUY taker fee transfer missing');
+    assert.ok(apiSrc.includes('if (quoteLeg.legFee > 0n && testnet2Config.FEE_COLLECTOR_ADDRESS)'), 'SELL taker fee transfer missing');
+    assert.ok(apiSrc.includes('Leg A2 (Taker Fee on BUY)') && apiSrc.includes('Leg B2 (Taker Fee on SELL)'));
+  });
+
+  await test('Live10Acc P0-3: GET /validator-info auto-refreshes L1 multisig status & modal skips admin bootstrap', () => {
+    const srvSrc = fs.readFileSync(path.join(__dirname, '../dashboard/server.js'), 'utf8');
+    assert.ok(srvSrc.includes('refreshValidatorClusterOnChainStatus'), 'server.js must refresh validator cluster L1 status');
+    const modalPath = path.resolve(__dirname, '../../web-wallet-exchange/src/modules/services/submodule/clob/components/TradingAccountSetupModal.vue');
+    if (fs.existsSync(modalPath)) {
+      const modalSrc = fs.readFileSync(modalPath, 'utf8');
+      assert.ok(!modalSrc.includes('/api/clob/validator-cluster/bootstrap'), 'User modal must not call admin-gated /validator-cluster/bootstrap');
+    }
+  });
+
+  await test('Live10Acc P1-1/P1-2/P1-3/P2-1: Slippage floor, PartiallyFilled status, STP market_state sync & PostOnly support', () => {
+    const clobApi = require('../dashboard/clob_api');
+    const msg = clobApi.constructOrderMessage('XPX/USDT', 'sell', 'PostOnly', '0.000090', '10', 'n1', 9999999999999);
+    assert.ok(msg.includes(':ORDER:XPX/USDT:sell:PostOnly:'), `Expected PostOnly in canonical msg, got: ${msg}`);
+    const apiSrc = fs.readFileSync(path.join(__dirname, '../dashboard/clob_api.js'), 'utf8');
+    assert.ok(apiSrc.includes('priceTicks = (slippageCeilingTicks / tickSize) * tickSize;'), 'Market Buy slippage ceiling must floor to tick grid');
+    assert.ok(apiSrc.includes("totalFilled > 0n ? 'PartiallyFilled' : 'Open'"), 'reconcileActiveOrdersWithTrades must preserve PartiallyFilled');
+    assert.ok(apiSrc.includes('function readLiveOrdersFromMarketState('), 'STP sync must reconcile against market_state.bin');
+  });
+
+  await test('Live10Acc P1-4: grpc_vm_server uses WarmWasmWorkerPool and wasm_worker supports poolMode', () => {
+    const vmSrc = fs.readFileSync(path.join(__dirname, '../executor/grpc_vm_server.js'), 'utf8');
+    const workerSrc = fs.readFileSync(path.join(__dirname, '../executor/wasm_worker.js'), 'utf8');
+    assert.ok(vmSrc.includes('class WarmWasmWorkerPool'), 'WarmWasmWorkerPool missing from grpc_vm_server.js');
+    assert.ok(workerSrc.includes('poolMode = false') && workerSrc.includes("msg.type === 'execute'"), 'poolMode missing from wasm_worker.js');
+  });
+
   try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
 
   console.log(`\n🎉 Red-Team 5-Pass Hardening Suite: ${passed} tests passed.\n`);

@@ -312,6 +312,14 @@ function reconcileActiveOrdersWithTrades() {
     }
   }
 
+  const liveOrdersByMarket = new Map();
+  for (const m of markets) {
+    try {
+      const liveMap = readLiveOrdersFromMarketState(m);
+      if (liveMap) liveOrdersByMarket.set(m, liveMap);
+    } catch (_) {}
+  }
+
   let modified = false;
   for (const o of activeOrders.values()) {
     const orderId = Number(o.id || o.orderId);
@@ -333,11 +341,34 @@ function reconcileActiveOrdersWithTrades() {
     if (pct > 100) pct = 100;
     if (pct < 0) pct = 0;
 
-    const remainingAtomic = initialAtomic > totalFilled ? initialAtomic - totalFilled : 0n;
-    const isFilled = remainingAtomic === 0n;
+    let remainingAtomic = initialAtomic > totalFilled ? initialAtomic - totalFilled : 0n;
+    let isFilled = remainingAtomic === 0n;
+    let wasStpOrBookRemoved = false;
+
+    const liveMap = liveOrdersByMarket.get(oMarket);
+    if (liveMap && o.status !== 'Filled' && o.status !== 'Cancelled') {
+      if (!liveMap.has(orderId)) {
+        // Order is no longer resting in canonical WASM market_state.bin (e.g. STP-cancelled or fully filled)
+        remainingAtomic = 0n;
+        if (totalFilled >= initialAtomic) {
+          isFilled = true;
+        } else {
+          wasStpOrBookRemoved = true;
+        }
+      } else {
+        const liveRem = liveMap.get(orderId);
+        if (liveRem < remainingAtomic) {
+          remainingAtomic = liveRem;
+        }
+      }
+    }
 
     const newFilledStr = `${pct}%`;
-    const newStatus = isFilled ? 'Filled' : (o.status === 'Cancelled' ? 'Cancelled' : 'Open');
+    const newStatus = isFilled
+      ? 'Filled'
+      : ((o.status === 'Cancelled' || wasStpOrBookRemoved)
+        ? 'Cancelled'
+        : (totalFilled > 0n ? 'PartiallyFilled' : 'Open'));
     const newRemainingStr = formatAtomicUnits(remainingAtomic, 6);
 
     if (
@@ -672,10 +703,16 @@ function canonicalizeDecimalString(val, maxDecimals = 8) {
   return String(val);
 }
 
+function normalizeOrderTypeLabel(type) {
+  if (type === 2 || /^post[_-]?only$/i.test(String(type || '').trim())) return 'PostOnly';
+  if (type === 1 || /^(market|ioc)$/i.test(String(type || '').trim())) return 'Market';
+  return 'Limit';
+}
+
 function constructOrderMessage(pair, side, type, price, amount, nonce, expiry) {
   const normPair = (pair || 'XPX/USDT').toUpperCase().replace('_', '/');
   const normSide = side === 1 || side === 'sell' ? 'sell' : 'buy';
-  const normType = type === 1 || type === 'Market' ? 'Market' : 'Limit';
+  const normType = normalizeOrderTypeLabel(type);
   const priceStr = canonicalizeDecimalString(price, 8);
   const amountStr = canonicalizeDecimalString(amount, 6);
   return `${DOMAIN_SEPARATOR}:ORDER:${normPair}:${normSide}:${normType}:${priceStr}:${amountStr}:${nonce}:${expiry}`;
@@ -2851,6 +2888,48 @@ function decodeMarketStateDepth(statePath, maxLevels = 50) {
   return depth;
 }
 
+/**
+ * Decode exact live resting (orderId -> remainingAmountAtomic) map from Rust bincode `market_state.bin`
+ * so gateway `activeOrders` stays 100% synced even after Self-Trade Prevention (STP) decrements/cancellations.
+ */
+function readLiveOrdersFromMarketState(marketKey = 'xpx_usdt') {
+  const market = (marketKey || 'xpx_usdt').toLowerCase().replace('/', '_');
+  const statePath = path.join(CLUSTER_DIR, 'node1', 'data', 'drives', DRIVE_KEY_HEX, 'drive', 'markets', market, 'market_state.bin');
+  if (!fs.existsSync(statePath)) return null;
+  const buf = fs.readFileSync(statePath);
+  if (buf.length < 72) return null;
+  let off = 0;
+  const ensure = (n) => {
+    if (off + n > buf.length) throw new Error('Truncated market_state.bin');
+  };
+  const readU64 = () => {
+    ensure(8);
+    const v = Number(buf.readBigUInt64LE(off));
+    off += 8;
+    return v;
+  };
+  off += 56; // base_id(8) + quote_id(8) + tick_size(8) + min_order_size(8) + next_order_id(8) + maker_fee_bps(8) + taker_fee_bps(8)
+  const liveMap = new Map();
+  const scanSide = () => {
+    const mapLen = readU64();
+    for (let i = 0; i < mapLen; i++) {
+      off += 24; // BTreeMap key(8) + level.price(8) + level.total_depth(8)
+      const ordersLen = readU64();
+      ensure(ordersLen * 76);
+      for (let j = 0; j < ordersLen; j++) {
+        // LimitOrder bincode: order_id(0..8), owner_pubkey(8..40), side(40..44), price(44..52), initial(52..60), remaining(60..68), timestamp(68..76)
+        const orderId = Number(buf.readBigUInt64LE(off));
+        const remAtomic = buf.readBigUInt64LE(off + 60);
+        liveMap.set(orderId, remAtomic);
+        off += 76;
+      }
+    }
+  };
+  scanSide(); // bids
+  scanSide(); // asks
+  return liveMap;
+}
+
 function getMarketDepthSnapshot(marketKey = 'xpx_usdt') {
   const market = (marketKey || 'xpx_usdt').toLowerCase().replace('/', '_');
   const marketDir = path.join(CLUSTER_DIR, 'node1', 'data', 'drives', DRIVE_KEY_HEX, 'drive', 'markets', market);
@@ -3334,7 +3413,10 @@ async function _placeOrderUnlocked(orderReq) {
   }
 
   const side = String(orderReq.side).toLowerCase() === 'sell' || orderReq.side === 1 ? 1 : 0;
-  const orderType = String(orderReq.type).toLowerCase() === 'market' || String(orderReq.type).toLowerCase() === 'ioc' || orderReq.orderType === 1 || orderReq.type === 1 ? 1 : 0; // 0=Limit, 1=Market (IOC)
+  const rawTypeStr = String(orderReq.type ?? '').trim().toLowerCase();
+  const isPostOnly = rawTypeStr === 'postonly' || rawTypeStr === 'post_only' || rawTypeStr === 'post-only' || orderReq.orderType === 2 || orderReq.type === 2;
+  const isMarketIoc = rawTypeStr === 'market' || rawTypeStr === 'ioc' || orderReq.orderType === 1 || orderReq.type === 1;
+  const orderType = isPostOnly ? 2 : (isMarketIoc ? 1 : 0); // 0=Limit, 1=Market (IOC), 2=PostOnly
   const marketKey = isBnb ? 'xpx_bnb' : 'xpx_usdt';
   const depth = getMarketDepthSnapshot(marketKey);
 
@@ -3393,13 +3475,13 @@ async function _placeOrderUnlocked(orderReq) {
   if (amountAtomic > MAX_U64 || priceTicksRaw > MAX_U64) {
     throw new Error('Order amount or price exceeds maximum 64-bit integer limit');
   }
-  if (orderType === 0 && priceTicksRaw <= 0n) {
-    throw new Error('Invalid order price: must be greater than zero for Limit order');
+  if ((orderType === 0 || orderType === 2) && priceTicksRaw <= 0n) {
+    throw new Error('Invalid order price: must be greater than zero for Limit/PostOnly order');
   }
 
   const tickSize = isBnb ? 1n : 100n;
-  // Reject off-grid limit order prices (Finding M-4)
-  if (orderType === 0 && (priceTicksRaw % tickSize !== 0n)) {
+  // Reject off-grid limit/post-only order prices (Finding M-4)
+  if ((orderType === 0 || orderType === 2) && (priceTicksRaw % tickSize !== 0n)) {
     throw new Error(`Invalid price tick: price must align to tick size grid of ${formatAtomicUnits(tickSize, 8)}`);
   }
 
@@ -3444,8 +3526,8 @@ async function _placeOrderUnlocked(orderReq) {
   let priceTicks = priceTicksRaw;
 
   // 1. Dynamic Price Collar Protection (Fat-Finger & Flash-Crash Shield)
-  // For Limit Orders (orderType === 0), verify price does not deviate excessively from market reference
-  if (orderType === 0 && !orderReq.allowWideCollar) {
+  // For Limit & PostOnly Orders (orderType === 0 || 2), verify price does not deviate excessively from market reference
+  if ((orderType === 0 || orderType === 2) && !orderReq.allowWideCollar) {
     const depth = getMarketDepthSnapshot(marketKey);
     const collarBps = BigInt(Math.max(100, Math.min(5000, Number(orderReq.collarBps) || 1500))); // default 15.00% (1500 bps)
     let refPriceTicks = null;
@@ -3486,8 +3568,11 @@ async function _placeOrderUnlocked(orderReq) {
         throw new Error('Market Buy rejected: No ask liquidity available on orderbook to match against');
       }
       const bestAskTicks = BigInt(depth.best_ask);
-      const slippageCeilingTicks = (bestAskTicks * (10000n + maxSlippageBps) + 9999n) / 10000n;
-      priceTicks = ((slippageCeilingTicks + tickSize - 1n) / tickSize) * tickSize;
+      // Floor down to tick grid so Market Buy NEVER exceeds the caller's maxSlippageBps cap
+      // (while always permitting fills at the current bestAskTicks).
+      const slippageCeilingTicks = (bestAskTicks * (10000n + maxSlippageBps)) / 10000n;
+      priceTicks = (slippageCeilingTicks / tickSize) * tickSize;
+      if (priceTicks < bestAskTicks) priceTicks = bestAskTicks;
     } else {
       // Market Sell matches against resting Bids
       if (!depth || !depth.best_bid || !depth.bids || depth.bids.length === 0) {
@@ -3625,6 +3710,7 @@ async function _placeOrderUnlocked(orderReq) {
   let onChainTxHash = null;
   let pendingSettlement = null;
   let fillsCount = 0;
+  let hasEscrowRefund = false;
   const emittedTx = ret.transaction;
   const payouts = [];
   let takerFeeAtomic = 0n;
@@ -3656,6 +3742,7 @@ async function _placeOrderUnlocked(orderReq) {
             : '';
 
           const isRefund = messageStr.includes('Refund') || messageStr.includes('Escrow Refund');
+          if (isRefund) hasEscrowRefund = true;
           const isTradeFill = messageStr.startsWith('SiriusCLOB: Trade Fill');
 
           // Track fill count based on actual trade fill base leg emitted by engine for this order
@@ -3868,6 +3955,20 @@ async function _placeOrderUnlocked(orderReq) {
               });
               ownerDelta.xpx += baseLeg.payoutAmount;
 
+              // Leg A2 (Taker Fee on BUY): Maker sends baseLeg.legFee (XPX) directly to FEE_COLLECTOR_ADDRESS
+              // so Maker's L1 debit equals exact gross fill_qty and Protocol Fee Collector receives on-chain revenue!
+              if (baseLeg.legFee > 0n && testnet2Config.FEE_COLLECTOR_ADDRESS) {
+                settlementTransfers.push({
+                  fromTradingPub: fromMakerPub,
+                  fromType: makerAcc ? 'TRADING' : 'VAULT',
+                  ownerPublicKey: makerAcc ? makerAcc.owner_public_key : null,
+                  toAddress: testnet2Config.FEE_COLLECTOR_ADDRESS,
+                  mosaicHex: baseMosaicOnChain,
+                  amountAtomic: baseLeg.legFee.toString(),
+                  symbol: 'XPX',
+                });
+              }
+
               // Leg B: Quote paid Taker -> Maker/Vault
               const fromTakerPub = callerTradingAcc ? callerTradingAcc.trading_public_key : vault.publicKey;
               const toMakerAddr = makerAcc ? makerAcc.trading_address : vault.address.plain();
@@ -3951,6 +4052,20 @@ async function _placeOrderUnlocked(orderReq) {
               });
               if (quoteSym === 'USDT') ownerDelta.usdt += quoteLeg.payoutAmount;
               else ownerDelta.bnb += quoteLeg.payoutAmount;
+
+              // Leg B2 (Taker Fee on SELL): Maker sends quoteLeg.legFee (USDT/BNB) directly to FEE_COLLECTOR_ADDRESS
+              // so Maker's L1 debit equals exact gross quote_amt and Protocol Fee Collector receives on-chain revenue!
+              if (quoteLeg.legFee > 0n && testnet2Config.FEE_COLLECTOR_ADDRESS) {
+                settlementTransfers.push({
+                  fromTradingPub: fromMakerPub,
+                  fromType: makerAcc ? 'TRADING' : 'VAULT',
+                  ownerPublicKey: makerAcc ? makerAcc.owner_public_key : null,
+                  toAddress: testnet2Config.FEE_COLLECTOR_ADDRESS,
+                  mosaicHex: quoteMosaicOnChain,
+                  amountAtomic: quoteLeg.legFee.toString(),
+                  symbol: quoteSym,
+                });
+              }
             }
           }
 
@@ -3967,7 +4082,7 @@ async function _placeOrderUnlocked(orderReq) {
             orderContext: {
               pair: (pair || 'XPX/USDT').toUpperCase().replace('_', '/'),
               side: side === 1 ? 'sell' : 'buy',
-              type: orderType === 1 ? 'Market' : 'Limit',
+              type: normalizeOrderTypeLabel(orderType),
               price: canonicalizeDecimalString(priceInput, 8),
               amount: canonicalizeDecimalString(amountInput, 6),
               nonce: orderReq.nonce,
@@ -4067,21 +4182,25 @@ async function _placeOrderUnlocked(orderReq) {
     syncGatewayCacheFromDrive(callerKey);
   }
 
-  const orderId = expectedOrderId;
+  const isPostOnlyRejected = orderType === 2 && fillsCount === 0 && hasEscrowRefund;
+  const orderId = isPostOnlyRejected ? 0 : expectedOrderId;
   const initialAtomic = BigInt(amountAtomic);
-  const remainingAtomic = initialAtomic > takerBaseFilled ? initialAtomic - takerBaseFilled : 0n;
+  const remainingAtomic = isPostOnlyRejected
+    ? 0n
+    : (initialAtomic > takerBaseFilled ? initialAtomic - takerBaseFilled : 0n);
   const pct = initialAtomic > 0n ? Number((takerBaseFilled * 100n) / initialAtomic) : 0;
   const clampedPct = Math.min(100, Math.max(0, pct));
-  const isFilled = remainingAtomic === 0n;
+  const isFilled = !isPostOnlyRejected && remainingAtomic === 0n;
+  const orderTypeLabel = normalizeOrderTypeLabel(orderType);
 
-  if (orderType === 0) {
+  if ((orderType === 0 || orderType === 2) && !isPostOnlyRejected) {
     activeOrders.set(orderId, {
       id: orderId,
       orderId,
       callerKey,
       pair: normalizePair(pair),
       side: side === 0 ? 'Buy' : 'Sell',
-      type: 'Limit',
+      type: orderTypeLabel,
       price: priceInput,
       amount: amountInput,
       priceTicks: Number(priceTicks),
@@ -4103,7 +4222,7 @@ async function _placeOrderUnlocked(orderReq) {
     saveActiveOrders();
   }
 
-  // Reconcile resting maker orders with trades recorded by matching engine
+  // Reconcile resting maker orders (and STP decrements/cancellations) with canonical WASM state & trades
   reconcileActiveOrdersWithTrades();
 
   // Synchronize gateway cache from canonical drive ledger for all involved parties
@@ -4118,21 +4237,27 @@ async function _placeOrderUnlocked(orderReq) {
   const updatedBal = callerHasSmartTrading
     ? await syncAndGetAccountBalance(callerKey)
     : getAccountBalance(callerKey);
+  const reconciledPlaced = !isPostOnlyRejected && activeOrders.has(orderId) ? activeOrders.get(orderId) : null;
+  const finalStatus = isPostOnlyRejected
+    ? 'Rejected'
+    : (reconciledPlaced
+      ? reconciledPlaced.status
+      : ((orderType === 0 || orderType === 2)
+        ? (isFilled ? 'Filled' : (takerBaseFilled > 0n ? 'PartiallyFilled' : 'Open'))
+        : (isFilled ? 'Filled' : (takerBaseFilled > 0n ? 'PartiallyFilled' : 'Cancelled'))));
   return {
     ok: true,
     success: true,
     orderId,
     side: side === 0 ? 'Buy' : 'Sell',
-    type: orderType === 0 ? 'Limit' : 'Market',
+    type: orderTypeLabel,
     price: priceInput,
     amount: amountInput,
     priceTicks: Number(priceTicks),
     amountAtomic: Number(amountAtomic),
     filled: `${clampedPct}%`,
-    status: orderType === 0
-      ? (isFilled ? 'Filled' : (takerBaseFilled > 0n ? 'PartiallyFilled' : 'Open'))
-      : (isFilled ? 'Filled' : (takerBaseFilled > 0n ? 'PartiallyFilled' : 'Cancelled')),
-    remainingAmount: formatAtomicUnits(remainingAtomic, 6),
+    status: finalStatus,
+    remainingAmount: reconciledPlaced ? reconciledPlaced.remainingAmount : formatAtomicUnits(remainingAtomic, 6),
     filledAmount: formatAtomicUnits(takerBaseFilled, 6),
     gasConsumed: ret.execution_gas_consumed,
     fillsCount,

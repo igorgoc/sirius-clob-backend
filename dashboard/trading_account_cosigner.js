@@ -479,6 +479,46 @@ async function ensureValidatorClusterOnChain(waitForConfirmation = true) {
   };
 }
 
+let refreshClusterPromise = null;
+let lastClusterRefreshAt = 0;
+
+/**
+ * Lightweight read-only L1 check that refreshes cfg.isMultisigConfirmedOnChain on startup or
+ * GET /api/clob/validator-info so newly restarted servers never report false when the cluster
+ * is already confirmed 2-of-3 multisig on Sirius L1.
+ */
+async function refreshValidatorClusterOnChainStatus(force = false) {
+  const cfg = getOrInitValidatorClusterConfig();
+  if (cfg.isMultisigConfirmedOnChain) return true;
+  const now = Date.now();
+  if (!force && now - lastClusterRefreshAt < 15_000) {
+    return Boolean(cfg.isMultisigConfirmedOnChain);
+  }
+  if (refreshClusterPromise) return refreshClusterPromise;
+
+  refreshClusterPromise = (async () => {
+    lastClusterRefreshAt = Date.now();
+    try {
+      const nodeUrl = testnetClient.getActiveNodeUrl();
+      const info = await testnetClient.fetchJson(`${nodeUrl}/account/${cfg.clusterAddress}/multisig`, 4000);
+      if (info && isValidValidatorClusterMultisig(info.multisig, cfg)) {
+        cfg.isMultisigConfirmedOnChain = true;
+        delete cfg.bootstrapPrivateKey;
+        if (cachedClusterCfg) cachedClusterCfg.isMultisigConfirmedOnChain = true;
+        try {
+          fs.writeFileSync(VALIDATOR_CLUSTER_FILE, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+        } catch (_) {}
+        return true;
+      }
+    } catch (_) {}
+    return Boolean(cfg.isMultisigConfirmedOnChain);
+  })().finally(() => {
+    refreshClusterPromise = null;
+  });
+
+  return refreshClusterPromise;
+}
+
 function getValidatorClusterInfo() {
   const cfg = getOrInitValidatorClusterConfig();
   return {
@@ -1369,19 +1409,26 @@ function isSettlementPayloadExpired(aggregatePayloadHex, bufferMs = SETTLEMENT_E
 
 /**
  * Build and Vault-sign an AggregateCompleteV1 transaction from a settlement's transfer legs.
+ * Sirius Catapult requires the outer initiator (Vault) to be an eligible signer of at least
+ * one inner transaction. For pure P2P Smart Trading Account swaps (where no VAULT trade leg
+ * exists), attaches a 1 micro-XPX (0.000001 XPX) Vault -> FEE_COLLECTOR gas-sponsor anchor leg
+ * so Sirius L1 accepts the AggregateCompleteV1 without requiring users to pay L1 gas.
  */
 function buildSettlementAggregateTx({ orderId, transfers }) {
   const vault = testnetClient.getOrInitVaultAccount();
   const embeddedTxs = [];
   const requiredUserSigners = new Set();
   const allowedInnerSigners = new Set();
+  let hasVaultInnerLeg = false;
 
   for (const tr of (transfers || [])) {
     const amt = BigInt(tr.amountAtomic || '0');
     if (amt <= 0n) continue;
-    const fromPub = tr.fromType === 'VAULT' ? vault.publicKey : tr.fromTradingPub;
+    const isVaultLeg = tr.fromType === 'VAULT';
+    if (isVaultLeg) hasVaultInnerLeg = true;
+    const fromPub = isVaultLeg ? vault.publicKey : tr.fromTradingPub;
     allowedInnerSigners.add(fromPub.toUpperCase());
-    if (tr.fromType !== 'VAULT' && tr.ownerPublicKey) {
+    if (!isVaultLeg && tr.ownerPublicKey) {
       requiredUserSigners.add(tr.ownerPublicKey.toUpperCase());
     }
     const mosaic = new Mosaic(
@@ -1401,6 +1448,23 @@ function buildSettlementAggregateTx({ orderId, transfers }) {
 
   if (embeddedTxs.length === 0) return null;
 
+  // Catapult protocol rule: outer AggregateComplete initiator MUST be an eligible cosigner
+  // of at least one inner tx (otherwise Sirius L1 rejects with Failure_Aggregate_Ineligible_Cosigners).
+  if (!hasVaultInnerLeg) {
+    const xpxHex = (config.XPX_MOSAIC_ID || '13BFC518E40549D7').toUpperCase();
+    const sponsorRecipient = config.FEE_COLLECTOR_ADDRESS || vault.address.plain();
+    const sponsorTx = TransferTransaction.create(
+      Deadline.create(),
+      Address.createFromRawAddress(sponsorRecipient),
+      [new Mosaic(new MosaicId(xpxHex), UInt64.fromUint(1))],
+      PlainMessage.create(`CLOB_P2P_SPONSOR:${orderId || 'MATCH'}`.slice(0, 120)),
+      config.NETWORK_TYPE
+    ).toAggregate(PublicAccount.createFromPublicKey(vault.publicKey, config.NETWORK_TYPE));
+    sponsorTx.version.signatureDScheme = 0;
+    embeddedTxs.push(sponsorTx);
+    allowedInnerSigners.add(vault.publicKey.toUpperCase());
+  }
+
   const feeUnits = 120000 + embeddedTxs.length * 40000;
   const aggTx = AggregateTransaction.createCompleteV1(
     Deadline.create(),
@@ -1410,7 +1474,7 @@ function buildSettlementAggregateTx({ orderId, transfers }) {
     UInt64.fromUint(feeUnits)
   );
 
-  // Vault initiates and pays the tiny L1 settlement fee (satisfies Vault leg if Vault is sending!)
+  // Vault initiates and pays the tiny L1 settlement fee (100% eligible via Vault leg or gas-sponsor anchor)
   const signedByVault = vault.sign(aggTx, config.GENERATION_HASH);
   return { signedByVault, requiredUserSigners, allowedInnerSigners };
 }
@@ -1593,13 +1657,18 @@ async function _submitSettlementCosignatureUnlocked({ settlementId, cosignature 
   }
 
   // All users signed -> gather 2-of-3 BFT Validator Server cosignatures over gRPC!
-  const allowedSigners = Array.from(
-    new Set(
-      (s.transfers || [])
-        .map((t) => (t.fromType === 'VAULT' ? testnetClient.getOrInitVaultAccount().publicKey : t.fromTradingPub))
-        .filter(Boolean)
-    )
+  const vaultPubUpper = testnetClient.getOrInitVaultAccount().publicKey.toUpperCase();
+  const initiatorPubHex = s.aggregatePayload.slice(136, 200).toUpperCase();
+  const allowedSignersSet = new Set(
+    (s.transfers || [])
+      .map((t) => (t.fromType === 'VAULT' ? vaultPubUpper : String(t.fromTradingPub || '').toUpperCase()))
+      .filter(Boolean)
   );
+  // Include Vault as an allowed inner signer when Vault is the outer gas-sponsor initiator
+  if (initiatorPubHex === vaultPubUpper) {
+    allowedSignersSet.add(vaultPubUpper);
+  }
+  const allowedSigners = Array.from(allowedSignersSet);
 
   const validatorCosigs = await requestBftNodeCosignatures({
     action: 'SETTLEMENT',
@@ -1614,7 +1683,6 @@ async function _submitSettlementCosignatureUnlocked({ settlementId, cosignature 
     },
   });
 
-  const initiatorPubHex = s.aggregatePayload.slice(136, 200).toUpperCase();
   const finalCosigs = combineAndDedupeCosignatures(s.aggregatePayload, initiatorPubHex, [
     ...existing,
     ...validatorCosigs,
@@ -1726,11 +1794,26 @@ async function reconcileInFlightL1Txs() {
             3000
           );
           if (st && st.group === 'confirmed') {
+            const addrsToInvalidate = new Set();
             const rec = clobDb.getTradingAccountByTradingKey(s.tradingPublicKey);
-            if (rec) testnetClient.invalidateAccountBalanceCache(rec.trading_address);
+            if (rec && rec.trading_address) addrsToInvalidate.add(rec.trading_address);
             if (s.counterpartyKey) {
               const cpRec = clobDb.getTradingAccountByOwner(s.counterpartyKey);
-              if (cpRec) testnetClient.invalidateAccountBalanceCache(cpRec.trading_address);
+              if (cpRec && cpRec.trading_address) addrsToInvalidate.add(cpRec.trading_address);
+            }
+            for (const reqPk of (Array.isArray(s.requiredCosigners) ? s.requiredCosigners : [])) {
+              const reqRec = clobDb.getTradingAccountByOwner(reqPk);
+              if (reqRec && reqRec.trading_address) addrsToInvalidate.add(reqRec.trading_address);
+            }
+            for (const tr of (Array.isArray(s.transfers) ? s.transfers : [])) {
+              if (tr.toAddress) addrsToInvalidate.add(tr.toAddress);
+              if (tr.fromTradingPub && tr.fromType === 'TRADING') {
+                const trRec = clobDb.getTradingAccountByTradingKey(tr.fromTradingPub);
+                if (trRec && trRec.trading_address) addrsToInvalidate.add(trRec.trading_address);
+              }
+            }
+            for (const addr of addrsToInvalidate) {
+              testnetClient.invalidateAccountBalanceCache(addr);
             }
             clobDb.updateTradingSettlementStatus(s.settlementId, 'confirmed', s.txHash, null);
           } else if (st && st.group === 'failed') {
@@ -1750,12 +1833,14 @@ module.exports = {
   VALIDATOR_QUORUM,
   getOrInitValidatorClusterConfig,
   ensureValidatorClusterOnChain,
+  refreshValidatorClusterOnChainStatus,
   getValidatorClusterInfo,
   discoverTradingAccountStatus,
   computeTradingAccountBalances,
   activateTradingAccount,
   cosignWithdrawal,
   createTradeSettlement,
+  buildSettlementAggregateTx,
   submitSettlementCosignature,
   getAggregateDeadlineEpochMs,
   isSettlementPayloadExpired,

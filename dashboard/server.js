@@ -1778,14 +1778,20 @@ const server = http.createServer((req, res) => {
 
   // 1. Get Level-2 BFT Validator Cluster info & public keys
   if (pathname === '/api/clob/validator-info' && req.method === 'GET') {
-    try {
-      const info = tradingCosigner.getValidatorClusterInfo();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(info));
-    } catch (err) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: err.message }));
-    }
+    (async () => {
+      try {
+        let info = tradingCosigner.getValidatorClusterInfo();
+        if (!info.isMultisigConfirmedOnChain && typeof tradingCosigner.refreshValidatorClusterOnChainStatus === 'function') {
+          await tradingCosigner.refreshValidatorClusterOnChainStatus();
+          info = tradingCosigner.getValidatorClusterInfo();
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(info));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
+      }
+    })();
     return;
   }
 
@@ -3553,6 +3559,11 @@ server.listen(PORT, HOST, () => {
     } catch (err) {
       console.warn('[Market Maker] Could not auto-start MM bot:', err.message);
     }
+  }
+
+  // Proactively verify Level-2 Validator Cluster on Sirius L1 on boot so /validator-info immediately reports confirmed
+  if (typeof tradingCosigner.refreshValidatorClusterOnChainStatus === 'function') {
+    tradingCosigner.refreshValidatorClusterOnChainStatus(true).catch(() => {});
   }
 
   // Autonomous 24/7 Liquidity Watchdog: Guarantees order books are ALWAYS filled on both pairs
