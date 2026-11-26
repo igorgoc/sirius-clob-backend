@@ -495,15 +495,6 @@ function getLogTail(rawNode, lines = 100) {
   }
 }
 
-function escapeHtml(str) {
-  return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
-}
-
 function getClientIp(req) {
   // Only trust cf-connecting-ip when explicitly deployed behind Cloudflare
   if (process.env.TRUST_CLOUDFLARE_PROXY === 'true') {
@@ -1080,36 +1071,6 @@ const server = http.createServer((req, res) => {
     const snapshot = clobApi.exportNodeDriveSnapshot();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: Boolean(snapshot), snapshot }));
-    return;
-  }
-
-  // SiriusCLOB DEX Endpoint: Run 3-Node E2E Verification (Admin Protected)
-  if (pathname === '/api/clob/test-e2e' && req.method === 'POST') {
-    parseJsonBody(req).catch(() => ({})).then((body) => {
-      const auth = verifyAdminAuth(req, body, 'TEST_E2E');
-      if (!auth.authorized) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, success: false, error: auth.error }));
-        return;
-      }
-      const testScript = path.join(ROOT_DIR, 'scripts/test_clob_e2e.js');
-      if (!fs.existsSync(testScript)) {
-        res.writeHead(501, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, success: false, error: 'E2E test suite script is not installed in production cloud container.' }));
-        return;
-      }
-      execFile('node', [testScript], { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          ok: !err,
-          success: !err,
-          summary: stdout.split('\n').filter(l => l.includes('Criterion') || l.includes('|') || l.includes('✅')).join('\n'),
-          output: stdout,
-          stdout,
-          stderr: err ? err.message : null
-        }));
-      });
-    });
     return;
   }
 

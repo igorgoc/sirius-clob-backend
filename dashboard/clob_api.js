@@ -657,118 +657,6 @@ async function recordDepositTx(txHash, callerKey, mosaicId, confirmationDepth = 
   }
 }
 
-/**
- * Refund Path for deposits with mismatched sender or uncredited deposits.
- * Inspects on-chain deposit to vault, verifies on-chain sender, and executes
- * an on-chain refund transfer from the vault directly back to the original sender.
- */
-function refundMismatchedDeposit(txHash, customAdminPrivKey = null) {
-  const normHash = (txHash || '').trim().toLowerCase();
-  if (!/^[0-9a-fA-F]{64}$/.test(normHash)) {
-    throw new Error(`Invalid deposit txHash format (${txHash}): expected 64 hex characters`);
-  }
-
-  const existing = clobDb.getDeposit(normHash) || processedDeposits.get(normHash);
-  if (existing && existing.status === 'confirmed') {
-    throw new Error(`Deposit tx ${normHash} has already been credited to ledger; cannot be refunded`);
-  }
-  if (existing && existing.status === 'refunded') {
-    throw new Error(`Deposit tx ${normHash} has already been refunded (Refund Tx: ${existing.refund_tx_hash || existing.refundTxHash})`);
-  }
-
-  const txInfo = queryTransactionOnChain(normHash);
-  if (!txInfo.found || !txInfo.height) {
-    throw new Error(`Deposit transaction ${normHash} not found or unconfirmed on local chain`);
-  }
-
-  let vaultAddress = (testnet2Config.SUPERCONTRACT_VAULT_ADDRESS || 'VDV43V46CVS6A7J2C7W223QNYB72D4566P76F7CA').replace(/[- ]/g, '').toUpperCase();
-  if (fs.existsSync(ACCOUNTS_FILE)) {
-    try {
-      const accounts = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'));
-      if (accounts && accounts.contract && accounts.contract.address) {
-        vaultAddress = accounts.contract.address.replace(/[- ]/g, '').toUpperCase();
-      }
-    } catch (_) {}
-  }
-  const txRecipient = (txInfo.recipient || '').replace(/[- ]/g, '').toUpperCase();
-  if (txRecipient !== vaultAddress) {
-    throw new Error(`Transaction ${normHash} was not sent to vault (${vaultAddress}), got ${txRecipient}`);
-  }
-
-  if (!txInfo.mosaics || txInfo.mosaics.length === 0) {
-    throw new Error(`Transaction ${normHash} contains no mosaics to refund`);
-  }
-
-  const mosaicToRefund = txInfo.mosaics[0];
-  const refundAmountAtomic = BigInt(mosaicToRefund.amount || 0);
-  if (refundAmountAtomic <= 0n) {
-    throw new Error(`Transaction ${normHash} has zero amount to refund`);
-  }
-
-  // Derive sender address from txInfo
-  let senderAddr = txInfo.senderAddress;
-  if (!senderAddr && txInfo.sender) {
-    try {
-      senderAddr = Address.createFromPublicKey(txInfo.sender, NETWORK_ID).plain();
-    } catch (_) {
-      senderAddr = txInfo.sender;
-    }
-  }
-  const vaultPriv = customAdminPrivKey || accounts.contract.privateKey;
-
-  // CRITICAL: Mark deposit as 'refunding' atomically in SQLite BEFORE broadcast!
-  clobDb.markDepositRefunding(normHash);
-  processedDeposits.set(normHash, {
-    status: 'refunding',
-    sender: txInfo.sender,
-    recipientAddress: senderAddr,
-    mosaicIdHex: mosaicToRefund.mosaicIdHex,
-    amount: refundAmountAtomic.toString(),
-    timestamp: Date.now(),
-  });
-  saveProcessedDeposits();
-
-  // Broadcast refund transfer on-chain from vault to sender address
-  const memo = `REFUND:${normHash.slice(0, 16)}`;
-  const refundRes = broadcastTransferOnChain(
-    vaultPriv,
-    senderAddr,
-    mosaicToRefund.mosaicIdHex,
-    refundAmountAtomic,
-    memo
-  );
-
-  // Transition from 'refunding' -> 'refunded' in SQLite
-  clobDb.markDepositRefunded(
-    normHash,
-    refundRes.txHash,
-    senderAddr,
-    mosaicToRefund.mosaicIdHex,
-    refundAmountAtomic
-  );
-
-  processedDeposits.set(normHash, {
-    status: 'refunded',
-    sender: txInfo.sender,
-    recipientAddress: senderAddr,
-    mosaicIdHex: mosaicToRefund.mosaicIdHex,
-    amount: refundAmountAtomic.toString(),
-    refundTxHash: refundRes.txHash,
-    timestamp: Date.now(),
-  });
-  saveProcessedDeposits();
-
-  return {
-    ok: true,
-    refunded: true,
-    originalTxHash: normHash,
-    refundTxHash: refundRes.txHash,
-    recipientAddress: senderAddr,
-    mosaicIdHex: mosaicToRefund.mosaicIdHex,
-    amountAtomic: refundAmountAtomic.toString(),
-  };
-}
-
 loadProcessedDeposits();
 
 function canonicalizeDecimalString(val, maxDecimals = 8) {
@@ -825,50 +713,6 @@ function verifyEd25519Signature(pubKeyHex, message, signatureHex) {
   } catch (err) {
     throw new Error(`Signature verification failed: ${err.message}`);
   }
-}
-
-function signOrderRequest(privKeyHex, order) {
-  const account = Account.createFromPrivateKey(privKeyHex, NETWORK_ID, 1);
-  const msgStr = constructOrderMessage(
-    order.pair,
-    order.side,
-    order.type,
-    order.price,
-    order.amount,
-    order.nonce,
-    order.expiry
-  );
-  return account.signData(msgStr);
-}
-
-function signCancelRequest(privKeyHex, cancelReq) {
-  const account = Account.createFromPrivateKey(privKeyHex, NETWORK_ID, 1);
-  const msgStr = constructCancelMessage(
-    cancelReq.pair,
-    cancelReq.orderId,
-    cancelReq.nonce,
-    cancelReq.expiry
-  );
-  return account.signData(msgStr);
-}
-
-function signCancelAllRequest(privKeyHex, cancelAllReq) {
-  const account = Account.createFromPrivateKey(privKeyHex, NETWORK_ID, 1);
-  const msgStr = constructCancelAllMessage(
-    cancelAllReq.pair,
-    cancelAllReq.nonce,
-    cancelAllReq.expiry
-  );
-  return account.signData(msgStr);
-}
-
-function signBatchCancelRequest(privKeyHex, batchReq) {
-  const account = Account.createFromPrivateKey(privKeyHex, NETWORK_ID, 1);
-  const pair = batchReq.pair || batchReq.market || 'XPX/USDT';
-  const normPair = pair.toUpperCase().replace('_', '/');
-  const orderIds = [...new Set((batchReq.orderIds || []).map((id) => parseInt(id, 10)).filter((id) => Number.isSafeInteger(id) && id > 0))];
-  const batchMsg = `${DOMAIN_SEPARATOR}:CANCEL_BATCH:${normPair}:${orderIds.join(',')}:${batchReq.nonce}:${batchReq.expiry}`;
-  return account.signData(batchMsg);
 }
 
 // Persistent withdrawal state registry: requested -> broadcast -> confirmed
@@ -961,33 +805,9 @@ function constructWithdrawMessage(mosaic, amount, nonce, expiry, recipient = nul
   return `${DOMAIN_SEPARATOR}:WITHDRAW:${normMosaic}:${amount}:${nonce}:${expiry}`;
 }
 
-function signWithdrawalRequest(privKeyHex, withdrawReq) {
-  const account = Account.createFromPrivateKey(privKeyHex, NETWORK_ID, 1);
-  const msg = constructWithdrawMessage(
-    withdrawReq.mosaic || 'XPX',
-    withdrawReq.amount,
-    withdrawReq.nonce,
-    withdrawReq.expiry,
-    withdrawReq.recipient
-  );
-  return account.signData(msg);
-}
-
 function constructAdminMessage(action, nonce, expiry) {
   const normAction = String(action || '').trim().toUpperCase();
   return `${DOMAIN_SEPARATOR}:ADMIN:ACTION:${normAction}:${nonce}:${expiry}`;
-}
-
-function signAdminRequest(privKeyHex, action, nonce, expiry) {
-  const account = Account.createFromPrivateKey(privKeyHex, NETWORK_ID, 1);
-  const msg = constructAdminMessage(action, nonce, expiry);
-  return {
-    publicKey: account.publicKey,
-    action: String(action || '').trim().toUpperCase(),
-    nonce,
-    expiry,
-    signature: account.signData(msg),
-  };
 }
 
 function getAuthorizedAdminKeys() {
@@ -1094,23 +914,6 @@ function verifyAdminRequest(body, expectedAction) {
     callerKey,
     action,
   };
-}
-
-function signWithdrawRequest(privKeyHex, withdrawReq) {
-  const account = Account.createFromPrivateKey(privKeyHex, NETWORK_ID, 1);
-  const mosaic = withdrawReq.mosaic ||
-    (String(withdrawReq.mosaicId) === XPX_MOSAIC_ID ? 'XPX' :
-    (String(withdrawReq.mosaicId) === USDT_MOSAIC_ID ? 'USDT' :
-    (String(withdrawReq.mosaicId) === BNB_MOSAIC_ID ? 'BNB' : withdrawReq.mosaicId))) || 'XPX';
-  const recipient = withdrawReq.recipient || account.address.plain();
-  const msgStr = constructWithdrawMessage(
-    mosaic,
-    withdrawReq.amount,
-    withdrawReq.nonce,
-    withdrawReq.expiry,
-    recipient
-  );
-  return account.signData(msgStr);
 }
 
 function verifyWithdrawalSignature(callerKey, req) {
@@ -1554,11 +1357,6 @@ function isCircuitBreakerTripped() {
   return exchangeCircuitBreaker.tripped;
 }
 
-function getCircuitBreakerStatus() {
-  loadCircuitBreakerState();
-  return { ...exchangeCircuitBreaker };
-}
-
 // Configured Protocol Withdrawal Fees (covers L1 network gas + generates exchange revenue)
 const WITHDRAWAL_FEES = {
   XPX: 1_000_000n, // 1.0 XPX (covers ~0.2 XPX L1 gas -> +0.8 XPX exchange profit)
@@ -1817,15 +1615,7 @@ async function withClusterConsensusLock(fn) {
   }
 }
 
-let customConsensusExecutor = null;
-function _setExecuteConsensusCallOverride(fn) {
-  customConsensusExecutor = fn;
-}
-
 async function executeConsensusCall(stageName, height, txHashHex, contractCallId, vmOptions = {}) {
-  if (customConsensusExecutor) {
-    return await customConsensusExecutor(stageName, height, txHashHex, contractCallId, vmOptions);
-  }
   const tCons0 = Date.now();
   return withClusterConsensusLock(async (seqNo) => {
     const tLock = Date.now();
@@ -2442,12 +2232,6 @@ function updateAccountBalance(publicKey, updater, authContext = null) {
 }
 
 function queryVaultOnChainBalance(mosaicHex) {
-  const normHex = String(mosaicHex).toUpperCase().replace(/^0X/, '').padStart(16, '0');
-  const cached = vaultBalanceCache.get(normHex);
-  return cached ? cached.balance : 0n;
-}
-
-function queryAccountOnChainBalance(accountPubKey, mosaicHex) {
   const normHex = String(mosaicHex).toUpperCase().replace(/^0X/, '').padStart(16, '0');
   const cached = vaultBalanceCache.get(normHex);
   return cached ? cached.balance : 0n;
@@ -3487,116 +3271,6 @@ function startSolvencySentinel(intervalMs = 30000) {
   }, intervalMs);
   if (solvencySentinelInterval.unref) solvencySentinelInterval.unref();
   console.log(`🛡️ [Solvency Sentinel] 24/7 Continuous Solvency Sentinel Daemon active (interval: ${intervalMs}ms)`);
-}
-
-async function syncUserOnChainBalanceToDrive(publicKey) {
-  const key = normalizeKey(publicKey).toLowerCase();
-  try {
-    const netType = testnet2Config.NETWORK_TYPE || 168;
-    const { PublicAccount } = require('tsjs-xpx-chain-sdk');
-    const acc = PublicAccount.createFromPublicKey(key, netType);
-    const addr = acc.address.plain();
-    const endpoint = testnet2Config.NODE_URL || 'https://api-2.testnet2.xpxsirius.io';
-    const t2Client = require('./testnet2_client');
-    const data = await t2Client.fetchJson(`${endpoint}/account/${addr}`);
-    if (!data || !data.account) return;
-    const mosaics = (data.account && data.account.mosaics) || [];
-
-    const isMainnet = netType === 184;
-    const xpxHex = (isMainnet ? '402B2F579FA859B8' : '13BFC518E40549D7').toLowerCase();
-    const usdtHex = (isMainnet ? '7525381A171D1E44' : '4430AEFEF7E15D0C').toLowerCase();
-    const bnbHex = (isMainnet ? '1E5C5FADEC7B34DD' : '3CC1D3CE7447B6F9').toLowerCase();
-
-    let onChainXpx = 0n;
-    let onChainUsdt = 0n;
-    let onChainBnb = 0n;
-
-    for (const m of mosaics) {
-      let idHex = '';
-      if (Array.isArray(m.id) && m.id.length === 2) {
-        const low = (m.id[0] >>> 0).toString(16).padStart(8, '0');
-        const high = (m.id[1] >>> 0).toString(16).padStart(8, '0');
-        idHex = (high + low).toLowerCase();
-      } else if (typeof m.id === 'string') {
-        idHex = m.id.toLowerCase().replace(/^0x/, '');
-      }
-
-      let amountAtomic = 0n;
-      if (Array.isArray(m.amount) && m.amount.length === 2) {
-        amountAtomic = BigInt(m.amount[1] >>> 0) * 4294967296n + BigInt(m.amount[0] >>> 0);
-      } else {
-        amountAtomic = BigInt(m.amount || 0);
-      }
-
-      if (idHex === xpxHex) onChainXpx = amountAtomic;
-      else if (idHex === usdtHex) onChainUsdt = amountAtomic;
-      else if (idHex === bnbHex) onChainBnb = amountAtomic;
-    }
-
-    const driveBal = getDriveBalances(key) || { xpx: 0n, usdt: 0n, bnb: 0n };
-    const diffXpx = onChainXpx > driveBal.xpx ? onChainXpx - driveBal.xpx : 0n;
-    const diffUsdt = onChainUsdt > driveBal.usdt ? onChainUsdt - driveBal.usdt : 0n;
-    const diffBnb = onChainBnb > driveBal.bnb ? onChainBnb - driveBal.bnb : 0n;
-
-    if (diffXpx === 0n && diffUsdt === 0n && diffBnb === 0n) return;
-
-    const currentHeight = getLatestCommittedHeight('node1');
-    const callId = Math.floor(Math.random() * 90000) + 10000;
-    const servicePayments = [];
-
-    if (diffXpx > 0n) {
-      servicePayments.push({ mosaic_id: XPX_MOSAIC_ID, amount: String(diffXpx) });
-    }
-    if (diffUsdt > 0n) {
-      servicePayments.push({ mosaic_id: USDT_MOSAIC_ID, amount: String(diffUsdt) });
-    }
-    if (diffBnb > 0n) {
-      servicePayments.push({ mosaic_id: BNB_MOSAIC_ID, amount: String(diffBnb) });
-    }
-
-    for (const sp of servicePayments) {
-      const p = Buffer.alloc(17);
-      p.writeUInt8(4, 0); // OP_DEPOSIT
-      p.writeBigUInt64LE(BigInt(sp.mosaic_id), 1);
-      p.writeBigUInt64LE(BigInt(sp.amount), 9);
-
-      await executeConsensusCall(
-        'Auto-Sync On-Chain Balance',
-        currentHeight + 1,
-        'auto_sync_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
-        callId,
-        {
-          parameters: p,
-          callerKeyHex: key,
-          servicePayments: [sp],
-        }
-      );
-    }
-
-    // Record in processed_deposits.json
-    const depFile = path.join(CLUSTER_DIR, 'processed_deposits.json');
-    let deps = [];
-    if (fs.existsSync(depFile)) {
-      try { deps = JSON.parse(fs.readFileSync(depFile, 'utf8')); } catch (_) {}
-    }
-    for (const sp of servicePayments) {
-      deps.push({
-        txHash: 'onchain_auto_sync_' + key.slice(0, 12) + '_' + Date.now(),
-        height: currentHeight,
-        senderAddress: addr,
-        senderPublicKey: key,
-        recipientAddress: 'VAAUXFYQ424I6V3JDVWCBWGWHRTIJGTSX4B2TLSV',
-        mosaicIdHex: sp.mosaic_id === XPX_MOSAIC_ID ? '13bfc518e40549d7' : (sp.mosaic_id === USDT_MOSAIC_ID ? '4430aefef7e15d0c' : '3cc1d3ce7447b6f9'),
-        amountAtomic: sp.amount,
-        timestamp: Date.now(),
-      });
-    }
-    fs.writeFileSync(depFile, JSON.stringify(deps, null, 2));
-
-    syncGatewayCacheFromDrive(key);
-  } catch (err) {
-    console.warn('[Auto-Sync] Could not auto-sync on-chain balance for', key, err.message);
-  }
 }
 
 function isMainnetNonCustodialOnly() {
@@ -5786,7 +5460,6 @@ async function cosignTradingAccountWithdrawal(reqBody) {
 module.exports = {
   tradingCosigner,
   cosignTradingAccountWithdrawal,
-  syncUserOnChainBalanceToDrive,
   creditVerifiedDeposit,
   placeOrder,
   cancelOrder,
@@ -5800,12 +5473,6 @@ module.exports = {
   updateAccountBalance,
   claimFaucet,
   getLatestCommittedHeight,
-  signOrderRequest,
-  signCancelRequest,
-  signBatchCancelRequest,
-  signCancelAllRequest,
-  signWithdrawRequest,
-  signWithdrawalRequest,
   constructWithdrawMessage,
   verifyWithdrawalSignature,
   confirmWithdrawal,
@@ -5815,17 +5482,14 @@ module.exports = {
   withdrawals,
   loadWithdrawals,
   deriveMosaicFromAsset,
-  verifyWithdrawalSignature,
   saveWithdrawals,
   verifyEd25519Signature,
   constructOrderMessage,
   constructCancelMessage,
   constructCancelAllMessage,
-  constructWithdrawMessage,
   parseDecimalToBigInt,
   formatAtomicUnits,
   queryVaultOnChainBalance,
-  queryAccountOnChainBalance,
   queryTransactionOnChain,
   verifyOnChainDeposit,
   broadcastTransferOnChain,
@@ -5851,7 +5515,6 @@ module.exports = {
   usedNonces,
   PROCESSED_DEPOSITS_FILE,
   recordDepositTx,
-  refundMismatchedDeposit,
   processedDeposits,
   loadProcessedDeposits,
   loadBalances,
@@ -5865,10 +5528,8 @@ module.exports = {
   activeOrders,
   clobDb,
   constructAdminMessage,
-  signAdminRequest,
   getAuthorizedAdminKeys,
   verifyAdminRequest,
-  executeConsensusCall,
   withClusterConsensusLock,
   computeMarketsHashForDir,
   computeNodeMarketsHash,
@@ -5882,7 +5543,6 @@ module.exports = {
   resetCircuitBreaker,
   loadCircuitBreakerState,
   isCircuitBreakerTripped,
-  getCircuitBreakerStatus,
   checkAndEnforceCircuitBreaker,
   WITHDRAWAL_LIMITS_24H,
   getRolling24hWithdrawalVolume,
@@ -5909,6 +5569,4 @@ module.exports = {
   getWithdrawalFee,
   withAccountLock,
   _placeOrderUnlocked,
-  _setExecuteConsensusCallOverride,
-  setCustomConsensusExecutor: _setExecuteConsensusCallOverride,
 };

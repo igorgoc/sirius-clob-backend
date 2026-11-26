@@ -4,7 +4,8 @@
   "description": "Sirius CLOB Decentralized Exchange Backend: 3-Node BFT WASM Cluster + Relayer API",
   "main": "dashboard/server.js",
   "scripts": {
-    "start": "bash start.sh"
+    "start": "bash start.sh",
+    "test": "node scripts/test_redteam_5pass_hardening.js && node scripts/test_edge_cases_comprehensive.js && node scripts/test_chaos_and_stress.js"
   },
   "dependencies": {
     "@grpc/grpc-js": "^1.10.9",
