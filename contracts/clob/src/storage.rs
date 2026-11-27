@@ -94,8 +94,11 @@ struct MarketPairV1 {
     pub asks: std::collections::BTreeMap<crate::types::PriceTick, crate::types::PriceLevel>,
 }
 
+pub const MAX_STATE_FILE_BYTES: usize = 64 * 1024 * 1024; // 64 MiB hard cap against bincode OOM DoS
+
 pub fn load_or_init_market(quote_mosaic_id: u64) -> Result<MarketPair, &'static str> {
-    let (_, state_file, _, _, _) = get_market_paths(quote_mosaic_id)?;
+    let canonical_quote = canonicalize_mosaic_id(quote_mosaic_id).unwrap_or(quote_mosaic_id);
+    let (_, state_file, _, _, _) = get_market_paths(canonical_quote)?;
     if path_exists(state_file) {
         let mut reader = FileReader::new(state_file)
             .map_err(|_| "Corrupt or unreadable market_state.bin: failed to open")?;
@@ -105,6 +108,9 @@ pub fn load_or_init_market(quote_mosaic_id: u64) -> Result<MarketPair, &'static 
             .map_err(|_| "Corrupt or unreadable market_state.bin: failed to read")?;
         if buf.is_empty() {
             return Err("Corrupt market_state.bin: empty file — refusing to silently reset orderbook");
+        }
+        if buf.len() > MAX_STATE_FILE_BYTES {
+            return Err("Corrupt market_state.bin: file exceeds maximum allowed size");
         }
         if let Ok(mut market) = bincode::deserialize::<MarketPair>(&buf) {
             if market.order_index.is_empty() && (!market.bids.is_empty() || !market.asks.is_empty()) {
@@ -132,10 +138,10 @@ pub fn load_or_init_market(quote_mosaic_id: u64) -> Result<MarketPair, &'static 
     }
 
     // Default Market initialized ONLY on true first boot (when state_file does not exist)
-    let tick_size = if quote_mosaic_id == BNB_MOSAIC_ID { 1 } else { 100 };
+    let tick_size = if canonical_quote == BNB_MOSAIC_ID { 1 } else { 100 };
     Ok(MarketPair::new(
         XPX_MOSAIC_ID,
-        quote_mosaic_id,
+        canonical_quote,
         tick_size,
         100_000,     // min order size = 0.100000 XPX
         0,           // 0.00% maker fee (0 bps)
@@ -170,7 +176,7 @@ pub fn record_trades(quote_mosaic_id: u64, new_trades: &[TradeFill]) -> Result<(
     if path_exists(trades_file) {
         if let Ok(mut reader) = FileReader::new(trades_file) {
             let mut buf = Vec::new();
-            if reader.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+            if reader.read_to_end(&mut buf).is_ok() && !buf.is_empty() && buf.len() <= MAX_STATE_FILE_BYTES {
                 if let Ok(existing) = bincode::deserialize::<Vec<TradeFill>>(&buf) {
                     all_trades = existing;
                 }
@@ -229,11 +235,17 @@ impl BalanceLedger {
         (0, 0)
     }
 
-    pub fn deposit(&mut self, pubkey: [u8; 32], mosaic_id: u64, amount: u64) {
+    pub fn deposit(&mut self, pubkey: [u8; 32], mosaic_id: u64, amount: u64) -> Result<(), &'static str> {
+        if amount == 0 {
+            return Ok(());
+        }
         for e in &mut self.entries {
             if e.pubkey == pubkey && e.mosaic_id == mosaic_id {
-                e.free_amount = e.free_amount.saturating_add(amount);
-                return;
+                e.free_amount = e
+                    .free_amount
+                    .checked_add(amount)
+                    .ok_or("Balance deposit overflow")?;
+                return Ok(());
             }
         }
         const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
@@ -250,9 +262,13 @@ impl BalanceLedger {
             locked_amount: 0,
         });
         self.entries.sort_by(|a, b| a.pubkey.cmp(&b.pubkey).then(a.mosaic_id.cmp(&b.mosaic_id)));
+        Ok(())
     }
 
     pub fn withdraw(&mut self, pubkey: &[u8; 32], mosaic_id: u64, amount: u64) -> Result<(), &'static str> {
+        if amount == 0 {
+            return Ok(());
+        }
         for e in &mut self.entries {
             if &e.pubkey == pubkey && e.mosaic_id == mosaic_id {
                 if e.free_amount < amount {
@@ -266,13 +282,20 @@ impl BalanceLedger {
     }
 
     pub fn lock(&mut self, pubkey: &[u8; 32], mosaic_id: u64, amount: u64) -> Result<(), &'static str> {
+        if amount == 0 {
+            return Ok(());
+        }
         for e in &mut self.entries {
             if &e.pubkey == pubkey && e.mosaic_id == mosaic_id {
                 if e.free_amount < amount {
                     return Err("Insufficient free balance to lock");
                 }
+                let next_locked = e
+                    .locked_amount
+                    .checked_add(amount)
+                    .ok_or("Balance lock overflow")?;
                 e.free_amount -= amount;
-                e.locked_amount = e.locked_amount.saturating_add(amount);
+                e.locked_amount = next_locked;
                 return Ok(());
             }
         }
@@ -280,11 +303,18 @@ impl BalanceLedger {
     }
 
     pub fn unlock(&mut self, pubkey: &[u8; 32], mosaic_id: u64, amount: u64) -> Result<(), &'static str> {
+        if amount == 0 {
+            return Ok(());
+        }
         for e in &mut self.entries {
             if &e.pubkey == pubkey && e.mosaic_id == mosaic_id {
                 let actual = e.locked_amount.min(amount);
+                let next_free = e
+                    .free_amount
+                    .checked_add(actual)
+                    .ok_or("Balance unlock overflow")?;
                 e.locked_amount -= actual;
-                e.free_amount = e.free_amount.saturating_add(actual);
+                e.free_amount = next_free;
                 return Ok(());
             }
         }
@@ -292,6 +322,9 @@ impl BalanceLedger {
     }
 
     pub fn release_locked(&mut self, pubkey: &[u8; 32], mosaic_id: u64, amount: u64) -> Result<(), &'static str> {
+        if amount == 0 {
+            return Ok(());
+        }
         for e in &mut self.entries {
             if &e.pubkey == pubkey && e.mosaic_id == mosaic_id {
                 let actual = e.locked_amount.min(amount);
@@ -303,18 +336,29 @@ impl BalanceLedger {
     }
 }
 
-pub fn load_balances() -> BalanceLedger {
+/// Fail-closed balance ledger loader:
+/// Returns an empty ledger ONLY when `markets/balances.bin` does not exist yet (fresh boot).
+/// If the file exists but is empty, unreadable, oversized, or corrupt, returns Err instead of
+/// silently wiping all user balances on the next save.
+pub fn load_balances() -> Result<BalanceLedger, &'static str> {
     if path_exists(BALANCES_FILE) {
-        if let Ok(mut reader) = FileReader::new(BALANCES_FILE) {
-            let mut buf = Vec::new();
-            if reader.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
-                if let Ok(ledger) = bincode::deserialize::<BalanceLedger>(&buf) {
-                    return ledger;
-                }
-            }
+        let mut reader = FileReader::new(BALANCES_FILE)
+            .map_err(|_| "Corrupt or unreadable balances.bin: failed to open")?;
+        let mut buf = Vec::new();
+        reader
+            .read_to_end(&mut buf)
+            .map_err(|_| "Corrupt or unreadable balances.bin: failed to read")?;
+        if buf.is_empty() {
+            return Err("Corrupt balances.bin: empty file — refusing to silently reset balances");
         }
+        if buf.len() > MAX_STATE_FILE_BYTES {
+            return Err("Corrupt balances.bin: file exceeds maximum allowed size");
+        }
+        let ledger = bincode::deserialize::<BalanceLedger>(&buf)
+            .map_err(|_| "Corrupt balances.bin: bincode deserialization failed — refusing to wipe balances")?;
+        return Ok(ledger);
     }
-    BalanceLedger::default()
+    Ok(BalanceLedger::default())
 }
 
 pub fn save_balances(ledger: &BalanceLedger) -> Result<(), &'static str> {

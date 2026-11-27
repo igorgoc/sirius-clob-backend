@@ -70,6 +70,112 @@ pub const OP_CANCEL_ALL: u8 = 6;
 pub const OP_BATCH_CANCEL: u8 = 7;
 pub const OP_EMERGENCY_UNLOCK: u8 = 8;
 
+/// Anti-DoS parameter bounds
+pub const MAX_DEPTH_LEVELS: usize = 500;
+pub const MAX_BATCH_CANCEL_ORDERS: usize = 500;
+
+/// Helper: emit an on-chain refund for an attached service payment without touching the balance ledger
+fn emit_payment_refund(caller: [u8; 32], mosaic_id: u64, paid: u64, memo: &[u8]) {
+    if paid == 0 {
+        return;
+    }
+    let mut refund_agg = AggregateTransaction::default();
+    refund_agg.set_max_fee(100_000);
+    if let Some(tx) = build_transfer_tx(caller, mosaic_id, paid, memo) {
+        refund_agg.add_embedded_transaction(tx);
+        blockchain::set_transaction(&refund_agg);
+    }
+}
+
+/// Pure, panic-free parser for OP_BATCH_CANCEL payloads (safe on 32-bit wasm32 usize)
+pub fn parse_batch_cancel_params(params: &[u8]) -> Result<(u64, Vec<OrderId>), u32> {
+    // Strip leading OP_BATCH_CANCEL ONLY when framed length is 8*k + 1 (prevents double-stripping order_id == 7!)
+    let p = if !params.is_empty() && params.len() % 8 == 1 && params[0] == OP_BATCH_CANCEL {
+        &params[1..]
+    } else {
+        params
+    };
+
+    if p.len() < 8 || p.len() % 8 != 0 {
+        return Err(101);
+    }
+
+    let mut explicit_quote = 0u64;
+    let mut order_ids = Vec::new();
+
+    if p.len() >= 16 {
+        let first_u64 = u64::from_le_bytes(p[0..8].try_into().unwrap_or([0; 8]));
+        let second_u64 = u64::from_le_bytes(p[8..16].try_into().unwrap_or([0; 8]));
+
+        // Checked arithmetic prevents 32-bit wasm32 usize truncation and overflow abort
+        let counted_frame_match = usize::try_from(second_u64)
+            .ok()
+            .and_then(|c| c.checked_mul(8))
+            .and_then(|b| b.checked_add(16))
+            .map(|expected_len| expected_len == p.len())
+            .unwrap_or(false);
+
+        if counted_frame_match {
+            let count = second_u64 as usize;
+            if count == 0 || count > MAX_BATCH_CANCEL_ORDERS {
+                return Err(101);
+            }
+            explicit_quote = first_u64;
+            order_ids.reserve(count);
+            for i in 0..count {
+                let start = 16 + i * 8;
+                let oid = u64::from_le_bytes(p[start..start + 8].try_into().unwrap_or([0; 8]));
+                order_ids.push(oid);
+            }
+        } else if first_u64 == 0
+            || canonicalize_mosaic_id(first_u64)
+                .map(|m| m == USDT_MOSAIC_ID || m == BNB_MOSAIC_ID)
+                .unwrap_or(false)
+        {
+            let count = (p.len() - 8) / 8;
+            if count == 0 || count > MAX_BATCH_CANCEL_ORDERS {
+                return Err(101);
+            }
+            explicit_quote = first_u64;
+            order_ids.reserve(count);
+            let mut offset = 8;
+            while offset + 8 <= p.len() {
+                let oid = u64::from_le_bytes(p[offset..offset + 8].try_into().unwrap_or([0; 8]));
+                order_ids.push(oid);
+                offset += 8;
+            }
+        } else {
+            let count = p.len() / 8;
+            if count > MAX_BATCH_CANCEL_ORDERS {
+                return Err(101);
+            }
+            order_ids.reserve(count);
+            let mut offset = 0;
+            while offset + 8 <= p.len() {
+                let oid = u64::from_le_bytes(p[offset..offset + 8].try_into().unwrap_or([0; 8]));
+                order_ids.push(oid);
+                offset += 8;
+            }
+        }
+    } else if p.len() == 8 {
+        let oid = u64::from_le_bytes(p[0..8].try_into().unwrap_or([0; 8]));
+        order_ids.push(oid);
+    }
+
+    if order_ids.is_empty() || order_ids.len() > MAX_BATCH_CANCEL_ORDERS {
+        return Err(101);
+    }
+
+    if explicit_quote != 0 {
+        match canonicalize_mosaic_id(explicit_quote) {
+            Some(q) if q == USDT_MOSAIC_ID || q == BNB_MOSAIC_ID => explicit_quote = q,
+            _ => return Err(105),
+        }
+    }
+
+    Ok((explicit_quote, order_ids))
+}
+
 /// Core Order Placement Handler
 pub fn handle_place_order(params: &[u8]) -> u32 {
     // ABI Resiliency: only strip leading OP_PLACE_ORDER if total length matches prefixed frame (19 or 27 bytes)
@@ -107,21 +213,21 @@ pub fn handle_place_order(params: &[u8]) -> u32 {
 
     let caller = blockchain::get_caller_public_key();
     let timestamp = blockchain::get_block_time();
-
     let payments = blockchain::get_service_payments();
 
     let quote_mosaic_id = if explicit_quote != 0 {
-        explicit_quote
-    } else if payments.iter().any(|pm| pm.mosaic_id == BNB_MOSAIC_ID) {
+        match canonicalize_mosaic_id(explicit_quote) {
+            Some(q) if q == USDT_MOSAIC_ID || q == BNB_MOSAIC_ID => q,
+            _ => return 105, // Unsupported quote mosaic ID
+        }
+    } else if payments
+        .iter()
+        .any(|pm| canonicalize_mosaic_id(pm.mosaic_id) == Some(BNB_MOSAIC_ID))
+    {
         BNB_MOSAIC_ID
     } else {
         USDT_MOSAIC_ID
     };
-
-    // Whitelist check: strictly only USDT and BNB quote mosaics are supported
-    if quote_mosaic_id != USDT_MOSAIC_ID && quote_mosaic_id != BNB_MOSAIC_ID {
-        return 105; // Unsupported quote mosaic ID
-    }
 
     let (required_mosaic, required_amount) = match side {
         OrderSide::Buy => (quote_mosaic_id, MarketPair::calculate_quote_amount(amount, price)),
@@ -132,49 +238,47 @@ pub fn handle_place_order(params: &[u8]) -> u32 {
         return 104; // Zero price, amount, sub-atomic truncation, or saturated quote overflow
     }
 
-    // Verify service payments and free trading balance in on-chain BalanceLedger (saturating sum to prevent u64 wrap)
+    // Verify service payments matching the required mosaic (canonicalized, saturating sum)
     let paid = payments
         .iter()
-        .filter(|p| p.mosaic_id == required_mosaic)
-        .fold(0u64, |acc, p| acc.saturating_add(p.amount));
+        .filter(|pm| canonicalize_mosaic_id(pm.mosaic_id) == Some(required_mosaic))
+        .fold(0u64, |acc, pm| acc.saturating_add(pm.amount));
 
-    let mut ledger = load_balances();
+    // Fail-closed load: never wipe balances on corrupt balances.bin
+    let mut ledger = match load_balances() {
+        Ok(l) => l,
+        Err(_) => {
+            emit_payment_refund(caller, required_mosaic, paid, b"SiriusCLOB: Ledger Load Error Refund");
+            return 105;
+        }
+    };
+
     if paid > 0 {
-        ledger.deposit(caller, required_mosaic, paid);
+        if ledger.deposit(caller, required_mosaic, paid).is_err() {
+            emit_payment_refund(caller, required_mosaic, paid, b"SiriusCLOB: Deposit Overflow Refund");
+            return 305;
+        }
     }
 
     let (free_bal, _) = ledger.get_balance(&caller, required_mosaic);
 
     if free_bal < required_amount {
-        // If partial tokens were sent, refund them immediately so they are never lost
-        if paid > 0 {
-            let _ = ledger.withdraw(&caller, required_mosaic, paid);
-            let mut refund_agg = AggregateTransaction::default();
-            refund_agg.set_max_fee(100_000);
-            if let Some(tx) = build_transfer_tx(
-                caller,
-                required_mosaic,
-                paid,
-                b"SiriusCLOB: Insufficient Escrow Refund",
-            ) {
-                refund_agg.add_embedded_transaction(tx);
-                blockchain::set_transaction(&refund_agg);
-            }
-        }
-        let _ = save_balances(&ledger);
+        // Ledger has NOT been persisted yet, so refunding attached `paid` leaves ledger untouched & consistent
+        emit_payment_refund(caller, required_mosaic, paid, b"SiriusCLOB: Insufficient Escrow Refund");
         return 301; // Insufficient escrow deposit
     }
 
-    // Lock required amount from free balance into order escrow
-    let _ = ledger.lock(&caller, required_mosaic, required_amount);
-    let _ = save_balances(&ledger);
+    // Lock required amount in memory (do NOT persist until market matching & all accounting checks succeed!)
+    if ledger.lock(&caller, required_mosaic, required_amount).is_err() {
+        emit_payment_refund(caller, required_mosaic, paid, b"SiriusCLOB: Lock Error Refund");
+        return 301;
+    }
 
     // Load market state from Replicator Drive
     let mut market = match load_or_init_market(quote_mosaic_id) {
         Ok(m) => m,
         Err(_) => {
-            let _ = ledger.unlock(&caller, required_mosaic, required_amount);
-            let _ = save_balances(&ledger);
+            emit_payment_refund(caller, required_mosaic, paid, b"SiriusCLOB: Market Load Error Refund");
             return 105;
         }
     };
@@ -182,39 +286,13 @@ pub fn handle_place_order(params: &[u8]) -> u32 {
     let result = match market.place_order(caller, side, order_type, price, amount, timestamp) {
         Ok(res) => res,
         Err(_) => {
-            let _ = ledger.unlock(&caller, required_mosaic, required_amount);
-            let _ = save_balances(&ledger);
-            // If the matching engine rejects (e.g. lot size, tick size), refund 100% of deposited tokens
-            if paid > 0 {
-                let mut refund_agg = AggregateTransaction::default();
-                refund_agg.set_max_fee(100_000);
-                if let Some(tx) = build_transfer_tx(
-                    caller,
-                    required_mosaic,
-                    paid,
-                    b"SiriusCLOB: Order Rejected Refund",
-                ) {
-                    refund_agg.add_embedded_transaction(tx);
-                    blockchain::set_transaction(&refund_agg);
-                }
-            }
+            // Because `ledger` was NEVER persisted with `paid` or the lock, refunding `paid` cannot double-refund!
+            emit_payment_refund(caller, required_mosaic, paid, b"SiriusCLOB: Order Rejected Refund");
             return 201; // Engine rejected order
         }
     };
 
-    // Save updated orderbook state
-    if save_market_state(&market).is_err() {
-        let _ = ledger.unlock(&caller, required_mosaic, required_amount);
-        let _ = save_balances(&ledger);
-        return 105; // Failed to persist state
-    }
-
-    // Record trade history
-    if !result.fills.is_empty() {
-        let _ = record_trades(market.quote_mosaic_id, &result.fills);
-    }
-
-    // Prepare settlement transfers
+    // Prepare settlement transfers & apply ALL ledger mutations in memory BEFORE writing ANY file to disk!
     let mut aggregate_tx = AggregateTransaction::default();
     aggregate_tx.set_max_fee(100_000);
 
@@ -227,9 +305,15 @@ pub fn handle_place_order(params: &[u8]) -> u32 {
                 // Taker (Buyer) receives Base (XPX minus taker fee)
                 let net_base = match fill.base_amount.checked_sub(fill.taker_fee) {
                     Some(val) => val,
-                    None => return 305, // Fee exceeds base amount underflow error
+                    None => {
+                        emit_payment_refund(caller, required_mosaic, paid, b"SiriusCLOB: Fee Error Refund");
+                        return 305;
+                    }
                 };
-                let _ = ledger.deposit(fill.taker_pubkey, market.base_mosaic_id, net_base);
+                if ledger.deposit(fill.taker_pubkey, market.base_mosaic_id, net_base).is_err() {
+                    emit_payment_refund(caller, required_mosaic, paid, b"SiriusCLOB: Balance Overflow Refund");
+                    return 305;
+                }
                 let base_memo = format!("SiriusCLOB: Trade Fill (Base):FEE={}:TAKER_FEE={}", fill.taker_fee, fill.taker_fee);
                 if let Some(tx) = build_transfer_tx(
                     fill.taker_pubkey,
@@ -239,12 +323,18 @@ pub fn handle_place_order(params: &[u8]) -> u32 {
                 ) {
                     aggregate_tx.add_embedded_transaction(tx);
                 }
-                // Maker (Seller) receives Quote (USDT minus maker fee)
+                // Maker (Seller) receives Quote (USDT/BNB minus maker fee)
                 let net_quote = match fill.quote_amount.checked_sub(fill.maker_fee) {
                     Some(val) => val,
-                    None => return 305, // Fee exceeds quote amount underflow error
+                    None => {
+                        emit_payment_refund(caller, required_mosaic, paid, b"SiriusCLOB: Fee Error Refund");
+                        return 305;
+                    }
                 };
-                let _ = ledger.deposit(fill.maker_pubkey, market.quote_mosaic_id, net_quote);
+                if ledger.deposit(fill.maker_pubkey, market.quote_mosaic_id, net_quote).is_err() {
+                    emit_payment_refund(caller, required_mosaic, paid, b"SiriusCLOB: Balance Overflow Refund");
+                    return 305;
+                }
                 let quote_memo = format!("SiriusCLOB: Trade Fill (Quote):FEE={}:MAKER_FEE={}", fill.maker_fee, fill.maker_fee);
                 if let Some(tx) = build_transfer_tx(
                     fill.maker_pubkey,
@@ -262,9 +352,15 @@ pub fn handle_place_order(params: &[u8]) -> u32 {
                 // Maker (Buyer) receives Base (XPX minus maker fee)
                 let net_base = match fill.base_amount.checked_sub(fill.maker_fee) {
                     Some(val) => val,
-                    None => return 305, // Fee exceeds base amount underflow error
+                    None => {
+                        emit_payment_refund(caller, required_mosaic, paid, b"SiriusCLOB: Fee Error Refund");
+                        return 305;
+                    }
                 };
-                let _ = ledger.deposit(fill.maker_pubkey, market.base_mosaic_id, net_base);
+                if ledger.deposit(fill.maker_pubkey, market.base_mosaic_id, net_base).is_err() {
+                    emit_payment_refund(caller, required_mosaic, paid, b"SiriusCLOB: Balance Overflow Refund");
+                    return 305;
+                }
                 let base_memo = format!("SiriusCLOB: Trade Fill (Base):FEE={}:MAKER_FEE={}", fill.maker_fee, fill.maker_fee);
                 if let Some(tx) = build_transfer_tx(
                     fill.maker_pubkey,
@@ -274,12 +370,18 @@ pub fn handle_place_order(params: &[u8]) -> u32 {
                 ) {
                     aggregate_tx.add_embedded_transaction(tx);
                 }
-                // Taker (Seller) receives Quote (USDT minus taker fee)
+                // Taker (Seller) receives Quote (USDT/BNB minus taker fee)
                 let net_quote = match fill.quote_amount.checked_sub(fill.taker_fee) {
                     Some(val) => val,
-                    None => return 305, // Fee exceeds quote amount underflow error
+                    None => {
+                        emit_payment_refund(caller, required_mosaic, paid, b"SiriusCLOB: Fee Error Refund");
+                        return 305;
+                    }
                 };
-                let _ = ledger.deposit(fill.taker_pubkey, market.quote_mosaic_id, net_quote);
+                if ledger.deposit(fill.taker_pubkey, market.quote_mosaic_id, net_quote).is_err() {
+                    emit_payment_refund(caller, required_mosaic, paid, b"SiriusCLOB: Balance Overflow Refund");
+                    return 305;
+                }
                 let quote_memo = format!("SiriusCLOB: Trade Fill (Quote):FEE={}:TAKER_FEE={}", fill.taker_fee, fill.taker_fee);
                 if let Some(tx) = build_transfer_tx(
                     fill.taker_pubkey,
@@ -293,42 +395,73 @@ pub fn handle_place_order(params: &[u8]) -> u32 {
         }
     }
 
-    // Overpayment protection: if caller attached more than required, refund excess immediately
-    let excess_deposit = match paid.checked_sub(required_amount) {
-        Some(val) => val,
-        None => 0,
-    };
+    // Unlock any evicted unfillable dust remainders back to their resting order owners
+    for &(dust_owner, dust_side, dust_amount) in &result.dust_refunds {
+        if dust_amount > 0 {
+            let dust_mosaic = match dust_side {
+                OrderSide::Buy => market.quote_mosaic_id,
+                OrderSide::Sell => market.base_mosaic_id,
+            };
+            let _ = ledger.unlock(&dust_owner, dust_mosaic, dust_amount);
+        }
+    }
 
-    // Exact Escrow Refunds (IOC unspent, price improvement, STP, and excess deposit)
-    let total_refund_base = result.refund_base.saturating_add(if side == OrderSide::Sell { excess_deposit } else { 0 });
-    let total_refund_quote = result.refund_quote.saturating_add(if side == OrderSide::Buy { excess_deposit } else { 0 });
-
-    if total_refund_base > 0 {
-        let _ = ledger.unlock(&caller, market.base_mosaic_id, total_refund_base);
+    // Exact Escrow Refunds (IOC unspent, PostOnly rejection, price improvement, unfillable dust, and STP)
+    // NOTE: Unlocked strictly from locked escrow (never mixed with free `excess_deposit`!)
+    if result.refund_base > 0 {
+        let _ = ledger.unlock(&caller, market.base_mosaic_id, result.refund_base);
         if let Some(tx) = build_transfer_tx(
             caller,
             market.base_mosaic_id,
-            total_refund_base,
+            result.refund_base,
             b"SiriusCLOB: Base Escrow Refund",
         ) {
             aggregate_tx.add_embedded_transaction(tx);
         }
     }
 
-    if total_refund_quote > 0 {
-        let _ = ledger.unlock(&caller, market.quote_mosaic_id, total_refund_quote);
+    if result.refund_quote > 0 {
+        let _ = ledger.unlock(&caller, market.quote_mosaic_id, result.refund_quote);
         if let Some(tx) = build_transfer_tx(
             caller,
             market.quote_mosaic_id,
-            total_refund_quote,
+            result.refund_quote,
             b"SiriusCLOB: Quote Escrow Refund",
         ) {
             aggregate_tx.add_embedded_transaction(tx);
         }
     }
 
+    // Overpayment protection: excess `paid > required_amount` sat in `free_amount` (never locked),
+    // so withdraw it from `free_amount` BEFORE emitting its on-chain refund transfer!
+    let excess_deposit = paid.saturating_sub(required_amount);
+    if excess_deposit > 0 {
+        if ledger.withdraw(&caller, required_mosaic, excess_deposit).is_ok() {
+            if let Some(tx) = build_transfer_tx(
+                caller,
+                required_mosaic,
+                excess_deposit,
+                b"SiriusCLOB: Excess Deposit Refund",
+            ) {
+                aggregate_tx.add_embedded_transaction(tx);
+            }
+        }
+    }
+
+    // Persist market state (skip redundant write on rejected PostOnly) & balance ledger together
+    if result.status != OrderStatus::Rejected {
+        if save_market_state(&market).is_err() {
+            return 105; // Failed to persist market state; balances untouched
+        }
+    }
+
     if save_balances(&ledger).is_err() {
         return 105; // Do not emit settlement transactions if balance ledger failed to persist
+    }
+
+    // Record trade history
+    if !result.fills.is_empty() {
+        let _ = record_trades(market.quote_mosaic_id, &result.fills);
     }
 
     // Emit settlement transactions if any were generated
@@ -360,7 +493,11 @@ pub fn handle_cancel_order(params: &[u8]) -> u32 {
     let caller = blockchain::get_caller_public_key();
 
     let mut market = if explicit_quote != 0 {
-        match load_or_init_market(explicit_quote) {
+        let canon_q = match canonicalize_mosaic_id(explicit_quote) {
+            Some(q) if q == USDT_MOSAIC_ID || q == BNB_MOSAIC_ID => q,
+            _ => return 105,
+        };
+        match load_or_init_market(canon_q) {
             Ok(m) => m,
             Err(_) => return 105,
         }
@@ -370,9 +507,7 @@ pub fn handle_cancel_order(params: &[u8]) -> u32 {
             Ok(m) => m,
             Err(_) => return 105,
         };
-        if m_usdt.bids.values().any(|lvl| lvl.orders.iter().any(|o| o.order_id == order_id))
-            || m_usdt.asks.values().any(|lvl| lvl.orders.iter().any(|o| o.order_id == order_id))
-        {
+        if m_usdt.order_index.contains_key(&order_id) {
             m_usdt
         } else {
             match load_or_init_market(BNB_MOSAIC_ID) {
@@ -382,31 +517,26 @@ pub fn handle_cancel_order(params: &[u8]) -> u32 {
         }
     };
 
+    // Load balance ledger fail-closed BEFORE mutating/saving market state
+    let mut ledger = match load_balances() {
+        Ok(l) => l,
+        Err(_) => return 105,
+    };
+
     let (side, refund_amount, _price) = match market.cancel_order(order_id, caller) {
         Ok(res) => res,
         Err(_) => return 202, // Order not found or unauthorized
     };
 
-    if save_market_state(&market).is_err() {
-        return 105;
-    }
+    let mut aggregate_tx = AggregateTransaction::default();
+    aggregate_tx.set_max_fee(100_000);
 
-    // Emit refund transaction for unspent escrow and release in ledger
     if refund_amount > 0 {
         let refund_mosaic = match side {
             OrderSide::Buy => market.quote_mosaic_id,
             OrderSide::Sell => market.base_mosaic_id,
         };
-
-        let mut ledger = load_balances();
         let _ = ledger.unlock(&caller, refund_mosaic, refund_amount);
-        if save_balances(&ledger).is_err() {
-            return 105;
-        }
-
-        let mut aggregate_tx = AggregateTransaction::default();
-        aggregate_tx.set_max_fee(100_000);
-
         if let Some(tx) = build_transfer_tx(
             caller,
             refund_mosaic,
@@ -414,8 +544,19 @@ pub fn handle_cancel_order(params: &[u8]) -> u32 {
             b"SiriusCLOB: Order Cancellation Refund",
         ) {
             aggregate_tx.add_embedded_transaction(tx);
-            blockchain::set_transaction(&aggregate_tx);
         }
+    }
+
+    if save_market_state(&market).is_err() {
+        return 105;
+    }
+
+    if refund_amount > 0 && save_balances(&ledger).is_err() {
+        return 105;
+    }
+
+    if !aggregate_tx.get_embedded_transactions().is_empty() {
+        blockchain::set_transaction(&aggregate_tx);
     }
 
     0
@@ -426,7 +567,10 @@ pub fn handle_deposit(params: &[u8]) -> u32 {
     let caller = blockchain::get_caller_public_key();
     let payments = blockchain::get_service_payments();
 
-    let mut ledger = load_balances();
+    let mut ledger = match load_balances() {
+        Ok(l) => l,
+        Err(_) => return 105,
+    };
     let mut credited = 0usize;
 
     // 1. Process servicePayments attached to the invocation
@@ -434,7 +578,9 @@ pub fn handle_deposit(params: &[u8]) -> u32 {
         for pm in &payments {
             if pm.amount > 0 {
                 if let Some(canonical_id) = canonicalize_mosaic_id(pm.mosaic_id) {
-                    ledger.deposit(caller, canonical_id, pm.amount);
+                    if ledger.deposit(caller, canonical_id, pm.amount).is_err() {
+                        return 305;
+                    }
                     credited += 1;
                 }
             }
@@ -442,9 +588,9 @@ pub fn handle_deposit(params: &[u8]) -> u32 {
     }
 
     // 2. Fallback: Parse binary deposit parameters if service payments array is empty
-    // Format: [OP_DEPOSIT (1 byte), mosaic_id (8 bytes LE), amount (8 bytes LE)]
+    // Format: [OP_DEPOSIT (1 byte, optional), mosaic_id (8 bytes LE), amount (8 bytes LE)]
     if credited == 0 && params.len() >= 16 {
-        let p = if !params.is_empty() && params[0] == OP_DEPOSIT {
+        let p = if params.len() == 17 && params[0] == OP_DEPOSIT {
             &params[1..]
         } else {
             params
@@ -454,7 +600,9 @@ pub fn handle_deposit(params: &[u8]) -> u32 {
             let amount = u64::from_le_bytes(p[8..16].try_into().unwrap_or([0; 8]));
             if amount > 0 {
                 if let Some(canonical_id) = canonicalize_mosaic_id(mosaic_id) {
-                    ledger.deposit(caller, canonical_id, amount);
+                    if ledger.deposit(caller, canonical_id, amount).is_err() {
+                        return 305;
+                    }
                     credited += 1;
                 }
             }
@@ -494,7 +642,7 @@ pub fn handle_deposit(params: &[u8]) -> u32 {
 
 /// Core Withdrawal Handler
 pub fn handle_withdraw(params: &[u8]) -> u32 {
-    let p = if !params.is_empty() && params[0] == OP_WITHDRAW {
+    let p = if params.len() == 17 && params[0] == OP_WITHDRAW {
         &params[1..]
     } else {
         params
@@ -518,7 +666,10 @@ pub fn handle_withdraw(params: &[u8]) -> u32 {
     };
 
     let caller = blockchain::get_caller_public_key();
-    let mut ledger = load_balances();
+    let mut ledger = match load_balances() {
+        Ok(l) => l,
+        Err(_) => return 105,
+    };
 
     if ledger.withdraw(&caller, mosaic_id, amount).is_err() {
         return 302; // Insufficient free balance
@@ -552,8 +703,10 @@ pub fn handle_get_depth(params: &[u8]) -> u32 {
         params
     };
 
+    // Safe clamp before usize cast (prevents 32-bit wasm32 truncation and huge allocations)
     let max_levels = if p.len() >= 8 {
-        u64::from_le_bytes(p[0..8].try_into().unwrap_or([0; 8])) as usize
+        let raw = u64::from_le_bytes(p[0..8].try_into().unwrap_or([0; 8]));
+        u64::min(raw, MAX_DEPTH_LEVELS as u64) as usize
     } else {
         50 // default to 50 levels
     };
@@ -565,7 +718,10 @@ pub fn handle_get_depth(params: &[u8]) -> u32 {
     };
 
     let quotes_to_sync = if explicit_quote != 0 {
-        vec![explicit_quote]
+        match canonicalize_mosaic_id(explicit_quote) {
+            Some(q) if q == USDT_MOSAIC_ID || q == BNB_MOSAIC_ID => vec![q],
+            _ => return 105,
+        }
     } else {
         vec![USDT_MOSAIC_ID, BNB_MOSAIC_ID]
     };
@@ -600,7 +756,7 @@ pub fn handle_get_depth(params: &[u8]) -> u32 {
 
 /// Core Cancel All Handler
 pub fn handle_cancel_all(params: &[u8]) -> u32 {
-    let p = if !params.is_empty() && params[0] == OP_CANCEL_ALL {
+    let p = if (params.len() == 1 || params.len() == 9) && params[0] == OP_CANCEL_ALL {
         &params[1..]
     } else {
         params
@@ -614,25 +770,33 @@ pub fn handle_cancel_all(params: &[u8]) -> u32 {
 
     let caller = blockchain::get_caller_public_key();
     let markets_to_process = if explicit_quote != 0 {
-        vec![explicit_quote]
+        match canonicalize_mosaic_id(explicit_quote) {
+            Some(q) if q == USDT_MOSAIC_ID || q == BNB_MOSAIC_ID => vec![q],
+            _ => return 105,
+        }
     } else {
         vec![USDT_MOSAIC_ID, BNB_MOSAIC_ID]
     };
 
-    let mut ledger = load_balances();
+    let mut ledger = match load_balances() {
+        Ok(l) => l,
+        Err(_) => return 105,
+    };
     let mut aggregate_tx = AggregateTransaction::default();
     aggregate_tx.set_max_fee(100_000);
-    let mut _total_cancelled = 0usize;
+    let mut total_cancelled = 0usize;
 
     for q in markets_to_process {
         let mut market = match load_or_init_market(q) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(_) => return 105,
         };
         let res = market.cancel_all(caller);
         if !res.cancelled_order_ids.is_empty() {
-            _total_cancelled += res.cancelled_order_ids.len();
-            let _ = save_market_state(&market);
+            total_cancelled += res.cancelled_order_ids.len();
+            if save_market_state(&market).is_err() {
+                return 105;
+            }
 
             if res.total_refund_base > 0 {
                 let _ = ledger.unlock(&caller, market.base_mosaic_id, res.total_refund_base);
@@ -660,7 +824,9 @@ pub fn handle_cancel_all(params: &[u8]) -> u32 {
         }
     }
 
-    let _ = save_balances(&ledger);
+    if total_cancelled > 0 && save_balances(&ledger).is_err() {
+        return 105;
+    }
 
     if !aggregate_tx.get_embedded_transactions().is_empty() {
         blockchain::set_transaction(&aggregate_tx);
@@ -671,70 +837,22 @@ pub fn handle_cancel_all(params: &[u8]) -> u32 {
 
 /// Core Batch Cancel Handler
 pub fn handle_batch_cancel(params: &[u8]) -> u32 {
-    let p = if !params.is_empty() && params[0] == OP_BATCH_CANCEL {
-        &params[1..]
-    } else {
-        params
+    let (explicit_quote, order_ids) = match parse_batch_cancel_params(params) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
     };
 
-    if p.len() < 8 {
-        return 101; // Invalid param length
-    }
-
     let caller = blockchain::get_caller_public_key();
-
-    // Parse payload: supports [quote_mosaic_id: u64, order_count: u64, order_ids...]
-    // or [quote_mosaic_id: u64, order_ids...] or [order_ids...]
-    let mut explicit_quote = 0u64;
-    let mut order_ids = Vec::new();
-
-    if p.len() >= 16 {
-        let first_u64 = u64::from_le_bytes(p[0..8].try_into().unwrap_or([0; 8]));
-        let second_u64 = u64::from_le_bytes(p[8..16].try_into().unwrap_or([0; 8]));
-
-        if p.len() == 16 + (second_u64 as usize) * 8 {
-            // Format: [quote_mosaic_id: 8 bytes, count: 8 bytes, order_ids...]
-            explicit_quote = first_u64;
-            let count = second_u64 as usize;
-            for i in 0..count {
-                let start = 16 + i * 8;
-                let oid = u64::from_le_bytes(p[start..start + 8].try_into().unwrap_or([0; 8]));
-                order_ids.push(oid);
-            }
-        } else if (p.len() - 8) % 8 == 0 && (first_u64 == USDT_MOSAIC_ID || first_u64 == BNB_MOSAIC_ID || first_u64 == 0) {
-            // Format: [quote_mosaic_id: 8 bytes, order_ids...]
-            explicit_quote = first_u64;
-            let mut offset = 8;
-            while offset + 8 <= p.len() {
-                let oid = u64::from_le_bytes(p[offset..offset + 8].try_into().unwrap_or([0; 8]));
-                order_ids.push(oid);
-                offset += 8;
-            }
-        } else if p.len() % 8 == 0 {
-            // Format: [order_ids...]
-            let mut offset = 0;
-            while offset + 8 <= p.len() {
-                let oid = u64::from_le_bytes(p[offset..offset + 8].try_into().unwrap_or([0; 8]));
-                order_ids.push(oid);
-                offset += 8;
-            }
-        }
-    } else if p.len() == 8 {
-        let oid = u64::from_le_bytes(p[0..8].try_into().unwrap_or([0; 8]));
-        order_ids.push(oid);
-    }
-
-    if order_ids.is_empty() {
-        return 101; // No orders provided
-    }
-
     let markets_to_process = if explicit_quote != 0 {
         vec![explicit_quote]
     } else {
         vec![USDT_MOSAIC_ID, BNB_MOSAIC_ID]
     };
 
-    let mut ledger = load_balances();
+    let mut ledger = match load_balances() {
+        Ok(l) => l,
+        Err(_) => return 105,
+    };
     let mut aggregate_tx = AggregateTransaction::default();
     aggregate_tx.set_max_fee(100_000);
     let mut total_cancelled = 0usize;
@@ -742,12 +860,14 @@ pub fn handle_batch_cancel(params: &[u8]) -> u32 {
     for q in markets_to_process {
         let mut market = match load_or_init_market(q) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(_) => return 105,
         };
         let res = market.cancel_batch(&order_ids, caller);
         if !res.cancelled_order_ids.is_empty() {
             total_cancelled += res.cancelled_order_ids.len();
-            let _ = save_market_state(&market);
+            if save_market_state(&market).is_err() {
+                return 105;
+            }
 
             if res.total_refund_base > 0 {
                 let _ = ledger.unlock(&caller, market.base_mosaic_id, res.total_refund_base);
@@ -779,7 +899,9 @@ pub fn handle_batch_cancel(params: &[u8]) -> u32 {
         return 202; // Order not found or unauthorized
     }
 
-    let _ = save_balances(&ledger);
+    if save_balances(&ledger).is_err() {
+        return 105;
+    }
 
     if !aggregate_tx.get_embedded_transactions().is_empty() {
         blockchain::set_transaction(&aggregate_tx);
@@ -794,22 +916,29 @@ pub fn handle_emergency_unlock() -> u32 {
     let caller = blockchain::get_caller_public_key();
     let markets_to_process = [USDT_MOSAIC_ID, BNB_MOSAIC_ID];
 
-    let mut ledger = load_balances();
+    let mut ledger = match load_balances() {
+        Ok(l) => l,
+        Err(_) => return 105,
+    };
     let mut aggregate_tx = AggregateTransaction::default();
     aggregate_tx.set_max_fee(200_000);
 
     // 1. Cancel all resting orders across all markets and unlock escrow
     for q in markets_to_process {
-        if let Ok(mut market) = load_or_init_market(q) {
-            let res = market.cancel_all(caller);
-            if !res.cancelled_order_ids.is_empty() {
-                let _ = save_market_state(&market);
-                if res.total_refund_base > 0 {
-                    let _ = ledger.unlock(&caller, market.base_mosaic_id, res.total_refund_base);
-                }
-                if res.total_refund_quote > 0 {
-                    let _ = ledger.unlock(&caller, market.quote_mosaic_id, res.total_refund_quote);
-                }
+        let mut market = match load_or_init_market(q) {
+            Ok(m) => m,
+            Err(_) => return 105,
+        };
+        let res = market.cancel_all(caller);
+        if !res.cancelled_order_ids.is_empty() {
+            if save_market_state(&market).is_err() {
+                return 105;
+            }
+            if res.total_refund_base > 0 {
+                let _ = ledger.unlock(&caller, market.base_mosaic_id, res.total_refund_base);
+            }
+            if res.total_refund_quote > 0 {
+                let _ = ledger.unlock(&caller, market.quote_mosaic_id, res.total_refund_quote);
             }
         }
     }
@@ -832,7 +961,9 @@ pub fn handle_emergency_unlock() -> u32 {
         }
     }
 
-    let _ = save_balances(&ledger);
+    if save_balances(&ledger).is_err() {
+        return 105;
+    }
 
     if !aggregate_tx.get_embedded_transactions().is_empty() {
         blockchain::set_transaction(&aggregate_tx);
@@ -913,5 +1044,74 @@ pub unsafe extern "C" fn run() -> u32 {
         OP_BATCH_CANCEL => handle_batch_cancel(payload),
         OP_EMERGENCY_UNLOCK => handle_emergency_unlock(),
         _ => 101, // Unknown op code
+    }
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+    use crate::storage::BalanceLedger;
+
+    #[test]
+    fn test_batch_cancel_order_id_7_not_double_stripped() {
+        assert_eq!(parse_batch_cancel_params(&[]), Err(101));
+        assert_eq!(parse_batch_cancel_params(&[OP_BATCH_CANCEL]), Err(101));
+
+        // When run() already stripped OP_BATCH_CANCEL, payload for cancelling Order #7 is 8 bytes starting with 0x07
+        let order_7_payload = 7u64.to_le_bytes();
+        let (q, ids) = parse_batch_cancel_params(&order_7_payload).expect("Order #7 must NOT be double-stripped");
+        assert_eq!(q, 0);
+        assert_eq!(ids, vec![7]);
+
+        // Direct call WITH leading OP_BATCH_CANCEL (9 bytes = 8*1 + 1) must strip opcode cleanly
+        let mut framed = vec![OP_BATCH_CANCEL];
+        framed.extend_from_slice(&7u64.to_le_bytes());
+        let (q2, ids2) = parse_batch_cancel_params(&framed).expect("Framed Order #7 must parse cleanly");
+        assert_eq!(q2, 0);
+        assert_eq!(ids2, vec![7]);
+    }
+
+    #[test]
+    fn test_batch_cancel_overflow_and_dos_rejected_without_panic() {
+        // Malicious count = u64::MAX must NOT overflow 32-bit usize or panic
+        let mut evil = Vec::new();
+        evil.extend_from_slice(&USDT_MOSAIC_ID.to_le_bytes());
+        evil.extend_from_slice(&u64::MAX.to_le_bytes());
+        // Does not match counted frame; falls through to [quote_mosaic_id, order_ids...] with 1 id (u64::MAX)
+        let parsed = parse_batch_cancel_params(&evil);
+        assert!(parsed.is_ok());
+
+        // Malicious huge counted frame > MAX_BATCH_CANCEL_ORDERS must be rejected with 101
+        let huge_count = (MAX_BATCH_CANCEL_ORDERS + 5) as u64;
+        let mut huge = Vec::with_capacity(16 + (huge_count as usize) * 8);
+        huge.extend_from_slice(&USDT_MOSAIC_ID.to_le_bytes());
+        huge.extend_from_slice(&huge_count.to_le_bytes());
+        for i in 0..huge_count {
+            huge.extend_from_slice(&(i + 1).to_le_bytes());
+        }
+        assert_eq!(parse_batch_cancel_params(&huge), Err(101));
+
+        // Unsupported explicit quote mosaic must be rejected with 105
+        let mut bad_quote = Vec::new();
+        bad_quote.extend_from_slice(&0xDEADBEEFu64.to_le_bytes());
+        bad_quote.extend_from_slice(&1u64.to_le_bytes());
+        bad_quote.extend_from_slice(&42u64.to_le_bytes());
+        assert_eq!(parse_batch_cancel_params(&bad_quote), Err(105));
+    }
+
+    #[test]
+    fn test_balance_ledger_checked_overflow_protection() {
+        let mut ledger = BalanceLedger::default();
+        let alice = [0xAA; 32];
+        assert!(ledger.deposit(alice, XPX_MOSAIC_ID, u64::MAX - 5).is_ok());
+        // Overflowing deposit must fail closed instead of silently saturating/dropping balance
+        assert!(ledger.deposit(alice, XPX_MOSAIC_ID, 10).is_err());
+        assert_eq!(ledger.get_balance(&alice, XPX_MOSAIC_ID), (u64::MAX - 5, 0));
+
+        // Normal lock/unlock/withdraw work cleanly
+        assert!(ledger.lock(&alice, XPX_MOSAIC_ID, 1000).is_ok());
+        assert_eq!(ledger.get_balance(&alice, XPX_MOSAIC_ID), (u64::MAX - 1005, 1000));
+        assert!(ledger.unlock(&alice, XPX_MOSAIC_ID, 1000).is_ok());
+        assert_eq!(ledger.get_balance(&alice, XPX_MOSAIC_ID), (u64::MAX - 5, 0));
     }
 }

@@ -96,6 +96,10 @@ pub struct OrderResult {
     pub total_quote_filled: u64,
     pub refund_base: u64,
     pub refund_quote: u64,
+    /// Unfillable dust remainders evicted from resting counterparty orders:
+    /// (owner_pubkey, resting_side, refund_amount_in_escrowed_asset)
+    #[serde(default)]
+    pub dust_refunds: Vec<([u8; 32], OrderSide, u64)>,
 }
 
 /// Public Order Book depth snapshot entry (for UI and queries)

@@ -4,6 +4,10 @@ use crate::types::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Anti-DoS bounds protecting WASM memory and per-invocation execution time
+pub const MAX_ORDERS_PER_MARKET: usize = 50_000;
+pub const MAX_MATCHES_PER_ORDER: usize = 500;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MarketPair {
     pub base_mosaic_id: u64,
@@ -132,6 +136,7 @@ impl MarketPair {
                                 total_quote_filled: 0,
                                 refund_base: 0,
                                 refund_quote: Self::calculate_quote_amount(amount, price),
+                                dust_refunds: Vec::new(),
                             });
                         }
                     }
@@ -148,11 +153,17 @@ impl MarketPair {
                                 total_quote_filled: 0,
                                 refund_base: amount,
                                 refund_quote: 0,
+                                dust_refunds: Vec::new(),
                             });
                         }
                     }
                 }
             }
+        }
+
+        // Prevent orderbook memory griefing when resting new orders (crossing IOC fills still allowed)
+        if order_type != OrderType::IOC && self.order_index.len() >= MAX_ORDERS_PER_MARKET {
+            return Err("Order book capacity reached");
         }
 
         let order_id = self.next_order_id;
@@ -164,11 +175,15 @@ impl MarketPair {
         let mut total_quote_filled = 0u64;
         let mut stp_refund_base = 0u64;
         let mut stp_refund_quote = 0u64;
+        let mut dust_refunds: Vec<([u8; 32], OrderSide, u64)> = Vec::new();
+        let mut match_steps = 0usize;
+        let mut rested_amount = 0u64;
 
         match side {
             OrderSide::Buy => {
                 // Match against resting Asks (Lowest Ask first)
-                while remaining > 0 {
+                let mut stop_matching = false;
+                while remaining > 0 && !stop_matching && match_steps < MAX_MATCHES_PER_ORDER {
                     let best_ask_price = match self.best_ask() {
                         Some(p) if p <= price => p,
                         _ => break, // No matching asks left
@@ -176,32 +191,57 @@ impl MarketPair {
 
                     let mut level_empty = false;
                     if let Some(level) = self.asks.get_mut(&best_ask_price) {
-                        while remaining > 0 && !level.orders.is_empty() {
-                            let resting = &mut level.orders[0];
+                        while remaining > 0 && !level.orders.is_empty() && match_steps < MAX_MATCHES_PER_ORDER {
+                            match_steps += 1;
+                            let resting_owner = level.orders[0].owner_pubkey;
+                            let resting_rem = level.orders[0].remaining_amount;
+                            let resting_id = level.orders[0].order_id;
 
                             // Self-Trade Prevention (STP): Decrement and Cancel
-                            if resting.owner_pubkey == trader {
-                                let cancel_qty = std::cmp::min(remaining, resting.remaining_amount);
+                            if resting_owner == trader {
+                                let cancel_qty = std::cmp::min(remaining, resting_rem);
                                 level.total_depth = level.total_depth.saturating_sub(cancel_qty);
-                                resting.remaining_amount = resting.remaining_amount.saturating_sub(cancel_qty);
+                                level.orders[0].remaining_amount = resting_rem.saturating_sub(cancel_qty);
                                 remaining = remaining.saturating_sub(cancel_qty);
                                 // The resting Sell order was backed by Base asset (XPX), which is now cancelled
                                 stp_refund_base = stp_refund_base.saturating_add(cancel_qty);
-                                if resting.remaining_amount == 0 {
+                                if level.orders[0].remaining_amount == 0 {
                                     let removed = level.orders.remove(0);
+                                    self.order_index.remove(&removed.order_id);
+                                } else if Self::calculate_quote_amount(level.orders[0].remaining_amount, best_ask_price) == 0 {
+                                    // Evict unfillable dust remainder on resting self-order
+                                    let removed = level.orders.remove(0);
+                                    level.total_depth = level.total_depth.saturating_sub(removed.remaining_amount);
+                                    stp_refund_base = stp_refund_base.saturating_add(removed.remaining_amount);
                                     self.order_index.remove(&removed.order_id);
                                 }
                                 continue;
                             }
 
-                            let fill_qty = std::cmp::min(remaining, resting.remaining_amount);
+                            let fill_qty = std::cmp::min(remaining, resting_rem);
                             let quote_amt = Self::calculate_quote_amount(fill_qty, best_ask_price);
+
+                            // CRITICAL SECURITY INVARIANT: Never emit a zero-quote fill (prevents free base tokens!)
+                            if quote_amt == 0 {
+                                if Self::calculate_quote_amount(resting_rem, best_ask_price) == 0 {
+                                    // Resting ask itself is unfillable dust -> evict & refund its base escrow
+                                    let removed = level.orders.remove(0);
+                                    level.total_depth = level.total_depth.saturating_sub(removed.remaining_amount);
+                                    self.order_index.remove(&removed.order_id);
+                                    dust_refunds.push((removed.owner_pubkey, OrderSide::Sell, removed.remaining_amount));
+                                    continue;
+                                }
+                                // Incoming remaining is too small to pay >=1 atomic quote at best_ask_price
+                                stop_matching = true;
+                                break;
+                            }
+
                             let maker_fee = Self::calculate_fee(quote_amt, self.maker_fee_bps);
                             let taker_fee = Self::calculate_fee(fill_qty, self.taker_fee_bps);
 
                             fills.push(TradeFill {
-                                maker_order_id: resting.order_id,
-                                maker_pubkey: resting.owner_pubkey,
+                                maker_order_id: resting_id,
+                                maker_pubkey: resting_owner,
                                 taker_pubkey: trader,
                                 taker_side: OrderSide::Buy,
                                 price: best_ask_price,
@@ -215,11 +255,17 @@ impl MarketPair {
                             total_quote_filled = total_quote_filled.saturating_add(quote_amt);
                             remaining = remaining.saturating_sub(fill_qty);
                             level.total_depth = level.total_depth.saturating_sub(fill_qty);
-                            resting.remaining_amount = resting.remaining_amount.saturating_sub(fill_qty);
+                            level.orders[0].remaining_amount = resting_rem.saturating_sub(fill_qty);
 
-                            if resting.remaining_amount == 0 {
+                            if level.orders[0].remaining_amount == 0 {
                                 let removed = level.orders.remove(0);
                                 self.order_index.remove(&removed.order_id);
+                            } else if Self::calculate_quote_amount(level.orders[0].remaining_amount, best_ask_price) == 0 {
+                                // Evict unfillable dust remainder so top-of-book is never bricked
+                                let removed = level.orders.remove(0);
+                                level.total_depth = level.total_depth.saturating_sub(removed.remaining_amount);
+                                self.order_index.remove(&removed.order_id);
+                                dust_refunds.push((removed.owner_pubkey, OrderSide::Sell, removed.remaining_amount));
                             }
                         }
                         if level.orders.is_empty() {
@@ -232,8 +278,9 @@ impl MarketPair {
                     }
                 }
 
-                // Handle remaining unfilled quantity
-                if remaining > 0 && order_type != OrderType::IOC {
+                // Handle remaining unfilled quantity (never rest unfillable zero-quote dust on book)
+                if remaining > 0 && order_type != OrderType::IOC && Self::calculate_quote_amount(remaining, price) > 0 {
+                    rested_amount = remaining;
                     let resting_order = LimitOrder {
                         order_id,
                         owner_pubkey: trader,
@@ -253,7 +300,8 @@ impl MarketPair {
 
             OrderSide::Sell => {
                 // Match against resting Bids (Highest Bid first)
-                while remaining > 0 {
+                let mut stop_matching = false;
+                while remaining > 0 && !stop_matching && match_steps < MAX_MATCHES_PER_ORDER {
                     let best_bid_price = match self.best_bid() {
                         Some(p) if p >= price => p,
                         _ => break, // No matching bids left
@@ -261,32 +309,54 @@ impl MarketPair {
 
                     let mut level_empty = false;
                     if let Some(level) = self.bids.get_mut(&best_bid_price) {
-                        while remaining > 0 && !level.orders.is_empty() {
-                            let resting = &mut level.orders[0];
+                        while remaining > 0 && !level.orders.is_empty() && match_steps < MAX_MATCHES_PER_ORDER {
+                            match_steps += 1;
+                            let resting_owner = level.orders[0].owner_pubkey;
+                            let resting_rem = level.orders[0].remaining_amount;
+                            let resting_id = level.orders[0].order_id;
 
                             // Self-Trade Prevention (STP): Decrement and Cancel
-                            if resting.owner_pubkey == trader {
-                                let cancel_qty = std::cmp::min(remaining, resting.remaining_amount);
+                            if resting_owner == trader {
+                                let cancel_qty = std::cmp::min(remaining, resting_rem);
                                 level.total_depth = level.total_depth.saturating_sub(cancel_qty);
-                                resting.remaining_amount = resting.remaining_amount.saturating_sub(cancel_qty);
+                                level.orders[0].remaining_amount = resting_rem.saturating_sub(cancel_qty);
                                 remaining = remaining.saturating_sub(cancel_qty);
-                                // The resting Buy order was backed by Quote asset (USDT), which is now cancelled
+                                // The resting Buy order was backed by Quote asset (USDT/BNB), which is now cancelled
                                 stp_refund_quote = stp_refund_quote.saturating_add(Self::calculate_quote_amount(cancel_qty, best_bid_price));
-                                if resting.remaining_amount == 0 {
+                                if level.orders[0].remaining_amount == 0 {
                                     let removed = level.orders.remove(0);
+                                    self.order_index.remove(&removed.order_id);
+                                } else if Self::calculate_quote_amount(level.orders[0].remaining_amount, best_bid_price) == 0 {
+                                    let removed = level.orders.remove(0);
+                                    level.total_depth = level.total_depth.saturating_sub(removed.remaining_amount);
                                     self.order_index.remove(&removed.order_id);
                                 }
                                 continue;
                             }
 
-                            let fill_qty = std::cmp::min(remaining, resting.remaining_amount);
+                            let fill_qty = std::cmp::min(remaining, resting_rem);
                             let quote_amt = Self::calculate_quote_amount(fill_qty, best_bid_price);
+
+                            // CRITICAL SECURITY INVARIANT: Never emit a zero-quote fill (prevents free base tokens!)
+                            if quote_amt == 0 {
+                                if Self::calculate_quote_amount(resting_rem, best_bid_price) == 0 {
+                                    // Resting bid itself is unfillable dust -> evict cleanly
+                                    let removed = level.orders.remove(0);
+                                    level.total_depth = level.total_depth.saturating_sub(removed.remaining_amount);
+                                    self.order_index.remove(&removed.order_id);
+                                    continue;
+                                }
+                                // Incoming remaining is too small to receive >=1 atomic quote at best_bid_price
+                                stop_matching = true;
+                                break;
+                            }
+
                             let maker_fee = Self::calculate_fee(fill_qty, self.maker_fee_bps);
                             let taker_fee = Self::calculate_fee(quote_amt, self.taker_fee_bps);
 
                             fills.push(TradeFill {
-                                maker_order_id: resting.order_id,
-                                maker_pubkey: resting.owner_pubkey,
+                                maker_order_id: resting_id,
+                                maker_pubkey: resting_owner,
                                 taker_pubkey: trader,
                                 taker_side: OrderSide::Sell,
                                 price: best_bid_price,
@@ -300,10 +370,15 @@ impl MarketPair {
                             total_quote_filled = total_quote_filled.saturating_add(quote_amt);
                             remaining = remaining.saturating_sub(fill_qty);
                             level.total_depth = level.total_depth.saturating_sub(fill_qty);
-                            resting.remaining_amount = resting.remaining_amount.saturating_sub(fill_qty);
+                            level.orders[0].remaining_amount = resting_rem.saturating_sub(fill_qty);
 
-                            if resting.remaining_amount == 0 {
+                            if level.orders[0].remaining_amount == 0 {
                                 let removed = level.orders.remove(0);
+                                self.order_index.remove(&removed.order_id);
+                            } else if Self::calculate_quote_amount(level.orders[0].remaining_amount, best_bid_price) == 0 {
+                                // Evict unfillable dust remainder on resting bid
+                                let removed = level.orders.remove(0);
+                                level.total_depth = level.total_depth.saturating_sub(removed.remaining_amount);
                                 self.order_index.remove(&removed.order_id);
                             }
                         }
@@ -317,8 +392,9 @@ impl MarketPair {
                     }
                 }
 
-                // Handle remaining unfilled quantity
-                if remaining > 0 && order_type != OrderType::IOC {
+                // Handle remaining unfilled quantity (never rest unfillable zero-quote dust on book)
+                if remaining > 0 && order_type != OrderType::IOC && Self::calculate_quote_amount(remaining, price) > 0 {
+                    rested_amount = remaining;
                     let resting_order = LimitOrder {
                         order_id,
                         owner_pubkey: trader,
@@ -341,19 +417,19 @@ impl MarketPair {
             OrderStatus::Filled
         } else if total_base_filled > 0 {
             OrderStatus::PartiallyFilled
-        } else if order_type == OrderType::IOC {
+        } else if order_type == OrderType::IOC || rested_amount == 0 {
             OrderStatus::Cancelled
         } else {
             OrderStatus::Open
         };
 
         // Exact Escrow Accounting:
-        // Returns any unspent escrow (from IOC cancellations, price improvement, or STP)
+        // Returns any unspent escrow (from IOC cancellations, unfillable dust remainders, price improvement, or STP)
         let (refund_base, refund_quote) = match side {
             OrderSide::Buy => {
                 let initial_deposit_quote = Self::calculate_quote_amount(amount, price);
-                let resting_quote = if order_type != OrderType::IOC && remaining > 0 {
-                    Self::calculate_quote_amount(remaining, price)
+                let resting_quote = if rested_amount > 0 {
+                    Self::calculate_quote_amount(rested_amount, price)
                 } else {
                     0
                 };
@@ -366,11 +442,7 @@ impl MarketPair {
             }
             OrderSide::Sell => {
                 let initial_deposit_base = amount;
-                let resting_base = if order_type != OrderType::IOC && remaining > 0 {
-                    remaining
-                } else {
-                    0
-                };
+                let resting_base = rested_amount;
                 let needed_base = total_base_filled.saturating_add(resting_base);
                 let unspent_base_refund = match initial_deposit_base.checked_sub(needed_base) {
                     Some(val) => val,
@@ -389,6 +461,7 @@ impl MarketPair {
             total_quote_filled,
             refund_base,
             refund_quote,
+            dust_refunds,
         })
     }
 
@@ -493,7 +566,7 @@ impl MarketPair {
             while i < level.orders.len() {
                 if level.orders[i].owner_pubkey == caller_pubkey {
                     let order = level.orders.remove(i);
-                    level.total_depth -= order.remaining_amount;
+                    level.total_depth = level.total_depth.saturating_sub(order.remaining_amount);
                     let refund = Self::calculate_quote_amount(order.remaining_amount, price);
                     result.total_refund_quote = result.total_refund_quote.saturating_add(refund);
                     result.cancelled_order_ids.push(order.order_id);
@@ -517,7 +590,7 @@ impl MarketPair {
             while i < level.orders.len() {
                 if level.orders[i].owner_pubkey == caller_pubkey {
                     let order = level.orders.remove(i);
-                    level.total_depth -= order.remaining_amount;
+                    level.total_depth = level.total_depth.saturating_sub(order.remaining_amount);
                     result.total_refund_base = result.total_refund_base.saturating_add(order.remaining_amount);
                     result.cancelled_order_ids.push(order.order_id);
                     self.order_index.remove(&order.order_id);
@@ -1118,5 +1191,47 @@ mod tests {
         assert_eq!(market.order_index.get(&r4.order_id), Some(&(OrderSide::Sell, 530_000)));
         assert_eq!(market.asks.get(&530_000).unwrap().total_depth, 40_000);
         assert_eq!(market.asks.get(&530_000).unwrap().orders[0].remaining_amount, 40_000);
+    }
+
+    #[test]
+    fn test_zero_quote_fill_prevented_and_dust_evicted() {
+        // Ultra-low-tick market like XPX/BNB (tick_size=1, min_order_size=100_000)
+        let mut market = MarketPair::new(
+            0x0DC67FBE1CAD29E3,
+            0x1E5C5FADEC7B34DD,
+            1,
+            100_000,
+            0,
+            10,
+        );
+
+        // Alice rests Sell 10,000,000 XPX (10 XPX) @ 14 ticks (quote = 1 atomic BNB)
+        let r_ask = market.place_order(ALICE, OrderSide::Sell, OrderType::Limit, 14, 10_000_000, 100).unwrap();
+        assert_eq!(r_ask.status, OrderStatus::Open);
+
+        // Bob buys 8,000,000 XPX @ 20 ticks (quote at 20 = 1; crosses Alice @ 14 -> quote_amt = 1 atomic BNB!)
+        // Remaining on Alice's order is 2,000,000 XPX, whose quote value @ 14 ticks is (2M * 14)/1e8 = 0 (unfillable dust!)
+        let r_buy = market.place_order(BOB, OrderSide::Buy, OrderType::Limit, 20, 8_000_000, 101).unwrap();
+        assert_eq!(r_buy.fills.len(), 1);
+        assert_eq!(r_buy.fills[0].base_amount, 8_000_000);
+        assert_eq!(r_buy.fills[0].quote_amount, 1);
+
+        // Alice's unfillable 2,000,000 XPX dust remainder MUST have been evicted cleanly & recorded in dust_refunds!
+        assert_eq!(market.best_ask(), None, "Unfillable zero-quote dust remainder must NOT stay on top of book");
+        assert_eq!(market.order_index.len(), 0);
+        assert_eq!(r_buy.dust_refunds.len(), 1);
+        assert_eq!(r_buy.dust_refunds[0], (ALICE, OrderSide::Sell, 2_000_000));
+    }
+
+    #[test]
+    fn test_cancel_all_saturating_depth_never_panics() {
+        let mut market = sample_market();
+        let _ = market.place_order(ALICE, OrderSide::Sell, OrderType::Limit, 500_000, 10_000, 100).unwrap();
+        // Artificially understate total_depth to prove saturating_sub prevents panic=abort trap
+        market.asks.get_mut(&500_000).unwrap().total_depth = 5_000;
+        let res = market.cancel_all(ALICE);
+        assert_eq!(res.cancelled_order_ids.len(), 1);
+        assert_eq!(res.total_refund_base, 10_000);
+        assert_eq!(market.best_ask(), None);
     }
 }
