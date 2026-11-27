@@ -230,30 +230,44 @@ function computeLadderQuotes({
   const asks = [];
   let remainingQuoteBudget = usableQuote;
   let remainingBaseBudget = usableBase;
+  let prevBidTick = null;
+  let prevAskTick = null;
 
   for (let i = 0; i < safeLevels; i++) {
     const offsetBps = safeSpreadBps + BigInt(i) * safeStepBps;
     if (offsetBps >= 9000n) break;
 
-    // Bid: round DOWN to tickUnit
+    // Bid: round DOWN to tickUnit and step strictly below previous bid level
     let rawBid = (midTicks * (10000n - offsetBps)) / 10000n;
     let bidTick = (rawBid / tickUnit) * tickUnit;
-    if (bidTick < tickUnit) bidTick = tickUnit;
+    if (prevBidTick !== null && bidTick >= prevBidTick) {
+      bidTick = prevBidTick > tickUnit ? prevBidTick - tickUnit : 0n;
+    }
 
-    // Ask: round UP to tickUnit
+    // Ask: round UP to tickUnit and step strictly above previous ask level
     let rawAsk = (midTicks * (10000n + offsetBps) + 9999n) / 10000n;
     let askTick = ((rawAsk + tickUnit - 1n) / tickUnit) * tickUnit;
+    if (prevAskTick !== null && askTick <= prevAskTick) {
+      askTick = prevAskTick + tickUnit;
+    }
 
     // Ensure strict non-crossing even on ultra-low-tick markets
-    if (askTick <= bidTick) {
+    if (bidTick > 0n && askTick <= bidTick) {
       askTick = bidTick + tickUnit;
     }
 
-    // Bid side allocation
+    // Bid side allocation (auto-bump to min non-dust base size if 1-unit quote notional would round to 0)
     if (bidTick > 0n && bidTick >= minAllowedTick && bidTick < midTicks) {
-      const quoteCost = (targetAmtAtomic * bidTick + PRICE_SCALE - 1n) / PRICE_SCALE;
-      if (quoteCost > 0n && remainingQuoteBudget >= quoteCost) {
+      const minNonDustBase = ((PRICE_SCALE + bidTick - 1n) / bidTick);
+      // Round up to whole XPX (1_000_000 atomic) if bump needed so sizes stay clean
+      const bumpedBase = minNonDustBase > targetAmtAtomic
+        ? ((minNonDustBase + AMOUNT_SCALE - 1n) / AMOUNT_SCALE) * AMOUNT_SCALE
+        : targetAmtAtomic;
+      const quoteFloor = (bumpedBase * bidTick) / PRICE_SCALE;
+      const quoteCost = (bumpedBase * bidTick + PRICE_SCALE - 1n) / PRICE_SCALE;
+      if (quoteFloor >= 1n && quoteCost > 0n && remainingQuoteBudget >= quoteCost) {
         remainingQuoteBudget -= quoteCost;
+        prevBidTick = bidTick;
         bids.push({
           pair: normPair,
           side: 'buy',
@@ -261,17 +275,23 @@ function computeLadderQuotes({
           level: i + 1,
           priceTicks: bidTick,
           price: formatTicks(bidTick, pDec),
-          amountAtomic: targetAmtAtomic,
-          amount: formatAtomic(targetAmtAtomic, 6),
+          amountAtomic: bumpedBase,
+          amount: formatAtomic(bumpedBase, 6),
           quoteCostAtomic: quoteCost,
         });
       }
     }
 
-    // Ask side allocation
+    // Ask side allocation (auto-bump to min non-dust base size so quote notional >= 1 atomic unit)
     if (askTick > midTicks && askTick <= maxAllowedTick) {
-      if (remainingBaseBudget >= targetAmtAtomic) {
-        remainingBaseBudget -= targetAmtAtomic;
+      const minNonDustBase = ((PRICE_SCALE + askTick - 1n) / askTick);
+      const bumpedBase = minNonDustBase > targetAmtAtomic
+        ? ((minNonDustBase + AMOUNT_SCALE - 1n) / AMOUNT_SCALE) * AMOUNT_SCALE
+        : targetAmtAtomic;
+      const quoteFloor = (bumpedBase * askTick) / PRICE_SCALE;
+      if (quoteFloor >= 1n && remainingBaseBudget >= bumpedBase) {
+        remainingBaseBudget -= bumpedBase;
+        prevAskTick = askTick;
         asks.push({
           pair: normPair,
           side: 'sell',
@@ -279,8 +299,8 @@ function computeLadderQuotes({
           level: i + 1,
           priceTicks: askTick,
           price: formatTicks(askTick, pDec),
-          amountAtomic: targetAmtAtomic,
-          amount: formatAtomic(targetAmtAtomic, 6),
+          amountAtomic: bumpedBase,
+          amount: formatAtomic(bumpedBase, 6),
         });
       }
     }
@@ -659,10 +679,11 @@ class MainnetMarketMaker {
     }
 
     const statusRes = await this.fetchTradingAccountStatus();
-    if (!statusRes.hasTradingAccount || !statusRes.tradingAccount || statusRes.tradingAccount.status !== 'active') {
+    const taState = statusRes?.status || statusRes?.tradingAccount?.status || 'none';
+    if (!statusRes.hasTradingAccount || !statusRes.tradingAccount || taState !== 'active') {
       throw new Error(
         `Smart Trading Account is not active for owner ${this.account.publicKey.slice(0, 12)}... ` +
-        `(hasTradingAccount=${Boolean(statusRes?.hasTradingAccount)}, status=${statusRes?.tradingAccount?.status || 'none'}). ` +
+        `(hasTradingAccount=${Boolean(statusRes?.hasTradingAccount)}, status=${taState}). ` +
         `Activate & fund a 2-of-2 Smart Trading Account before running the Mainnet Market Maker.`
       );
     }
@@ -947,9 +968,10 @@ class MainnetMarketMaker {
     // 4. Cancel stale resting quotes cleanly, then fetch authoritative Smart Trading balances
     await this.cancelAllMarkets();
     const taStatus = await this.fetchTradingAccountStatus();
-    if (!taStatus.hasTradingAccount || taStatus.tradingAccount?.status !== 'active') {
-      console.warn('[MainnetMM] ⚠️ Smart Trading Account no longer active. Halting quotes.');
-      return { ok: false, halted: true, reason: 'Trading account inactive' };
+    const taState = taStatus?.status || taStatus?.tradingAccount?.status || 'none';
+    if (!taStatus.hasTradingAccount || taState !== 'active') {
+      console.warn(`[MainnetMM] ⚠️ Smart Trading Account no longer active (status=${taState}). Halting quotes.`);
+      return { ok: false, halted: true, reason: `Trading account inactive (${taState})` };
     }
 
     const tradeable = taStatus.balances?.tradeable || {};
@@ -1032,6 +1054,10 @@ class MainnetMarketMaker {
     this.stopped = true;
     if (this.hbTimer) clearInterval(this.hbTimer);
     if (this.settleTimer) clearInterval(this.settleTimer);
+    if (!this.account || !this.config) {
+      console.log(`[MainnetMM] Shutdown (${reason}): bot was not initialized; nothing to cancel.`);
+      return;
+    }
     console.log(`[MainnetMM] Graceful shutdown (${reason}): cancelling all quotes before COD deregister...`);
     try {
       await this.cancelAllMarkets();
