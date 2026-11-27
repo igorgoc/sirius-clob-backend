@@ -1892,8 +1892,9 @@ const server = http.createServer((req, res) => {
     }
     try {
       const settlements = tradingCosigner.getPendingSettlementsWithAutoRebuild(ownerPub);
+      const recentSettlements = tradingCosigner.getRecentSettlementSummariesForCosigner(ownerPub, 25);
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, settlements }));
+      res.end(JSON.stringify({ ok: true, settlements, recentSettlements }));
     } catch (err) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: err.message }));

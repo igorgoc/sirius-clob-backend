@@ -1618,6 +1618,138 @@ function rebuildExpiredSettlement(settlement, { force = false, bufferMs = SETTLE
   return { rebuilt: true, settlement: updated };
 }
 
+function buildSettlementSignatureSummary(settlement, viewerPublicKey) {
+  const viewerLower = String(viewerPublicKey || '').trim().toLowerCase();
+  const viewerUpper = viewerLower.toUpperCase();
+  const reqSet = Array.from(
+    new Set(
+      (Array.isArray(settlement.requiredCosigners) ? settlement.requiredCosigners : [])
+        .map((pk) => String(pk || '').trim().toUpperCase())
+        .filter(Boolean)
+    )
+  );
+  const signedSet = new Set(
+    (Array.isArray(settlement.collectedCosigs) ? settlement.collectedCosigs : [])
+      .map((c) => String(c && c.signer ? c.signer : '').trim().toUpperCase())
+      .filter(Boolean)
+  );
+
+  const requiredCount = reqSet.length;
+  const signedRequiredCount = reqSet.filter((pk) => signedSet.has(pk)).length;
+  const isRequired = Boolean(viewerUpper && reqSet.includes(viewerUpper));
+  const isAlreadyBroadcastOrDone =
+    settlement.status === 'ready' ||
+    settlement.status === 'broadcast' ||
+    settlement.status === 'confirmed';
+
+  const signedCount = isAlreadyBroadcastOrDone ? Math.max(requiredCount, signedRequiredCount) : signedRequiredCount;
+  const signedByMe = isAlreadyBroadcastOrDone ? true : Boolean(viewerUpper && signedSet.has(viewerUpper));
+  const needsMySignature = settlement.status === 'pending_cosign' && isRequired && !signedByMe;
+  const allPartiesSigned = isAlreadyBroadcastOrDone || (requiredCount > 0 && signedCount >= requiredCount);
+  const waitingForCounterparty =
+    settlement.status === 'pending_cosign' &&
+    signedByMe &&
+    !allPartiesSigned;
+
+  // Resolve the viewer's OWN order metadata (Maker or Taker) from participantContexts
+  const pMap = settlement.orderContext && settlement.orderContext.participantContexts;
+  const myCtx =
+    pMap && typeof pMap === 'object'
+      ? (pMap[viewerLower] || pMap[viewerUpper] || null)
+      : null;
+  const baseCtx = settlement.orderContext || {};
+
+  // Compute exact filled XPX / quote amounts from transfers for this participant (or overall trade)
+  const viewerAcc = viewerLower ? clobDb.getTradingAccountByOwner(viewerLower) : null;
+  const viewerTradingPubUpper = viewerAcc && viewerAcc.trading_public_key
+    ? String(viewerAcc.trading_public_key).toUpperCase()
+    : '';
+  const viewerTradingAddrUpper = viewerAcc && viewerAcc.trading_address
+    ? String(viewerAcc.trading_address).replace(/[- ]/g, '').toUpperCase()
+    : '';
+
+  let myOutXpx = 0n;
+  let myInXpx = 0n;
+  let myOutQuote = 0n;
+  let myInQuote = 0n;
+  let inferredQuoteSymbol = '';
+
+  const transfers = Array.isArray(settlement.transfers) ? settlement.transfers : [];
+  for (const tr of transfers) {
+    const amt = BigInt(tr && tr.amountAtomic ? tr.amountAtomic : '0');
+    if (amt <= 0n) continue;
+    const sym = String(tr.symbol || '').toUpperCase();
+    if (sym && sym !== 'XPX' && !inferredQuoteSymbol) inferredQuoteSymbol = sym;
+    const isOut =
+      viewerTradingPubUpper &&
+      tr.fromType === 'TRADING' &&
+      String(tr.fromTradingPub || '').toUpperCase() === viewerTradingPubUpper;
+    const isIn =
+      viewerTradingAddrUpper &&
+      String(tr.toAddress || '').replace(/[- ]/g, '').toUpperCase() === viewerTradingAddrUpper;
+    if (sym === 'XPX') {
+      if (isOut) myOutXpx += amt;
+      if (isIn) myInXpx += amt;
+    } else if (sym === 'USDT' || sym === 'BNB') {
+      if (isOut) myOutQuote += amt;
+      if (isIn) myInQuote += amt;
+    }
+  }
+
+  const pair = String((myCtx && myCtx.pair) || baseCtx.pair || (inferredQuoteSymbol ? `XPX/${inferredQuoteSymbol}` : 'XPX/USDT'));
+  const quoteSymbol = pair.includes('/') ? pair.split('/')[1] : (inferredQuoteSymbol || 'USDT');
+  let mySide = (myCtx && myCtx.side) ? String(myCtx.side).toLowerCase() : '';
+  if (!mySide) {
+    if (myOutXpx > 0n && myInQuote > 0n) mySide = 'sell';
+    else if (myInXpx > 0n && myOutQuote > 0n) mySide = 'buy';
+    else if (String(settlement.ownerPublicKey || '').toLowerCase() === viewerLower && baseCtx.side) {
+      mySide = String(baseCtx.side).toLowerCase();
+    } else if (baseCtx.side) {
+      mySide = String(baseCtx.side).toLowerCase() === 'buy' ? 'sell' : 'buy';
+    } else {
+      mySide = 'buy';
+    }
+  }
+
+  const filledBaseAtomic = mySide === 'sell' ? myOutXpx : myInXpx;
+  const filledQuoteAtomic = mySide === 'sell' ? myInQuote : myOutQuote;
+  const myOrderId = (myCtx && myCtx.orderId !== undefined && myCtx.orderId !== null)
+    ? String(myCtx.orderId)
+    : (String(settlement.ownerPublicKey || '').toLowerCase() === viewerLower
+        ? String(settlement.orderId || baseCtx.orderId || '')
+        : String(settlement.orderId || ''));
+  const myPrice = (myCtx && myCtx.price) ? String(myCtx.price) : (baseCtx.price ? String(baseCtx.price) : '');
+  const myOrderAmount = (myCtx && myCtx.amount) ? String(myCtx.amount) : (baseCtx.amount ? String(baseCtx.amount) : '');
+  const filledXpxFormatted = filledBaseAtomic > 0n
+    ? (Number(filledBaseAtomic) / 1_000_000).toString()
+    : myOrderAmount;
+
+  return {
+    settlementId: settlement.settlementId,
+    orderId: String(settlement.orderId || ''),
+    myOrderId,
+    role: String(settlement.ownerPublicKey || '').toLowerCase() === viewerLower ? 'taker' : 'maker',
+    pair,
+    quoteSymbol,
+    mySide,
+    myPrice,
+    myAmount: filledXpxFormatted,
+    myOrderAmount,
+    filledBaseAtomic: filledBaseAtomic.toString(),
+    filledQuoteAtomic: filledQuoteAtomic.toString(),
+    status: settlement.status,
+    txHash: settlement.txHash || null,
+    requiredCount,
+    signedCount,
+    signedByMe,
+    needsMySignature,
+    waitingForCounterparty,
+    allPartiesSigned,
+    createdAt: settlement.createdAt,
+    updatedAt: settlement.updatedAt,
+  };
+}
+
 /**
  * Fetch all pending settlements where publicKey is owner or required cosigner,
  * automatically rebuilding any expired pending_cosign AggregateComplete payloads with a fresh L1 deadline.
@@ -1641,8 +1773,14 @@ function getPendingSettlementsWithAutoRebuild(publicKey, options = {}) {
       ...current,
       rebuilt,
       deadlineEpochMs: getAggregateDeadlineEpochMs(current.aggregatePayload),
+      signatureSummary: buildSettlementSignatureSummary(current, publicKey),
     };
   });
+}
+
+function getRecentSettlementSummariesForCosigner(publicKey, limit = 25) {
+  const rows = clobDb.getRecentSettlementsForCosigner(publicKey, limit);
+  return rows.map((s) => buildSettlementSignatureSummary(s, publicKey));
 }
 
 /**
@@ -1941,6 +2079,8 @@ module.exports = {
   checkCosignDefaulterCooldown,
   recordCosignDefaulterStrike,
   getPendingSettlementsWithAutoRebuild,
+  getRecentSettlementSummariesForCosigner,
+  buildSettlementSignatureSummary,
   requestBftNodeCosignatures,
   reconcileInFlightL1Txs,
   verifyOuterInitiatorSignature,

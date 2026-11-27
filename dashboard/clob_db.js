@@ -1117,6 +1117,26 @@ function getPendingSettlementsForCosigner(publicKey) {
     ));
 }
 
+function getRecentSettlementsForCosigner(publicKey, limit = 25) {
+  const db = getDb();
+  const pkLower = String(publicKey || '').trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(pkLower)) return [];
+  const safeLimit = Math.max(1, Math.min(100, Number(limit) || 25));
+  const rows = db.prepare(
+    `SELECT * FROM trading_settlements
+     WHERE (owner_public_key = ? OR counterparty_key = ? OR LOWER(required_cosigners_json) LIKE ?)
+     ORDER BY updated_at DESC
+     LIMIT ?`
+  ).all(pkLower, pkLower, `%${pkLower}%`, safeLimit);
+  return rows
+    .map(hydrateSettlementRow)
+    .filter((s) => (
+      s.ownerPublicKey === pkLower ||
+      s.counterpartyKey === pkLower ||
+      (Array.isArray(s.requiredCosigners) && s.requiredCosigners.some((r) => String(r || '').toLowerCase() === pkLower))
+    ));
+}
+
 function getAllInFlightTradingSettlements() {
   const db = getDb();
   const rows = db.prepare("SELECT * FROM trading_settlements WHERE status IN ('ready', 'broadcast')").all();
@@ -1223,6 +1243,7 @@ module.exports = {
   getTradingSettlement,
   getPendingSettlementsForOwner,
   getPendingSettlementsForCosigner,
+  getRecentSettlementsForCosigner,
   getAllInFlightTradingSettlements,
   getAllPendingCosignSettlements,
   expirePendingCosignSettlement,

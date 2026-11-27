@@ -531,6 +531,66 @@ async function main() {
     assert.ok(order.indexOf('bnb-1') < order.indexOf('usdt-3'), `Expected round-robin interleaving so bnb-1 runs before usdt-3, got: ${JSON.stringify(order)}`);
   });
 
+  await test('Settlement UX: signatureSummary distinguishes User1 (needsMySignature) & User2 (1/2 -> 2/2 both signed)', () => {
+    const { Account } = require('tsjs-xpx-chain-sdk');
+    const cosigner = require('../dashboard/trading_account_cosigner');
+    const user1 = Account.generateNewAccount(168); // Maker (Limit Sell)
+    const user2 = Account.generateNewAccount(168); // Taker (Buy)
+    const baseSettlement = {
+      settlementId: 'SET_UX_TEST_1',
+      orderId: '102',
+      ownerPublicKey: user2.publicKey.toLowerCase(),
+      counterpartyKey: user1.publicKey.toLowerCase(),
+      requiredCosigners: [user2.publicKey.toUpperCase(), user1.publicKey.toUpperCase()],
+      collectedCosigs: [{ signer: user2.publicKey.toUpperCase(), signature: 'AA'.repeat(64) }],
+      transfers: [],
+      orderContext: {
+        orderId: 102,
+        pair: 'XPX/USDT',
+        side: 'buy',
+        price: '0.000085',
+        amount: '100',
+        participantContexts: {
+          [user2.publicKey.toLowerCase()]: { orderId: 102, pair: 'XPX/USDT', side: 'buy', price: '0.000085', amount: '100', publicKey: user2.publicKey.toLowerCase() },
+          [user1.publicKey.toLowerCase()]: { orderId: 101, pair: 'XPX/USDT', side: 'sell', price: '0.000085', amount: '100', publicKey: user1.publicKey.toLowerCase() },
+        },
+      },
+      status: 'pending_cosign',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+
+    // Stage 1: Only User2 signed
+    const u1Before = cosigner.buildSettlementSignatureSummary(baseSettlement, user1.publicKey);
+    const u2Before = cosigner.buildSettlementSignatureSummary(baseSettlement, user2.publicKey);
+    assert.strictEqual(u1Before.myOrderId, '101', 'User1 must see their OWN Maker order ID #101');
+    assert.strictEqual(u1Before.mySide, 'sell');
+    assert.strictEqual(u1Before.needsMySignature, true, 'User1 must see needsMySignature=true');
+    assert.strictEqual(u1Before.signedCount, 1);
+    assert.strictEqual(u1Before.requiredCount, 2);
+
+    assert.strictEqual(u2Before.myOrderId, '102', 'User2 must see their OWN Taker order ID #102');
+    assert.strictEqual(u2Before.signedByMe, true);
+    assert.strictEqual(u2Before.waitingForCounterparty, true, 'User2 must see waitingForCounterparty=true (1/2)');
+    assert.strictEqual(u2Before.allPartiesSigned, false);
+
+    // Stage 2: User1 signs -> broadcast / confirmed
+    const afterBoth = {
+      ...baseSettlement,
+      collectedCosigs: [
+        { signer: user2.publicKey.toUpperCase(), signature: 'AA'.repeat(64) },
+        { signer: user1.publicKey.toUpperCase(), signature: 'BB'.repeat(64) },
+      ],
+      status: 'broadcast',
+      txHash: 'DEADBEEF'.repeat(8),
+    };
+    const u2After = cosigner.buildSettlementSignatureSummary(afterBoth, user2.publicKey);
+    assert.strictEqual(u2After.allPartiesSigned, true, 'User2 must see allPartiesSigned=true once User1 signs');
+    assert.strictEqual(u2After.waitingForCounterparty, false);
+    assert.strictEqual(u2After.signedCount, 2);
+    assert.strictEqual(u2After.requiredCount, 2);
+  });
+
   try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
 
   console.log(`\n🎉 Red-Team 5-Pass Hardening Suite: ${passed} tests passed.\n`);
