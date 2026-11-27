@@ -171,6 +171,17 @@ class BatchSettlerTestnet2 {
    * Flush and broadcast Aggregate Complete Transaction(s) to Sirius L1
    */
   async flushBatch() {
+    const isMainnet =
+      config.NETWORK_TYPE === 184 ||
+      String(config.NETWORK_ENV || '').toLowerCase() === 'mainnet' ||
+      String(process.env.SIRIUS_NETWORK || '').trim().toLowerCase() === 'mainnet';
+    if (isMainnet && process.env.ALLOW_MAINNET_LEGACY_VAULT !== 'true') {
+      throw new Error(
+        'Mainnet security guard: Legacy custodial Vault batch settlement is disabled on Sirius Mainnet. ' +
+        'All Mainnet settlements execute via non-custodial 2-of-2 Smart Trading Accounts.'
+      );
+    }
+
     while (this.isFlushing && this.activeFlushPromise) {
       try {
         await this.activeFlushPromise;
@@ -340,7 +351,7 @@ class BatchSettlerTestnet2 {
   startPeriodic(intervalMs = 15000, minItems = 1) {
     if (this.timer) clearInterval(this.timer);
     this.timer = setInterval(async () => {
-      if (this.pendingQueue.length >= minItems) {
+      if (this.pendingQueue.length >= minItems || this.inFlightChunks.length > 0) {
         try {
           await this.flushBatch();
         } catch (err) {
@@ -348,6 +359,7 @@ class BatchSettlerTestnet2 {
         }
       }
     }, intervalMs);
+    if (this.timer.unref) this.timer.unref();
     console.log(`[BatchSettler Testnet2] Periodic flush started (Interval: ${intervalMs}ms, minItems: ${minItems})`);
   }
 

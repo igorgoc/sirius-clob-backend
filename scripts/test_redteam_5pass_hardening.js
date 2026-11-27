@@ -860,6 +860,41 @@ async function main() {
     }
   });
 
+  await test('Final 4-File Audit (ws_hub, oracle, deposit_indexer, batch_settler): Mainnet guard, in-flight dedup, atomic writes & WS upgrade cap', async () => {
+    const wsSrc = fs.readFileSync(path.join(__dirname, '../dashboard/ws_hub.js'), 'utf8');
+    assert.ok(wsSrc.includes('pendingUpgrades') && wsSrc.includes('pendingByIp'), 'ws_hub must reserve capacity atomically before handleUpgrade');
+    assert.ok(wsSrc.includes("process.env.CLOB_TRUST_PROXY === 'true'"), 'ws_hub must not blindly trust XFF on bare-metal VPS');
+
+    const oracleSrc = fs.readFileSync(path.join(__dirname, '../dashboard/pancakeswap_oracle.js'), 'utf8');
+    assert.ok(oracleSrc.includes('inFlightOracleFetch'), 'pancakeswap_oracle must deduplicate concurrent RPC fetches');
+    assert.ok(oracleSrc.includes('hasRecentBnbUsd') && oracleSrc.includes('isFallback: !hasRecentBnbUsd'), 'pancakeswap_oracle must mark hardcoded USD fallback as stale/isFallback');
+
+    const idxSrc = fs.readFileSync(path.join(__dirname, '../dashboard/deposit_indexer.js'), 'utf8');
+    assert.ok(idxSrc.includes('getRequiredConfirmationDepth') && idxSrc.includes('atomicWriteJsonSync'), 'deposit_indexer must use config confirmation depth and atomicWriteJsonSync');
+
+    // BatchSettlerTestnet2 MUST refuse legacy Vault batch payouts on Mainnet
+    const { BatchSettlerTestnet2 } = require('../dashboard/batch_settler_testnet2');
+    const settler = new BatchSettlerTestnet2();
+    const prevNet = process.env.SIRIUS_NETWORK;
+    const prevAllow = process.env.ALLOW_MAINNET_LEGACY_VAULT;
+    try {
+      process.env.SIRIUS_NETWORK = 'mainnet';
+      delete process.env.ALLOW_MAINNET_LEGACY_VAULT;
+      let blocked = false;
+      try {
+        await settler.flushBatch();
+      } catch (err) {
+        blocked = /Mainnet security guard/i.test(err.message);
+      }
+      assert.strictEqual(blocked, true, 'BatchSettlerTestnet2.flushBatch() MUST fail closed on Mainnet');
+    } finally {
+      if (prevNet === undefined) delete process.env.SIRIUS_NETWORK;
+      else process.env.SIRIUS_NETWORK = prevNet;
+      if (prevAllow === undefined) delete process.env.ALLOW_MAINNET_LEGACY_VAULT;
+      else process.env.ALLOW_MAINNET_LEGACY_VAULT = prevAllow;
+    }
+  });
+
   try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
 
   console.log(`\n🎉 Red-Team 5-Pass Hardening Suite: ${passed} tests passed.\n`);

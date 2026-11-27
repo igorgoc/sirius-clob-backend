@@ -19,7 +19,9 @@ const DRIVE_KEY_HEX = 'bd1d100a98c34f62e170a8395b4498dc1e730286f5a12c489b37d0156
 const MAX_WS_BUFFERED_BYTES = 256 * 1024; // 256 KB per-socket backpressure cap (prevents slow-client RAM DoS)
 
 function getClientIp(req) {
-  const trustProxy = process.env.CLOB_TRUST_PROXY !== 'false';
+  const trustProxy =
+    process.env.CLOB_TRUST_PROXY === 'true' ||
+    (process.env.CLOB_TRUST_PROXY !== 'false' && Boolean(process.env.RENDER));
   const xff = trustProxy && req && req.headers && req.headers['x-forwarded-for'];
   if (typeof xff === 'string' && xff.trim()) {
     // Use right-most proxy-appended IP (never the client-spoofable left-most entry)
@@ -33,7 +35,7 @@ function isWsOriginAllowed(req) {
   const allowListRaw = String(process.env.CLOB_WS_ALLOWED_ORIGINS || '').trim();
   if (!allowListRaw) return true;
   const origin = String((req && req.headers && req.headers.origin) || '').trim().toLowerCase();
-  if (!origin) return true; // Non-browser clients
+  if (!origin) return process.env.CLOB_WS_ALLOW_EMPTY_ORIGIN === 'true';
   const allowed = allowListRaw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
   return allowed.includes(origin);
 }
@@ -55,7 +57,9 @@ function attachClobWebSocketHub(httpServer, { clusterDir, clobApi, enrichTradeWi
   });
 
   let seq = 0;
+  let pendingUpgrades = 0;
   const clientsByIp = new Map();
+  const pendingByIp = new Map();
   const lastDepthPayload = { xpx_usdt: '', xpx_bnb: '' };
   const lastTradesMeta = { xpx_usdt: '', xpx_bnb: '' };
   const lastTradesPayload = { xpx_usdt: [], xpx_bnb: [] };
@@ -175,6 +179,7 @@ function attachClobWebSocketHub(httpServer, { clusterDir, clobApi, enrichTradeWi
     if (frame.length > 16384) return;
     for (const client of wss.clients) {
       if (client.readyState !== WebSocket.OPEN) continue;
+      if (client.bufferedAmount > MAX_WS_BUFFERED_BYTES) continue;
       if (client.subscribedPublicKey === targetPk) {
         try {
           client.send(frame);
@@ -206,23 +211,50 @@ function attachClobWebSocketHub(httpServer, { clusterDir, clobApi, enrichTradeWi
       return;
     }
 
-    if (wss.clients.size >= MAX_WS_CLIENTS) {
+    if (wss.clients.size + pendingUpgrades >= MAX_WS_CLIENTS) {
       socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
       socket.destroy();
       return;
     }
 
     const clientIp = getClientIp(req);
-    if ((clientsByIp.get(clientIp) || 0) >= MAX_WS_CLIENTS_PER_IP) {
+    if ((clientsByIp.get(clientIp) || 0) + (pendingByIp.get(clientIp) || 0) >= MAX_WS_CLIENTS_PER_IP) {
       socket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n');
       socket.destroy();
       return;
     }
 
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      ws._clientIp = clientIp;
-      wss.emit('connection', ws, req);
-    });
+    // Reserve capacity slot atomically before async handleUpgrade to prevent burst races
+    pendingUpgrades += 1;
+    pendingByIp.set(clientIp, (pendingByIp.get(clientIp) || 0) + 1);
+    let pendingReleased = false;
+    const releasePending = () => {
+      if (pendingReleased) return;
+      pendingReleased = true;
+      pendingUpgrades = Math.max(0, pendingUpgrades - 1);
+      const nextPending = (pendingByIp.get(clientIp) || 1) - 1;
+      if (nextPending <= 0) pendingByIp.delete(clientIp);
+      else pendingByIp.set(clientIp, nextPending);
+    };
+    const releaseTimer = setTimeout(releasePending, 10000);
+    if (releaseTimer.unref) releaseTimer.unref();
+    const releasePendingAll = () => {
+      clearTimeout(releaseTimer);
+      releasePending();
+    };
+    socket.once('close', releasePendingAll);
+    socket.once('error', releasePendingAll);
+
+    try {
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        releasePendingAll();
+        ws._clientIp = clientIp;
+        wss.emit('connection', ws, req);
+      });
+    } catch (_) {
+      releasePendingAll();
+      try { socket.destroy(); } catch (__) {}
+    }
   });
 
   wss.on('connection', (ws, req) => {

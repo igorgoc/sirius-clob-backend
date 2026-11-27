@@ -10,6 +10,7 @@ let cachedPancakeOracle = null;
 let lastPancakeOracleFetch = 0;
 let consecutiveSpikeCount = 0;
 let sharedBscProvider = null;
+let inFlightOracleFetch = null;
 
 const PAIR_ADDRESS = '0x439B8E49F2b0d9C9824d5AB641D677511f362dA5';
 const XPX_BSC_CONTRACT = '0x6f3aaf802f57d045efdd2ac9c06d8879305542af';
@@ -72,7 +73,19 @@ async function getPancakeSwapPriceCached(forceRefresh = false) {
   if (!forceRefresh && cachedPancakeOracle && (now - lastPancakeOracleFetch < 15000)) {
     return cachedPancakeOracle;
   }
+  if (!forceRefresh && inFlightOracleFetch) {
+    return inFlightOracleFetch;
+  }
+  const promise = fetchPancakeSwapPriceInternal(now).finally(() => {
+    if (inFlightOracleFetch === promise) {
+      inFlightOracleFetch = null;
+    }
+  });
+  inFlightOracleFetch = promise;
+  return promise;
+}
 
+async function fetchPancakeSwapPriceInternal(now) {
   // 1. Direct BSC RPC On-Chain Reserves (reusing shared provider with strict RPC timeout)
   try {
     const { ethers } = require('ethers');
@@ -105,14 +118,18 @@ async function getPancakeSwapPriceCached(forceRefresh = false) {
       throw new Error(`Invalid computed priceBnbPerXpx: ${priceBnbPerXpx}`);
     }
 
-    let bnbUsd = 650;
     try {
-      const resDex = await fetch('https://api.dexscreener.com/latest/dex/pairs/bsc/' + PAIR_ADDRESS, {
+      const resp = await fetch('https://api.dexscreener.com/latest/dex/pairs/bsc/' + PAIR_ADDRESS, {
         signal: AbortSignal.timeout(3500)
-      }).then(r => r.json());
+      });
+      const resDex = resp.ok ? await resp.json() : null;
 
       const parsedUsd = resDex && resDex.pair ? parseFloat(resDex.pair.priceUsd) : NaN;
       if (resDex && resDex.pair && isPositiveFinite(parsedUsd)) {
+        const liqUsd = resDex.pair.liquidity ? Number(resDex.pair.liquidity.usd) : NaN;
+        const vol24h = resDex.pair.volume ? Number(resDex.pair.volume.h24) : 0;
+        const chg24h = resDex.pair.priceChange ? Number(resDex.pair.priceChange.h24) : 0;
+        const impliedBnbUsd = parsedUsd / priceBnbPerXpx;
         const guarded = applyOracleJumpGuard({
           ok: true,
           source: 'PancakeSwap V2 (BSC On-Chain + DexScreener)',
@@ -123,66 +140,81 @@ async function getPancakeSwapPriceCached(forceRefresh = false) {
           bnbReserve,
           priceBnb: priceBnbPerXpx,
           priceUsdt: parsedUsd,
-          liquidityUsd: resDex.pair.liquidity ? resDex.pair.liquidity.usd : (bnbReserve * bnbUsd * 2),
-          volume24hUsd: resDex.pair.volume ? resDex.pair.volume.h24 : 0,
-          priceChange24h: resDex.pair.priceChange ? resDex.pair.priceChange.h24 : 0,
+          liquidityUsd: isPositiveFinite(liqUsd) ? liqUsd : (bnbReserve * impliedBnbUsd * 2),
+          volume24hUsd: Number.isFinite(vol24h) ? vol24h : 0,
+          priceChange24h: Number.isFinite(chg24h) ? chg24h : 0,
           isFallback: false,
           stale: false,
           timestamp: now
         });
         cachedPancakeOracle = guarded;
-        lastPancakeOracleFetch = now;
+        if (!guarded.spikeRejected) lastPancakeOracleFetch = now;
         return cachedPancakeOracle;
       }
     } catch (_) {}
 
+    // If DexScreener USD feed is temporarily unavailable, derive BNB/USD from recent verified cache (<10m);
+    // NEVER silently serve a hardcoded $650 BNB rate with stale=false!
+    const hasRecentBnbUsd = Boolean(
+      cachedPancakeOracle &&
+      !cachedPancakeOracle.isFallback &&
+      isPositiveFinite(cachedPancakeOracle.priceUsdt) &&
+      isPositiveFinite(cachedPancakeOracle.priceBnb) &&
+      (now - Number(cachedPancakeOracle.timestamp || 0)) < 10 * 60 * 1000
+    );
+    const derivedBnbUsd = hasRecentBnbUsd
+      ? (cachedPancakeOracle.priceUsdt / cachedPancakeOracle.priceBnb)
+      : 650;
     const guardedOnChain = applyOracleJumpGuard({
       ok: true,
-      source: 'PancakeSwap V2 (BSC On-Chain)',
+      source: hasRecentBnbUsd ? 'PancakeSwap V2 (BSC On-Chain + Cached BNB/USD)' : 'PancakeSwap V2 (BSC On-Chain, Estimated USD)',
       pairAddress: PAIR_ADDRESS,
       baseToken: 'XPX',
       quoteToken: 'WBNB',
       xpxReserve,
       bnbReserve,
       priceBnb: priceBnbPerXpx,
-      priceUsdt: priceBnbPerXpx * bnbUsd,
-      isFallback: false,
-      stale: false,
+      priceUsdt: priceBnbPerXpx * derivedBnbUsd,
+      isFallback: !hasRecentBnbUsd,
+      stale: !hasRecentBnbUsd,
       timestamp: now
     });
     cachedPancakeOracle = guardedOnChain;
-    lastPancakeOracleFetch = now;
+    if (!guardedOnChain.spikeRejected) lastPancakeOracleFetch = now;
     return cachedPancakeOracle;
   } catch (err) {
     // 2. Fallback to DexScreener API
     try {
-      const resDex = await fetch('https://api.dexscreener.com/latest/dex/pairs/bsc/' + PAIR_ADDRESS, {
+      const resp = await fetch('https://api.dexscreener.com/latest/dex/pairs/bsc/' + PAIR_ADDRESS, {
         signal: AbortSignal.timeout(4000)
-      }).then(r => r.json());
+      });
+      const resDex = resp.ok ? await resp.json() : null;
 
       if (resDex && resDex.pair) {
         const p = resDex.pair;
         const parsedBnb = parseFloat(p.priceNative);
         const parsedUsd = parseFloat(p.priceUsd);
         const liqUsd = p.liquidity ? Number(p.liquidity.usd) : 0;
+        const vol24h = p.volume ? Number(p.volume.h24) : 0;
+        const chg24h = p.priceChange ? Number(p.priceChange.h24) : 0;
         if (isPositiveFinite(parsedBnb) && isPositiveFinite(parsedUsd) && (!Number.isFinite(liqUsd) || liqUsd >= 100)) {
           const guardedDex = applyOracleJumpGuard({
             ok: true,
             source: 'DexScreener API (PancakeSwap V2 Failover)',
-            pairAddress: p.pairAddress,
+            pairAddress: PAIR_ADDRESS,
             baseToken: 'XPX',
             quoteToken: 'WBNB',
             priceBnb: parsedBnb,
             priceUsdt: parsedUsd,
-            liquidityUsd: liqUsd || 8500,
-            volume24hUsd: p.volume ? p.volume.h24 : 500,
-            priceChange24h: p.priceChange ? p.priceChange.h24 : 0,
+            liquidityUsd: isPositiveFinite(liqUsd) ? liqUsd : 8500,
+            volume24hUsd: Number.isFinite(vol24h) ? vol24h : 0,
+            priceChange24h: Number.isFinite(chg24h) ? chg24h : 0,
             isFallback: false,
             stale: false,
             timestamp: now
           });
           cachedPancakeOracle = guardedDex;
-          lastPancakeOracleFetch = now;
+          if (!guardedDex.spikeRejected) lastPancakeOracleFetch = now;
           return cachedPancakeOracle;
         }
       }

@@ -278,8 +278,15 @@ impl MarketPair {
                     }
                 }
 
-                // Handle remaining unfilled quantity (never rest unfillable zero-quote dust on book)
-                if remaining > 0 && order_type != OrderType::IOC && Self::calculate_quote_amount(remaining, price) > 0 {
+                // Handle remaining unfilled quantity:
+                // NEVER rest unfillable zero-quote dust OR an order that would cross remaining book liquidity
+                // (e.g. after stopping on sub-atomic quote dust or hitting MAX_MATCHES_PER_ORDER)
+                let would_cross = self.best_ask().map(|ba| price >= ba).unwrap_or(false);
+                if remaining > 0
+                    && order_type != OrderType::IOC
+                    && !would_cross
+                    && Self::calculate_quote_amount(remaining, price) > 0
+                {
                     rested_amount = remaining;
                     let resting_order = LimitOrder {
                         order_id,
@@ -392,8 +399,15 @@ impl MarketPair {
                     }
                 }
 
-                // Handle remaining unfilled quantity (never rest unfillable zero-quote dust on book)
-                if remaining > 0 && order_type != OrderType::IOC && Self::calculate_quote_amount(remaining, price) > 0 {
+                // Handle remaining unfilled quantity:
+                // NEVER rest unfillable zero-quote dust OR an order that would cross remaining book liquidity
+                // (e.g. after stopping on sub-atomic quote dust or hitting MAX_MATCHES_PER_ORDER)
+                let would_cross = self.best_bid().map(|bb| price <= bb).unwrap_or(false);
+                if remaining > 0
+                    && order_type != OrderType::IOC
+                    && !would_cross
+                    && Self::calculate_quote_amount(remaining, price) > 0
+                {
                     rested_amount = remaining;
                     let resting_order = LimitOrder {
                         order_id,

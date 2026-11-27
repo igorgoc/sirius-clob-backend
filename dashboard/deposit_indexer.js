@@ -14,12 +14,20 @@ const {
 } = require('tsjs-xpx-chain-sdk');
 const config = require('./testnet2_config');
 const t2Client = require('./testnet2_client');
+const { atomicWriteJsonSync } = require('./atomic_fs');
 let clobApi = null;
 try {
   clobApi = require('./clob_api');
 } catch (_) {}
 
-const CONFIRMATION_DEPTH = 1; // 1 block confirmation required
+function getRequiredConfirmationDepth() {
+  const isMainnet =
+    config.NETWORK_TYPE === 184 ||
+    String(config.NETWORK_ENV || '').toLowerCase() === 'mainnet';
+  const configured = Number(config.CONFIRMATION_DEPTH || 1);
+  return isMainnet ? Math.max(3, configured) : Math.max(1, configured);
+}
+const MAX_SCAN_PAGES = 20;
 const DEFAULT_POLL_INTERVAL_MS = 10000; // 10s poll cycle (block time ~15s)
 
 let isRunning = false;
@@ -42,9 +50,10 @@ function loadProcessedDeposits() {
       for (const item of entries) {
         const hash = typeof item === 'string' ? item : item.txHash;
         if (hash) {
-          processedHashes.add(hash.toLowerCase());
           if (typeof item === 'object' && item.mosaicIdHex) {
             processedHashes.add(`${hash.toLowerCase()}:${item.mosaicIdHex.toLowerCase()}`);
+          } else {
+            processedHashes.add(hash.toLowerCase());
           }
         }
       }
@@ -105,14 +114,10 @@ function recordProcessedDeposit(record) {
     }
 
     list.push(record);
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    const serialized = JSON.stringify(list, null, 2);
-    const tmpFile = `${filePath}.tmp.${process.pid}`;
-    fs.writeFileSync(tmpFile, serialized);
-    fs.renameSync(tmpFile, filePath);
-    try {
-      fs.writeFileSync(bakPath, serialized);
-    } catch (_) {}
+    atomicWriteJsonSync(filePath, list, { backup: true });
+    if (!fs.existsSync(bakPath)) {
+      atomicWriteJsonSync(bakPath, list, { backup: false });
+    }
   } catch (err) {
     console.error('[Deposit Indexer] Error saving processed deposit:', err.message);
   }
@@ -208,18 +213,20 @@ async function scanDeposits(onDepositCallback) {
       } catch (_) {}
     }
 
+    const requiredDepth = getRequiredConfirmationDepth();
     for (const targetAddr of targets) {
       let page = 1;
-      while (true) {
+      while (page <= MAX_SCAN_PAGES) {
         const incomingTxs = await fetchVaultIncomingTransactions(targetAddr, 50, page);
         if (!incomingTxs || incomingTxs.length === 0) break;
 
         let hasNewOnPage = false;
+        let hasUnconfirmedOrFailedOnPage = false;
         for (const tx of incomingTxs) {
           if (!tx.transactionInfo || !tx.transactionInfo.hash) continue;
           const txHash = tx.transactionInfo.hash.toLowerCase();
 
-          // Idempotency check
+          // Legacy tx-level idempotency check (for string-only legacy records without mosaicIdHex)
           if (processedHashes.has(txHash)) continue;
 
           // Type 16724 = TransferTransaction
@@ -227,7 +234,8 @@ async function scanDeposits(onDepositCallback) {
 
           // Confirmation depth check (must be confirmed on-chain with height > 0)
           const txHeight = tx.transactionInfo.height ? tx.transactionInfo.height.compact() : 0;
-          if (txHeight <= 0 || currentHeight - txHeight < CONFIRMATION_DEPTH) {
+          if (txHeight <= 0 || currentHeight - txHeight < requiredDepth) {
+            hasUnconfirmedOrFailedOnPage = true;
             continue; // Wait for confirmation depth
           }
 
@@ -273,13 +281,14 @@ async function scanDeposits(onDepositCallback) {
               hasNewOnPage = true;
               console.log(`[Deposit Indexer] Credited deposit ${mosaicIdHex} (${amountAtomic}) from ${senderAddress} to ${targetAddr.plain()} (Tx: ${txHash.slice(0, 16)}...)`);
             } catch (cbErr) {
+              hasUnconfirmedOrFailedOnPage = true;
               console.error(`[Deposit Indexer] Callback error for deposit tx ${txHash}:`, cbErr.message);
             }
           }
         }
 
-        // Fast exit: if all transactions on page are already indexed and we're not cold-starting, break
-        if (!hasNewOnPage && processedHashes.size > 0) {
+        // Fast exit ONLY when all confirmed txs on this page were already processed and nothing is pending/failed
+        if (!hasNewOnPage && !hasUnconfirmedOrFailedOnPage && processedHashes.size > 0) {
           break;
         }
         if (incomingTxs.length < 50) break;

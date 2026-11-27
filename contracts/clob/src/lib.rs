@@ -1114,4 +1114,366 @@ mod security_tests {
         assert!(ledger.unlock(&alice, XPX_MOSAIC_ID, 1000).is_ok());
         assert_eq!(ledger.get_balance(&alice, XPX_MOSAIC_ID), (u64::MAX - 5, 0));
     }
+
+    struct SplitMix64(u64);
+    impl SplitMix64 {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn range(&mut self, lo: u64, hi: u64) -> u64 {
+            if lo >= hi { return lo; }
+            lo + (self.next() % (hi - lo + 1))
+        }
+    }
+
+    fn assert_market_and_ledger_invariants(
+        market: &MarketPair,
+        ledger: &BalanceLedger,
+        traders: &[[u8; 32]],
+        total_deposited_base: u128,
+        total_deposited_quote: u128,
+        total_fees_base: u128,
+        total_fees_quote: u128,
+        step: usize,
+    ) {
+        // 1. Never crossed book
+        if let (Some(bb), Some(ba)) = (market.best_bid(), market.best_ask()) {
+            assert!(bb < ba, "Step {}: Crossed book! best_bid={} >= best_ask={}", step, bb, ba);
+        }
+
+        // 2. Exact total_depth, zero empty levels, zero dust resting orders, and 1-to-1 order_index bijection
+        let mut resting_count = 0usize;
+        let mut book_locked_base: u128 = 0;
+        for (&price, lvl) in &market.bids {
+            assert!(!lvl.orders.is_empty(), "Step {}: Empty bid level @ {}", step, price);
+            let mut sum_depth = 0u64;
+            for o in &lvl.orders {
+                assert!(o.remaining_amount > 0, "Step {}: Zero remaining bid #{}", step, o.order_id);
+                assert!(
+                    MarketPair::calculate_quote_amount(o.remaining_amount, price) > 0,
+                    "Step {}: Unfillable zero-quote dust bid #{} resting @ {}",
+                    step, o.order_id, price
+                );
+                assert_eq!(
+                    market.order_index.get(&o.order_id),
+                    Some(&(OrderSide::Buy, price)),
+                    "Step {}: order_index mismatch for bid #{}",
+                    step, o.order_id
+                );
+                sum_depth = sum_depth.checked_add(o.remaining_amount).expect("depth sum overflow");
+                resting_count += 1;
+            }
+            assert_eq!(lvl.total_depth, sum_depth, "Step {}: Bid total_depth mismatch @ {}", step, price);
+        }
+
+        for (&price, lvl) in &market.asks {
+            assert!(!lvl.orders.is_empty(), "Step {}: Empty ask level @ {}", step, price);
+            let mut sum_depth = 0u64;
+            for o in &lvl.orders {
+                assert!(o.remaining_amount > 0, "Step {}: Zero remaining ask #{}", step, o.order_id);
+                assert!(
+                    MarketPair::calculate_quote_amount(o.remaining_amount, price) > 0,
+                    "Step {}: Unfillable zero-quote dust ask #{} resting @ {}",
+                    step, o.order_id, price
+                );
+                assert_eq!(
+                    market.order_index.get(&o.order_id),
+                    Some(&(OrderSide::Sell, price)),
+                    "Step {}: order_index mismatch for ask #{}",
+                    step, o.order_id
+                );
+                sum_depth = sum_depth.checked_add(o.remaining_amount).expect("depth sum overflow");
+                book_locked_base += o.remaining_amount as u128;
+                resting_count += 1;
+            }
+            assert_eq!(lvl.total_depth, sum_depth, "Step {}: Ask total_depth mismatch @ {}", step, price);
+        }
+
+        assert_eq!(
+            market.order_index.len(),
+            resting_count,
+            "Step {}: order_index len ({}) != resting orders ({})",
+            step, market.order_index.len(), resting_count
+        );
+
+        // 3. Exact Base & Quote conservation across all traders + protocol fees
+        let mut ledger_base_free: u128 = 0;
+        let mut ledger_base_locked: u128 = 0;
+        let mut ledger_quote_free: u128 = 0;
+        let mut ledger_quote_locked: u128 = 0;
+        for t in traders {
+            let (fb, lb) = ledger.get_balance(t, market.base_mosaic_id);
+            let (fq, lq) = ledger.get_balance(t, market.quote_mosaic_id);
+            ledger_base_free += fb as u128;
+            ledger_base_locked += lb as u128;
+            ledger_quote_free += fq as u128;
+            ledger_quote_locked += lq as u128;
+        }
+
+        assert_eq!(
+            ledger_base_free + ledger_base_locked + total_fees_base,
+            total_deposited_base,
+            "Step {}: BASE CONSERVATION BREACH! free={} locked={} fees={} != deposited={}",
+            step, ledger_base_free, ledger_base_locked, total_fees_base, total_deposited_base
+        );
+        assert_eq!(
+            ledger_base_locked,
+            book_locked_base,
+            "Step {}: LOCKED BASE DRIFT! ledger_locked={} != book_asks={}",
+            step, ledger_base_locked, book_locked_base
+        );
+        assert_eq!(
+            ledger_quote_free + ledger_quote_locked + total_fees_quote,
+            total_deposited_quote,
+            "Step {}: QUOTE CONSERVATION BREACH! free={} locked={} fees={} != deposited={}",
+            step, ledger_quote_free, ledger_quote_locked, total_fees_quote, total_deposited_quote
+        );
+    }
+
+    fn run_market_fuzz_campaign(
+        seed: u64,
+        iterations: usize,
+        quote_mosaic_id: u64,
+        tick_size: u64,
+        min_order_size: u64,
+        maker_fee_bps: u64,
+        taker_fee_bps: u64,
+        price_lo_ticks: u64,
+        price_hi_ticks: u64,
+    ) {
+        let mut rng = SplitMix64(seed);
+        let mut market = MarketPair::new(
+            XPX_MOSAIC_ID,
+            quote_mosaic_id,
+            tick_size,
+            min_order_size,
+            maker_fee_bps,
+            taker_fee_bps,
+        );
+        let mut ledger = BalanceLedger::default();
+        let traders: [[u8; 32]; 6] = [
+            [1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32], [5u8; 32], [6u8; 32],
+        ];
+        let mut total_deposited_base: u128 = 0;
+        let mut total_deposited_quote: u128 = 0;
+        let mut total_fees_base: u128 = 0;
+        let mut total_fees_quote: u128 = 0;
+
+        for t in &traders {
+            let init_base = 500_000_000_000u64; // 500k XPX
+            let init_quote = 500_000_000_000u64;
+            ledger.deposit(*t, XPX_MOSAIC_ID, init_base).unwrap();
+            ledger.deposit(*t, quote_mosaic_id, init_quote).unwrap();
+            total_deposited_base += init_base as u128;
+            total_deposited_quote += init_quote as u128;
+        }
+
+        let mut known_order_ids: Vec<OrderId> = Vec::new();
+        let mut total_fills: usize = 0;
+
+        for step in 0..iterations {
+            let action = rng.range(0, 99);
+            let trader = traders[rng.range(0, (traders.len() - 1) as u64) as usize];
+
+            if action < 58 {
+                // Place random Limit / IOC / PostOnly Buy or Sell order
+                let side = if rng.range(0, 1) == 0 { OrderSide::Buy } else { OrderSide::Sell };
+                let order_type = match rng.range(0, 9) {
+                    0..=5 => OrderType::Limit,
+                    6..=7 => OrderType::IOC,
+                    _ => OrderType::PostOnly,
+                };
+                let raw_tick_idx = rng.range(price_lo_ticks, price_hi_ticks);
+                let price = raw_tick_idx * tick_size;
+                let amount = rng.range(min_order_size, min_order_size.saturating_mul(250));
+
+                let (req_mosaic, req_amount) = match side {
+                    OrderSide::Buy => (quote_mosaic_id, MarketPair::calculate_quote_amount(amount, price)),
+                    OrderSide::Sell => (XPX_MOSAIC_ID, amount),
+                };
+                if price == 0 || amount == 0 || req_amount == 0 || req_amount == u64::MAX {
+                    continue;
+                }
+                let (free_bal, _) = ledger.get_balance(&trader, req_mosaic);
+                if free_bal < req_amount {
+                    continue;
+                }
+                ledger.lock(&trader, req_mosaic, req_amount).unwrap();
+
+                match market.place_order(trader, side, order_type, price, amount, step as u64 + 1) {
+                    Ok(res) => {
+                        if res.order_id > 0 && res.status != OrderStatus::Rejected {
+                            known_order_ids.push(res.order_id);
+                            if known_order_ids.len() > 256 {
+                                known_order_ids.remove(0);
+                            }
+                        }
+                        for fill in &res.fills {
+                            assert!(fill.base_amount > 0, "Step {}: zero base fill", step);
+                            assert!(fill.quote_amount > 0, "Step {}: ZERO-QUOTE FILL EXPLOIT!", step);
+                            total_fills += 1;
+                            match fill.taker_side {
+                                OrderSide::Buy => {
+                                    ledger.release_locked(&fill.taker_pubkey, market.quote_mosaic_id, fill.quote_amount).unwrap();
+                                    ledger.release_locked(&fill.maker_pubkey, market.base_mosaic_id, fill.base_amount).unwrap();
+                                    let net_base = fill.base_amount.checked_sub(fill.taker_fee).unwrap();
+                                    let net_quote = fill.quote_amount.checked_sub(fill.maker_fee).unwrap();
+                                    ledger.deposit(fill.taker_pubkey, market.base_mosaic_id, net_base).unwrap();
+                                    ledger.deposit(fill.maker_pubkey, market.quote_mosaic_id, net_quote).unwrap();
+                                    total_fees_base += fill.taker_fee as u128;
+                                    total_fees_quote += fill.maker_fee as u128;
+                                }
+                                OrderSide::Sell => {
+                                    ledger.release_locked(&fill.taker_pubkey, market.base_mosaic_id, fill.base_amount).unwrap();
+                                    ledger.release_locked(&fill.maker_pubkey, market.quote_mosaic_id, fill.quote_amount).unwrap();
+                                    let net_base = fill.base_amount.checked_sub(fill.maker_fee).unwrap();
+                                    let net_quote = fill.quote_amount.checked_sub(fill.taker_fee).unwrap();
+                                    ledger.deposit(fill.maker_pubkey, market.base_mosaic_id, net_base).unwrap();
+                                    ledger.deposit(fill.taker_pubkey, market.quote_mosaic_id, net_quote).unwrap();
+                                    total_fees_base += fill.maker_fee as u128;
+                                    total_fees_quote += fill.taker_fee as u128;
+                                }
+                            }
+                        }
+                        for &(dust_owner, dust_side, dust_amount) in &res.dust_refunds {
+                            if dust_amount > 0 {
+                                let m = match dust_side {
+                                    OrderSide::Buy => market.quote_mosaic_id,
+                                    OrderSide::Sell => market.base_mosaic_id,
+                                };
+                                ledger.unlock(&dust_owner, m, dust_amount).unwrap();
+                            }
+                        }
+                        if res.refund_base > 0 {
+                            ledger.unlock(&trader, market.base_mosaic_id, res.refund_base).unwrap();
+                        }
+                        if res.refund_quote > 0 {
+                            ledger.unlock(&trader, market.quote_mosaic_id, res.refund_quote).unwrap();
+                        }
+                    }
+                    Err(_) => {
+                        ledger.unlock(&trader, req_mosaic, req_amount).unwrap();
+                    }
+                }
+            } else if action < 73 && !known_order_ids.is_empty() {
+                // Single cancel (authorized or unauthorized)
+                let oid = known_order_ids[rng.range(0, (known_order_ids.len() - 1) as u64) as usize];
+                if let Ok((side, refund, _)) = market.cancel_order(oid, trader) {
+                    if refund > 0 {
+                        let m = match side {
+                            OrderSide::Buy => market.quote_mosaic_id,
+                            OrderSide::Sell => market.base_mosaic_id,
+                        };
+                        ledger.unlock(&trader, m, refund).unwrap();
+                    }
+                }
+            } else if action < 83 && !known_order_ids.is_empty() {
+                // Batch cancel (including duplicates & random IDs)
+                let cnt = rng.range(1, 5) as usize;
+                let mut batch = Vec::with_capacity(cnt);
+                for _ in 0..cnt {
+                    batch.push(known_order_ids[rng.range(0, (known_order_ids.len() - 1) as u64) as usize]);
+                }
+                let res = market.cancel_batch(&batch, trader);
+                if res.total_refund_base > 0 {
+                    ledger.unlock(&trader, market.base_mosaic_id, res.total_refund_base).unwrap();
+                }
+                if res.total_refund_quote > 0 {
+                    ledger.unlock(&trader, market.quote_mosaic_id, res.total_refund_quote).unwrap();
+                }
+            } else if action < 88 {
+                // Cancel all for trader
+                let res = market.cancel_all(trader);
+                if res.total_refund_base > 0 {
+                    ledger.unlock(&trader, market.base_mosaic_id, res.total_refund_base).unwrap();
+                }
+                if res.total_refund_quote > 0 {
+                    ledger.unlock(&trader, market.quote_mosaic_id, res.total_refund_quote).unwrap();
+                }
+            } else if action < 95 {
+                // Fuzz binary batch_cancel parser with arbitrary bytes (must NEVER panic!)
+                let len = rng.range(0, 72) as usize;
+                let mut raw = vec![0u8; len];
+                for b in &mut raw {
+                    *b = (rng.next() & 0xFF) as u8;
+                }
+                let _ = parse_batch_cancel_params(&raw);
+            } else {
+                // Depth snapshot query
+                let max_lvl = rng.range(0, 50) as usize;
+                let d = market.get_depth(max_lvl);
+                assert!(d.bids.len() <= max_lvl && d.asks.len() <= max_lvl);
+            }
+
+            // Check all invariants frequently (every step for first 2k, every 25 steps thereafter + final step)
+            if step < 2_000 || step % 25 == 0 || step + 1 == iterations {
+                assert_market_and_ledger_invariants(
+                    &market,
+                    &ledger,
+                    &traders,
+                    total_deposited_base,
+                    total_deposited_quote,
+                    total_fees_base,
+                    total_fees_quote,
+                    step,
+                );
+            }
+        }
+
+        // Final drain: cancel_all for every trader and verify book is 100% empty & base locked == 0
+        for t in &traders {
+            let res = market.cancel_all(*t);
+            if res.total_refund_base > 0 {
+                ledger.unlock(t, market.base_mosaic_id, res.total_refund_base).unwrap();
+            }
+            if res.total_refund_quote > 0 {
+                ledger.unlock(t, market.quote_mosaic_id, res.total_refund_quote).unwrap();
+            }
+        }
+        assert!(market.bids.is_empty() && market.asks.is_empty() && market.order_index.is_empty());
+        assert!(total_fills > 100, "Fuzzer must exercise real matching (got {} fills)", total_fills);
+        assert_market_and_ledger_invariants(
+            &market,
+            &ledger,
+            &traders,
+            total_deposited_base,
+            total_deposited_quote,
+            total_fees_base,
+            total_fees_quote,
+            iterations,
+        );
+    }
+
+    #[test]
+    fn fuzz_100k_orderbook_and_ledger_invariants() {
+        // Campaign 1: 50,000 random ops on XPX/USDT (tick=100, maker=5bps, taker=10bps)
+        run_market_fuzz_campaign(
+            0x51A1_05C1_0B00_0001,
+            50_000,
+            USDT_MOSAIC_ID,
+            100,
+            100_000,
+            5,
+            10,
+            70,   // 0.000070 USDT
+            110,  // 0.000110 USDT
+        );
+
+        // Campaign 2: 50,000 random ops on ultra-low-tick XPX/BNB (tick=1, maker=0bps, taker=10bps, extreme dust ticks 10..30!)
+        run_market_fuzz_campaign(
+            0x51A1_05C1_0B00_0002,
+            50_000,
+            BNB_MOSAIC_ID,
+            1,
+            100_000,
+            0,
+            10,
+            10,   // 0.00000010 BNB
+            30,   // 0.00000030 BNB
+        );
+    }
 }
