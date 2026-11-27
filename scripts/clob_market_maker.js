@@ -12,6 +12,23 @@
 
 const fs = require('fs');
 const path = require('path');
+
+// HARD MAINNET SAFETY GUARD: Synthetic/demo Market Maker MUST NEVER run on Sirius Mainnet!
+const l1Config = require('../dashboard/testnet2_config');
+if (
+  String(process.env.SIRIUS_NETWORK || '').trim().toLowerCase() === 'mainnet' ||
+  Number(process.env.SIRIUS_NETWORK_TYPE) === 184 ||
+  String(l1Config.NETWORK_ENV || '').toLowerCase() === 'mainnet' ||
+  Number(l1Config.NETWORK_TYPE) === 184
+) {
+  console.error(
+    '[FATAL] Refusing to start synthetic demo Market Maker (scripts/clob_market_maker.js) on Sirius Mainnet! ' +
+    'Use scripts/clob_mainnet_market_maker.js with a real funded 2-of-2 Smart Trading Account instead.'
+  );
+  process.exit(1);
+}
+
+const { atomicWriteJsonSync } = require('../dashboard/atomic_fs');
 const {
   executeOnNodeVm,
   assert3NodeConsensus,
@@ -30,9 +47,7 @@ const MM_STATUS_FILE = path.join(CLUSTER_DIR, 'mm_status.json');
 
 function writeStatus(status) {
   try {
-    const tmpFile = `${MM_STATUS_FILE}.${process.pid}.${Date.now()}.tmp`;
-    fs.writeFileSync(tmpFile, JSON.stringify(status, null, 2));
-    fs.renameSync(tmpFile, MM_STATUS_FILE);
+    atomicWriteJsonSync(MM_STATUS_FILE, status);
   } catch (_) {}
 }
 

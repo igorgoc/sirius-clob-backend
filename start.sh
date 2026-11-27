@@ -41,9 +41,15 @@ if [ -z "$SIRIUS_NODE_URL" ]; then
     fi
 fi
 
-echo "Starting Market Maker Daemon..."
-node scripts/clob_market_maker.js --daemon > cluster/mm.log 2>&1 &
-echo $! > cluster/mm.pid
+IS_CONFIG_MAINNET="$(node -e 'try { const c = require("./dashboard/testnet2_config"); process.stdout.write((Number(c.NETWORK_TYPE) === 184 || String(c.NETWORK_ENV || "").toLowerCase() === "mainnet") ? "1" : "0"); } catch (_) { process.stdout.write("0"); }' 2>/dev/null || echo 0)"
+if [ "$(echo "${SIRIUS_NETWORK}" | tr '[:upper:]' '[:lower:]')" = "mainnet" ] || [ "${SIRIUS_NETWORK_TYPE}" = "184" ] || [ "${IS_CONFIG_MAINNET}" = "1" ]; then
+    echo "Mainnet detected: Synthetic demo Market Maker (scripts/clob_market_maker.js) is disabled."
+    echo "Run scripts/clob_mainnet_market_maker.js externally with a funded 2-of-2 Smart Trading Account."
+else
+    echo "Starting Testnet Market Maker Daemon..."
+    node scripts/clob_market_maker.js --daemon > cluster/mm.log 2>&1 &
+    echo $! > cluster/mm.pid
+fi
 
 echo "Starting CLOB Relayer API on port ${PORT:-8088}..."
 exec node dashboard/server.js

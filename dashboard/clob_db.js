@@ -190,6 +190,25 @@ function getDb(customPath = null) {
       last_rebuilt_at INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS used_nonces (
+      caller_key TEXT NOT NULL,
+      nonce TEXT NOT NULL,
+      expiry_ms INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (caller_key, nonce)
+    );
+    CREATE INDEX IF NOT EXISTS idx_used_nonces_expiry ON used_nonces(expiry_ms);
+
+    CREATE TABLE IF NOT EXISTS cod_registrations (
+      caller_key TEXT PRIMARY KEY,
+      timeout_ms INTEGER NOT NULL CHECK(timeout_ms >= 1000),
+      last_heartbeat INTEGER NOT NULL,
+      registered_at INTEGER NOT NULL,
+      markets_json TEXT NOT NULL,
+      heartbeat_count INTEGER NOT NULL DEFAULT 1 CHECK(heartbeat_count >= 0),
+      updated_at INTEGER NOT NULL
+    );
   `);
 
   try {
@@ -1333,6 +1352,186 @@ function deleteSettlementRebuildMeta(settlementId) {
   db.prepare('DELETE FROM settlement_rebuild_meta WHERE settlement_id = ?').run(id);
 }
 
+let nonceConsumeCounter = 0;
+
+/**
+ * Atomically check and record a replay-protection nonce in SQLite using BEGIN IMMEDIATE.
+ * Returns { accepted: true } if newly consumed, or { accepted: false } if unexpired replay.
+ */
+function consumeReplayNonceAtomic(callerKey, nonce, expiryMs, now = Date.now()) {
+  const db = getDb();
+  const key = String(callerKey || '').trim().toLowerCase();
+  const nonceStr = String(nonce ?? '').trim();
+  const safeNow = Number.isFinite(Number(now)) && Number(now) > 0 ? Math.trunc(Number(now)) : Date.now();
+  const safeExp = Math.trunc(Number(expiryMs) || 0);
+  if (!key || !nonceStr || nonceStr.length > 128 || safeExp <= safeNow) {
+    return { accepted: false, reason: 'invalid_or_expired' };
+  }
+
+  const tx = db.transaction(() => {
+    const existing = db.prepare(
+      'SELECT expiry_ms FROM used_nonces WHERE caller_key = ? AND nonce = ?'
+    ).get(key, nonceStr);
+    if (existing && Math.trunc(Number(existing.expiry_ms) || 0) > safeNow) {
+      return { accepted: false, reason: 'replay' };
+    }
+    db.prepare(`
+      INSERT OR REPLACE INTO used_nonces (caller_key, nonce, expiry_ms, created_at)
+      VALUES (?, ?, ?, ?)
+    `).run(key, nonceStr, safeExp, safeNow);
+
+    nonceConsumeCounter++;
+    if (nonceConsumeCounter % 250 === 0) {
+      db.prepare('DELETE FROM used_nonces WHERE expiry_ms <= ?').run(safeNow);
+    }
+    return { accepted: true };
+  });
+
+  return tx.immediate();
+}
+
+function pruneExpiredNonces(now = Date.now()) {
+  const db = getDb();
+  const safeNow = Number.isFinite(Number(now)) && Number(now) > 0 ? Math.trunc(Number(now)) : Date.now();
+  const res = db.prepare('DELETE FROM used_nonces WHERE expiry_ms <= ?').run(safeNow);
+  return res.changes || 0;
+}
+
+function importLegacyUsedNonces(noncesObj, now = Date.now()) {
+  if (!noncesObj || typeof noncesObj !== 'object') return 0;
+  const db = getDb();
+  const safeNow = Number.isFinite(Number(now)) && Number(now) > 0 ? Math.trunc(Number(now)) : Date.now();
+  const insertStmt = db.prepare(`
+    INSERT OR IGNORE INTO used_nonces (caller_key, nonce, expiry_ms, created_at)
+    VALUES (?, ?, ?, ?)
+  `);
+  let imported = 0;
+  const tx = db.transaction(() => {
+    for (const [rawKey, mapObj] of Object.entries(noncesObj)) {
+      if (!mapObj || typeof mapObj !== 'object') continue;
+      const key = String(rawKey).trim().toLowerCase();
+      if (!key) continue;
+      for (const [nStr, exp] of Object.entries(mapObj)) {
+        const expMs = Math.trunc(Number(exp) || 0);
+        if (expMs > safeNow) {
+          const r = insertStmt.run(key, String(nStr), expMs, safeNow);
+          if (r.changes > 0) imported++;
+        }
+      }
+    }
+  });
+  tx.immediate();
+  return imported;
+}
+
+function hydrateCodRow(row) {
+  if (!row) return null;
+  let markets = ['XPX/USDT', 'XPX/BNB'];
+  try {
+    const parsed = JSON.parse(row.markets_json || '["XPX/USDT","XPX/BNB"]');
+    if (Array.isArray(parsed)) {
+      const cleaned = parsed.map((m) => (typeof m === 'string' ? m.trim() : '')).filter(Boolean);
+      if (cleaned.length > 0) markets = cleaned;
+    }
+  } catch (_) {}
+  return {
+    publicKey: row.caller_key,
+    timeoutMs: Math.max(1000, Math.trunc(Number(row.timeout_ms) || 10000)),
+    lastHeartbeat: Math.max(0, Math.trunc(Number(row.last_heartbeat) || 0)),
+    registeredAt: Math.max(0, Math.trunc(Number(row.registered_at) || 0)),
+    markets,
+    heartbeatCount: Math.max(0, Math.trunc(Number(row.heartbeat_count) || 0)),
+    updatedAt: Math.max(0, Math.trunc(Number(row.updated_at) || 0)),
+  };
+}
+
+function upsertCodRegistrationAtomic(callerKey, { timeoutMs, markets, now = Date.now() }) {
+  const db = getDb();
+  const key = String(callerKey || '').trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(key)) return null;
+  const safeNow = Number.isFinite(Number(now)) && Number(now) > 0 ? Math.trunc(Number(now)) : Date.now();
+  const safeTimeout = Math.max(1000, Math.min(120000, Math.trunc(Number(timeoutMs) || 10000)));
+  const filteredMarkets = Array.isArray(markets)
+    ? markets.map((m) => (typeof m === 'string' ? m.trim() : '')).filter(Boolean)
+    : [];
+  const cleanMarkets = filteredMarkets.length > 0 ? filteredMarkets : ['XPX/USDT'];
+
+  const tx = db.transaction(() => {
+    const prev = db.prepare(
+      'SELECT registered_at, heartbeat_count FROM cod_registrations WHERE caller_key = ?'
+    ).get(key);
+    const registeredAt = prev ? Math.max(0, Math.trunc(Number(prev.registered_at) || safeNow)) : safeNow;
+    const heartbeatCount = (prev ? Math.max(0, Math.trunc(Number(prev.heartbeat_count) || 0)) : 0) + 1;
+    db.prepare(`
+      INSERT INTO cod_registrations (caller_key, timeout_ms, last_heartbeat, registered_at, markets_json, heartbeat_count, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(caller_key) DO UPDATE SET
+        timeout_ms = excluded.timeout_ms,
+        last_heartbeat = excluded.last_heartbeat,
+        markets_json = excluded.markets_json,
+        heartbeat_count = excluded.heartbeat_count,
+        updated_at = excluded.updated_at
+    `).run(key, safeTimeout, safeNow, registeredAt, JSON.stringify(cleanMarkets), heartbeatCount, safeNow);
+    return {
+      publicKey: key,
+      timeoutMs: safeTimeout,
+      lastHeartbeat: safeNow,
+      registeredAt,
+      markets: cleanMarkets,
+      heartbeatCount,
+    };
+  });
+
+  return tx.immediate();
+}
+
+function getCodRegistration(callerKey) {
+  const db = getDb();
+  const key = String(callerKey || '').trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(key)) return null;
+  const row = db.prepare('SELECT * FROM cod_registrations WHERE caller_key = ?').get(key);
+  return hydrateCodRow(row);
+}
+
+function getAllCodRegistrations() {
+  const db = getDb();
+  const rows = db.prepare('SELECT * FROM cod_registrations ORDER BY last_heartbeat ASC').all();
+  return rows.map(hydrateCodRow);
+}
+
+function deleteCodRegistration(callerKey) {
+  const db = getDb();
+  const key = String(callerKey || '').trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(key)) return false;
+  const res = db.prepare('DELETE FROM cod_registrations WHERE caller_key = ?').run(key);
+  return res.changes > 0;
+}
+
+/**
+ * Atomically claim (select + delete) all expired COD registrations inside BEGIN IMMEDIATE
+ * so overlapping watchdog ticks or restarts never double-trigger cancellations.
+ */
+function claimExpiredCodRegistrations(now = Date.now()) {
+  const db = getDb();
+  const safeNow = Number.isFinite(Number(now)) && Number(now) > 0 ? Math.trunc(Number(now)) : Date.now();
+  const tx = db.transaction(() => {
+    const expiredRows = db.prepare(
+      'SELECT * FROM cod_registrations WHERE (? - last_heartbeat) > timeout_ms'
+    ).all(safeNow);
+    if (expiredRows.length === 0) return [];
+    const delStmt = db.prepare('DELETE FROM cod_registrations WHERE caller_key = ? AND (? - last_heartbeat) > timeout_ms');
+    const claimed = [];
+    for (const row of expiredRows) {
+      const r = delStmt.run(row.caller_key, safeNow);
+      if (r.changes > 0) {
+        claimed.push(hydrateCodRow(row));
+      }
+    }
+    return claimed;
+  });
+  return tx.immediate();
+}
+
 module.exports = {
   DB_FILE,
   getDb,
@@ -1381,4 +1580,12 @@ module.exports = {
   getSettlementRebuildMeta,
   incrementSettlementRebuildMeta,
   deleteSettlementRebuildMeta,
+  consumeReplayNonceAtomic,
+  pruneExpiredNonces,
+  importLegacyUsedNonces,
+  upsertCodRegistrationAtomic,
+  getCodRegistration,
+  getAllCodRegistrations,
+  deleteCodRegistration,
+  claimExpiredCodRegistrations,
 };

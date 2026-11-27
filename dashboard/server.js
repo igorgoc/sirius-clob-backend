@@ -12,6 +12,7 @@ module.paths.push(path.resolve(__dirname, '../../web-wallet-vuejs/node_modules')
 const { exec, execFile, execFileSync, spawn } = require('child_process');
 const clobApi = require('./clob_api');
 const clobDb = require('./clob_db');
+const { atomicWriteJsonSync, readJsonWithBackupSync } = require('./atomic_fs');
 const swapApi = require('./swap_api');
 const tradingCosigner = require('./trading_account_cosigner');
 const { defaultBatchSettlerTestnet2: defaultBatchSettler } = require('./batch_settler_testnet2');
@@ -108,8 +109,8 @@ const TRADE_TIMESTAMPS_FILE = path.join(CLUSTER_DIR, 'trade_timestamps.json');
 const tradeTimestamps = new Map();
 
 try {
-  if (fs.existsSync(TRADE_TIMESTAMPS_FILE)) {
-    const raw = JSON.parse(fs.readFileSync(TRADE_TIMESTAMPS_FILE, 'utf8'));
+  const raw = readJsonWithBackupSync(TRADE_TIMESTAMPS_FILE, null);
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
     for (const [k, v] of Object.entries(raw)) {
       tradeTimestamps.set(k, v);
     }
@@ -126,7 +127,7 @@ function saveTradeTimestampsDebounced() {
       for (const [k, v] of tradeTimestamps.entries()) {
         obj[k] = v;
       }
-      fs.writeFileSync(TRADE_TIMESTAMPS_FILE, JSON.stringify(obj, null, 2));
+      atomicWriteJsonSync(TRADE_TIMESTAMPS_FILE, obj);
     } catch (_) {}
     timestampsDirty = false;
   }, 2000);
@@ -1105,19 +1106,19 @@ const server = http.createServer((req, res) => {
       lastUpdate: Date.now()
     };
 
-    if (fs.existsSync(mmStatusFile)) {
-      try {
-        const fileContent = JSON.parse(fs.readFileSync(mmStatusFile, 'utf8'));
+    try {
+      const fileContent = readJsonWithBackupSync(mmStatusFile, null);
+      if (fileContent && typeof fileContent === 'object') {
         statusData = { ...statusData, ...fileContent, running, pid: running ? pid : null };
-      } catch (_) {}
-    }
+      }
+    } catch (_) {}
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(statusData));
     return;
   }
 
-  // SiriusCLOB DEX Endpoint: Start Market Maker Bot (Admin Protected)
+  // SiriusCLOB DEX Endpoint: Start Market Maker Bot (Admin Protected; disabled on Mainnet)
   if (pathname === '/api/clob/mm/start' && req.method === 'POST') {
     parseJsonBody(req)
       .then(async (body) => {
@@ -1126,6 +1127,20 @@ const server = http.createServer((req, res) => {
           if (!auth.authorized) {
             res.writeHead(401, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, success: false, error: auth.error }));
+            return;
+          }
+          if (
+            testnet2Config.NETWORK_TYPE === 184 ||
+            String(testnet2Config.NETWORK_ENV || '').toLowerCase() === 'mainnet' ||
+            String(process.env.SIRIUS_NETWORK || '').trim().toLowerCase() === 'mainnet' ||
+            Number(process.env.SIRIUS_NETWORK_TYPE) === 184
+          ) {
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              ok: false,
+              success: false,
+              error: 'Forbidden on Sirius Mainnet: Synthetic/demo market maker (scripts/clob_market_maker.js) is disabled on Mainnet. Use scripts/clob_mainnet_market_maker.js with a funded 2-of-2 Smart Trading Account.'
+            }));
             return;
           }
           const mmPidFile = path.join(CLUSTER_DIR, 'mm.pid');
@@ -1184,15 +1199,15 @@ const server = http.createServer((req, res) => {
             try { fs.unlinkSync(mmPidFile); } catch (_) {}
           }
           const mmStatusFile = path.join(CLUSTER_DIR, 'mm_status.json');
-          if (fs.existsSync(mmStatusFile)) {
-            try {
-              const cur = JSON.parse(fs.readFileSync(mmStatusFile, 'utf8'));
+          try {
+            const cur = readJsonWithBackupSync(mmStatusFile, null);
+            if (cur && typeof cur === 'object') {
               cur.running = false;
               cur.pid = null;
               cur.lastAction = 'Market Maker stopped by user';
-              fs.writeFileSync(mmStatusFile, JSON.stringify(cur, null, 2));
-            } catch (_) {}
-          }
+              atomicWriteJsonSync(mmStatusFile, cur);
+            }
+          } catch (_) {}
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, success: true, message: 'Market Maker bot stopped', output: stoppedPid ? `Market Maker (PID ${stoppedPid}) stopped.` : 'Market Maker was not running.' }));
         } catch (err) {
@@ -1208,7 +1223,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // SiriusCLOB DEX Endpoint: Execute 1 Step (Single Trading Round, Admin Protected)
+  // SiriusCLOB DEX Endpoint: Execute 1 Step (Single Trading Round, Admin Protected; disabled on Mainnet)
   if (pathname === '/api/clob/mm/step' && req.method === 'POST') {
     parseJsonBody(req)
       .then(async (body) => {
@@ -1217,6 +1232,20 @@ const server = http.createServer((req, res) => {
           if (!auth.authorized) {
             res.writeHead(401, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, success: false, error: auth.error }));
+            return;
+          }
+          if (
+            testnet2Config.NETWORK_TYPE === 184 ||
+            String(testnet2Config.NETWORK_ENV || '').toLowerCase() === 'mainnet' ||
+            String(process.env.SIRIUS_NETWORK || '').trim().toLowerCase() === 'mainnet' ||
+            Number(process.env.SIRIUS_NETWORK_TYPE) === 184
+          ) {
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              ok: false,
+              success: false,
+              error: 'Forbidden on Sirius Mainnet: Synthetic/demo market maker (scripts/clob_market_maker.js) is disabled on Mainnet. Use scripts/clob_mainnet_market_maker.js with a funded 2-of-2 Smart Trading Account.'
+            }));
             return;
           }
           execFile('node', [path.join(ROOT_DIR, 'scripts/clob_market_maker.js'), '--step'], { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {

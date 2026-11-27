@@ -636,6 +636,230 @@ async function main() {
     }
   });
 
+  await test('Pre-Mainnet Batch 2 (#2): atomicWriteJsonSync crash-safe write & .bak recovery from corrupt JSON', () => {
+    const { atomicWriteJsonSync, readJsonWithBackupSync } = require('../dashboard/atomic_fs');
+    const jsonPath = path.join(tmpDir, 'atomic_state.json');
+    atomicWriteJsonSync(jsonPath, { version: 1, orders: [101] });
+    atomicWriteJsonSync(jsonPath, { version: 2, orders: [101, 102] });
+    assert.ok(fs.existsSync(`${jsonPath}.bak`), 'Second atomic write must preserve previous valid state in .bak');
+    assert.deepStrictEqual(readJsonWithBackupSync(jsonPath, null), { version: 2, orders: [101, 102] });
+
+    // Simulate power-loss truncation/corruption of primary file
+    fs.writeFileSync(jsonPath, '{"version": 2, "orders": [101,', 'utf8');
+    const recovered = readJsonWithBackupSync(jsonPath, null);
+    assert.deepStrictEqual(recovered, { version: 1, orders: [101] }, 'Corrupt primary JSON must auto-recover from .bak');
+    // Primary file must also be healed on disk
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(jsonPath, 'utf8')), { version: 1, orders: [101] });
+  });
+
+  await test('Pre-Mainnet Batch 2 (#5 & #8): SQLite used_nonces replay protection & COD persistence across DB restart', () => {
+    const { Account } = require('tsjs-xpx-chain-sdk');
+    const clobDb = require('../dashboard/clob_db');
+    const trader = Account.generateNewAccount(168);
+    const pub = trader.publicKey.toLowerCase();
+    const t0 = Date.now();
+    const nonceVal = `${t0}001`;
+    const expiryMs = t0 + 60_000;
+
+    // #8: First consume succeeds; immediate replay fails; oversized nonce & empty pubkey rejected
+    const first = clobDb.consumeReplayNonceAtomic(pub, nonceVal, expiryMs, t0);
+    assert.strictEqual(first.accepted, true, 'Fresh nonce must be accepted');
+    const replay = clobDb.consumeReplayNonceAtomic(pub, nonceVal, expiryMs, t0 + 100);
+    assert.strictEqual(replay.accepted, false, 'Duplicate nonce MUST be rejected');
+    assert.strictEqual(clobDb.consumeReplayNonceAtomic('', nonceVal, expiryMs, t0).accepted, false, 'Empty callerKey must be rejected');
+    assert.strictEqual(clobDb.consumeReplayNonceAtomic(pub, '9'.repeat(200), expiryMs, t0).accepted, false, 'Oversized nonce (>128 chars) must be rejected');
+
+    // #5: Register COD heartbeat in SQLite
+    const reg = clobDb.upsertCodRegistrationAtomic(pub, { timeoutMs: 5000, markets: ['XPX/USDT', 'XPX/BNB'], now: t0 });
+    assert.strictEqual(reg.heartbeatCount, 1);
+
+    // Simulate full server restart (close & reopen SQLite)
+    clobDb.closeDb();
+    const replayAfterRestart = clobDb.consumeReplayNonceAtomic(pub, nonceVal, expiryMs, t0 + 500);
+    assert.strictEqual(replayAfterRestart.accepted, false, 'Replay nonce MUST remain rejected across server restart');
+
+    // Expired nonce pruning must clean old rows and allow re-use once pruned
+    const pruned = clobDb.pruneExpiredNonces(expiryMs + 1000);
+    assert.ok(pruned >= 1, 'Expired nonce must be pruned');
+    const afterPrune = clobDb.consumeReplayNonceAtomic(pub, nonceVal, expiryMs + 60_000, expiryMs + 1001);
+    assert.strictEqual(afterPrune.accepted, true, 'Pruned expired nonce slot can be reused cleanly');
+
+    // COD registration must persist across restart and claimExpiredCodRegistrations must be atomic/one-shot
+    const persistedCod = clobDb.getCodRegistration(pub);
+    assert.ok(persistedCod && persistedCod.timeoutMs === 5000, 'COD registration MUST persist in SQLite across restart');
+    assert.strictEqual(clobDb.claimExpiredCodRegistrations(t0 + 2000).length, 0, 'Active COD must not be claimed early');
+    const claimed = clobDb.claimExpiredCodRegistrations(t0 + 6000);
+    assert.strictEqual(claimed.length, 1, 'Expired COD registration must be claimed once');
+    assert.strictEqual(claimed[0].publicKey, pub);
+    assert.strictEqual(clobDb.claimExpiredCodRegistrations(t0 + 6001).length, 0, 'Claimed COD must not fire twice');
+  });
+
+  await test('Pre-Mainnet Batch 2 (#1 & #6): Mainnet MM hard blocks, Mainnet MM quoting & zero-trust cosign verifier, and frontend guards', () => {
+    const { spawnSync } = require('child_process');
+    const {
+      Account,
+      AggregateTransaction,
+      TransferTransaction,
+      Deadline,
+      Mosaic,
+      MosaicId,
+      UInt64,
+      PlainMessage,
+    } = require('tsjs-xpx-chain-sdk');
+    const mm = require('./clob_mainnet_market_maker');
+
+    // 1a. Synthetic clob_market_maker.js MUST refuse to start on Mainnet
+    const mmRun = spawnSync(process.execPath, [path.join(__dirname, 'clob_market_maker.js'), '--step'], {
+      env: { ...process.env, SIRIUS_NETWORK: 'mainnet', SIRIUS_NETWORK_TYPE: '184' },
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    assert.notStrictEqual(mmRun.status, 0, 'Synthetic clob_market_maker.js MUST exit non-zero on Mainnet');
+    assert.ok((mmRun.stderr || '').includes('Refusing to start synthetic demo Market Maker'), 'Expected explicit Mainnet refusal message');
+
+    // 1b. start.sh and server.js must contain Mainnet MM disable guards
+    const startSh = fs.readFileSync(path.join(__dirname, '../start.sh'), 'utf8');
+    assert.ok(startSh.includes('Synthetic demo Market Maker (scripts/clob_market_maker.js) is disabled'), 'start.sh must disable synthetic MM on Mainnet');
+    const serverSrc = fs.readFileSync(path.join(__dirname, '../dashboard/server.js'), 'utf8');
+    assert.ok(serverSrc.includes('Forbidden on Sirius Mainnet: Synthetic/demo market maker'), 'server.js must return 403 for /api/clob/mm/start & /step on Mainnet');
+
+    // 1c. Oracle validator & fixed-point ladder quoting invariants
+    const now = Date.now();
+    assert.strictEqual(mm.validateOracleData({ ok: true, isFallback: true, stale: false, priceUsdt: 0.0001, priceBnb: 0.00000015, timestamp: now }, { now }).ok, false, 'Must reject fallback oracle');
+    assert.strictEqual(mm.validateOracleData({ ok: true, isFallback: false, stale: false, priceUsdt: 0.0001, priceBnb: 0.00000015, timestamp: now - 120_000 }, { now, maxAgeMs: 60_000 }).ok, false, 'Must reject stale oracle');
+    assert.strictEqual(mm.validateOracleData({ ok: true, isFallback: false, stale: false, priceUsdt: 0.0002, priceBnb: 0.00000015, timestamp: now }, { now, prevMidByPair: { 'XPX/USDT': 0.0001 }, maxJumpRatio: 0.2 }).ok, false, 'Must reject >20% spike');
+
+    const ladder = mm.computeLadderQuotes({
+      pair: 'XPX/USDT',
+      midPrice: 0.0001,
+      spreadBps: 100,
+      levelStepBps: 50,
+      levels: 3,
+      orderSizeXpx: 10,
+      availableBaseAtomic: 100_000_000n,
+      availableQuoteAtomic: 50_000_000n,
+      reserveBaseAtomic: 5_000_000n,
+      maxInventoryShare: 0.60,
+    });
+    assert.strictEqual(ladder.ok, true);
+    assert.strictEqual(ladder.bids.length, 3);
+    assert.strictEqual(ladder.asks.length, 3);
+    assert.ok(ladder.bids[0].priceTicks < ladder.asks[0].priceTicks, 'Best bid must be strictly below best ask');
+
+    // 1d. Zero-trust settlement verifier: valid signed SELL passes; tampered outflow or personal wallet spend is blocked!
+    const netType = 168;
+    const genHash = '56D112C98F7A7E34D1AEDC4BD01BC06CA2276DD546A93E36690B785E82439CA9';
+    const botOwner = Account.generateNewAccount(netType);
+    const botTrading = Account.generateNewAccount(netType);
+    const cpTrading = Account.generateNewAccount(netType);
+    const xpxHex = '13BFC518E40549D7';
+    const usdtHex = '4430AEFEF7E15D0C';
+    const nonce = now * 1000 + 7;
+    const expiry = now + 60_000;
+    const orderMsg = `${netType}:SiriusCLOB-v1:ORDER:XPX/USDT:sell:PostOnly:0.000100:10:${nonce}:${expiry}`;
+    const orderSig = botOwner.signData(orderMsg);
+
+    const buildSettlement = (outXpxAmt, inUsdtAmt, signerAcc = botTrading) => {
+      const t1 = TransferTransaction.create(
+        Deadline.create(),
+        cpTrading.address,
+        [new Mosaic(new MosaicId(xpxHex), UInt64.fromUint(outXpxAmt))],
+        PlainMessage.create('fill'),
+        netType
+      ).toAggregateV1(signerAcc.publicAccount);
+      const t2 = TransferTransaction.create(
+        Deadline.create(),
+        botTrading.address,
+        [new Mosaic(new MosaicId(usdtHex), UInt64.fromUint(inUsdtAmt))],
+        PlainMessage.create('fill'),
+        netType
+      ).toAggregateV1(cpTrading.publicAccount);
+      const agg = AggregateTransaction.createCompleteV1(Deadline.create(), [t1, t2], netType, [], UInt64.fromUint(250000));
+      const signed = cpTrading.sign(agg, genHash);
+      return {
+        settlementId: `SET_MM_${outXpxAmt}_${inUsdtAmt}`,
+        aggregatePayload: signed.payload,
+        requiredCosigners: [botOwner.publicKey.toUpperCase()],
+        orderContext: {
+          participantContexts: {
+            [botOwner.publicKey.toLowerCase()]: {
+              publicKey: botOwner.publicKey.toLowerCase(),
+              pair: 'XPX/USDT',
+              side: 'sell',
+              type: 'PostOnly',
+              price: '0.000100',
+              amount: '10',
+              nonce,
+              expiry,
+              signature: orderSig,
+            },
+          },
+        },
+      };
+    };
+
+    const cumMap = new Map();
+    const validSettlement = buildSettlement(10_000_000, 1000);
+    const goodCheck = mm.verifySettlementForBot(validSettlement, {
+      networkType: netType,
+      ownerPublicKey: botOwner.publicKey,
+      tradingPublicKey: botTrading.publicKey,
+      tradingAddress: botTrading.address.plain(),
+      mosaicIds: { XPX: xpxHex, USDT: usdtHex, BNB: '3CC1D3CE7447B6F9' },
+      cumulativeOrderOutflows: cumMap,
+    });
+    assert.strictEqual(goodCheck.ok, true, `Valid settlement must pass verification (got ${goodCheck.error})`);
+    // Verify CosignatureTransaction.signTransactionPayload succeeds in Node SDK
+    const { CosignatureTransaction } = require('tsjs-xpx-chain-sdk');
+    const cosig = CosignatureTransaction.signTransactionPayload(botOwner, validSettlement.aggregatePayload, genHash);
+    assert.strictEqual(cosig.signer.toUpperCase(), botOwner.publicKey.toUpperCase());
+    assert.strictEqual(cosig.signature.length, 128);
+
+    // Malicious gateway trying to drain 20 XPX on a 10 XPX signed order -> BLOCKED
+    const overDrainCheck = mm.verifySettlementForBot(buildSettlement(20_000_000, 2000), {
+      networkType: netType,
+      ownerPublicKey: botOwner.publicKey,
+      tradingPublicKey: botTrading.publicKey,
+      tradingAddress: botTrading.address.plain(),
+      mosaicIds: { XPX: xpxHex, USDT: usdtHex, BNB: '3CC1D3CE7447B6F9' },
+      cumulativeOrderOutflows: cumMap,
+    });
+    assert.strictEqual(overDrainCheck.ok, false, 'Over-drain settlement MUST be blocked');
+
+    // Malicious gateway trying to spend directly from owner Main Wallet -> BLOCKED
+    const mainWalletDrainCheck = mm.verifySettlementForBot(buildSettlement(10_000_000, 1000, botOwner), {
+      networkType: netType,
+      ownerPublicKey: botOwner.publicKey,
+      tradingPublicKey: botTrading.publicKey,
+      tradingAddress: botTrading.address.plain(),
+      mosaicIds: { XPX: xpxHex, USDT: usdtHex, BNB: '3CC1D3CE7447B6F9' },
+      cumulativeOrderOutflows: cumMap,
+    });
+    assert.strictEqual(mainWalletDrainCheck.ok, false, 'Direct spend from Main Wallet MUST be blocked');
+
+    // Misconfigured identical ownerPublicKey === tradingPublicKey -> BLOCKED
+    const sameKeyCheck = mm.verifySettlementForBot(validSettlement, {
+      networkType: netType,
+      ownerPublicKey: botOwner.publicKey,
+      tradingPublicKey: botOwner.publicKey,
+      tradingAddress: botOwner.address.plain(),
+      mosaicIds: { XPX: xpxHex, USDT: usdtHex, BNB: '3CC1D3CE7447B6F9' },
+      cumulativeOrderOutflows: cumMap,
+    });
+    assert.strictEqual(sameKeyCheck.ok, false, 'Identical ownerPublicKey and tradingPublicKey MUST be blocked');
+
+    // #6: Frontend fail-closed clobApiBase guards across all handlers
+    const viewPath = '/Users/igorgoc/Projects/web-wallet-exchange/src/modules/services/submodule/clob/views/ViewClobExchange.vue';
+    const modalPath = '/Users/igorgoc/Projects/web-wallet-exchange/src/modules/services/submodule/clob/components/TradingAccountSetupModal.vue';
+    if (fs.existsSync(viewPath) && fs.existsSync(modalPath)) {
+      const viewSrc = fs.readFileSync(viewPath, 'utf8');
+      const modalSrc = fs.readFileSync(modalPath, 'utf8');
+      const guardMatches = viewSrc.match(/if\s*\(\s*!clobApiBase\.value\s*\)/g) || [];
+      assert.ok(guardMatches.length >= 10, `ViewClobExchange.vue must guard all CLOB handlers with if (!clobApiBase.value), found ${guardMatches.length}`);
+      assert.ok(modalSrc.includes('if (!props.clobApiBase)'), 'TradingAccountSetupModal.vue must guard against empty props.clobApiBase');
+    }
+  });
+
   try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
 
   console.log(`\n🎉 Red-Team 5-Pass Hardening Suite: ${passed} tests passed.\n`);

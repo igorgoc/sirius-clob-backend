@@ -7,6 +7,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { atomicWriteJsonSync, readJsonWithBackupSync } = require('./atomic_fs');
 
 if (!crypto.webcrypto) {
   crypto.webcrypto = {
@@ -191,17 +192,18 @@ async function withAccountLock(accountKeyHex, fn) {
 }
 
 function loadActiveOrders() {
-  if (fs.existsSync(ACTIVE_ORDERS_FILE)) {
-    try {
-      const data = JSON.parse(fs.readFileSync(ACTIVE_ORDERS_FILE, 'utf8'));
-      if (Array.isArray(data)) {
-        for (const o of data) {
-          if (o.status !== 'Filled' && o.remainingAmountAtomic !== '0') {
-            activeOrders.set(o.id || o.orderId, o);
-          }
-        }
+  const data = readJsonWithBackupSync(ACTIVE_ORDERS_FILE, null);
+  if (Array.isArray(data)) {
+    for (const o of data) {
+      if (!o || typeof o !== 'object') continue;
+      const oid = o.id || o.orderId;
+      if (!oid) continue;
+      const remStr = String(o.remainingAmountAtomic ?? '').trim();
+      const isZeroRem = remStr === '0' || (remStr !== '' && Number(remStr) === 0);
+      if (o.status !== 'Filled' && !isZeroRem) {
+        activeOrders.set(oid, o);
       }
-    } catch (_) {}
+    }
   }
   if (typeof reconcileActiveOrdersWithTrades === 'function') {
     reconcileActiveOrdersWithTrades();
@@ -211,7 +213,7 @@ function loadActiveOrders() {
 function saveActiveOrders() {
   try {
     const list = Array.from(activeOrders.values());
-    fs.writeFileSync(ACTIVE_ORDERS_FILE, JSON.stringify(list, null, 2));
+    atomicWriteJsonSync(ACTIVE_ORDERS_FILE, list, { backup: true });
   } catch (_) {}
 }
 
@@ -396,53 +398,35 @@ function reconcileActiveOrdersWithTrades() {
 
 loadActiveOrders();
 
-// Persistent nonce replay registry: Map<pubKeyHex, Map<nonce, expiryTimestamp>>
-const usedNonces = new Map();
-
+// Persistent nonce replay registry backed by indexed SQLite `used_nonces` table (atomic BEGIN IMMEDIATE)
 function loadUsedNonces() {
-  usedNonces.clear();
+  // One-time migration of any unexpired legacy used_nonces.json entries into SQLite
   if (fs.existsSync(NONCES_FILE)) {
     try {
       const data = JSON.parse(fs.readFileSync(NONCES_FILE, 'utf8'));
-      const now = Date.now();
-      for (const [key, noncesObj] of Object.entries(data)) {
-        const nonceMap = new Map();
-        for (const [nStr, exp] of Object.entries(noncesObj)) {
-          if (Number(exp) > now) {
-            nonceMap.set(String(nStr), Number(exp));
-          }
-        }
-        if (nonceMap.size > 0) {
-          usedNonces.set(key.toLowerCase(), nonceMap);
-        }
-      }
-    } catch (_) {}
-  }
-}
-
-function saveUsedNonces() {
-  try {
-    const now = Date.now();
-    const obj = {};
-    for (const [key, nonceMap] of usedNonces.entries()) {
-      for (const [nStr, exp] of nonceMap.entries()) {
-        if (exp <= now) nonceMap.delete(nStr);
-      }
-      if (nonceMap.size === 0) {
-        usedNonces.delete(key);
+      if (data && typeof data === 'object' && !Array.isArray(data)) {
+        clobDb.importLegacyUsedNonces(data, Date.now());
       } else {
-        obj[key] = Object.fromEntries(nonceMap.entries());
+        console.warn('[NonceRegistry] ⚠️ Legacy used_nonces.json is not a valid JSON object; skipping migration');
       }
+    } catch (err) {
+      console.warn(`[NonceRegistry] ⚠️ Failed to migrate legacy used_nonces.json: ${err.message}`);
     }
-    const tmpFile = `${NONCES_FILE}.tmp.${process.pid}`;
-    fs.writeFileSync(tmpFile, JSON.stringify(obj, null, 2));
-    fs.renameSync(tmpFile, NONCES_FILE);
-  } catch (_) {}
+  }
+  try {
+    clobDb.pruneExpiredNonces(Date.now());
+  } catch (err) {
+    console.warn(`[NonceRegistry] ⚠️ Failed to prune expired nonces on boot: ${err.message}`);
+  }
 }
 
 function checkAndRecordNonce(pubKeyHex, nonce, expiry) {
   if (nonce === undefined || nonce === null || nonce === '') {
     throw new Error('Missing nonce in request');
+  }
+  const nonceStr = String(nonce).trim();
+  if (!nonceStr || nonceStr.length > 128) {
+    throw new Error('Invalid nonce: must be non-empty and at most 128 characters');
   }
   if (!expiry) {
     throw new Error('Missing expiry timestamp in request');
@@ -450,30 +434,20 @@ function checkAndRecordNonce(pubKeyHex, nonce, expiry) {
   const expiryNum = Number(expiry);
   const now = Date.now();
   const MAX_EXPIRY_WINDOW_MS = 60 * 60 * 1000; // Max 1 hour into the future
-  if (isNaN(expiryNum) || expiryNum <= now) {
+  if (!Number.isFinite(expiryNum) || expiryNum <= now) {
     throw new Error(`Request has expired (expiry=${expiryNum}, now=${now})`);
   }
   if (expiryNum > now + MAX_EXPIRY_WINDOW_MS) {
     throw new Error(`Expiry timestamp is too far in the future (maximum window is 1 hour)`);
   }
-  const key = pubKeyHex.toLowerCase();
-  let userNonces = usedNonces.get(key);
-  if (!userNonces) {
-    userNonces = new Map();
-    usedNonces.set(key, userNonces);
-  } else {
-    for (const [nStr, exp] of userNonces.entries()) {
-      if (exp <= now) {
-        userNonces.delete(nStr);
-      }
-    }
+  const key = String(pubKeyHex || '').trim().toLowerCase();
+  if (!key || !/^[0-9a-f]{64}$/.test(key)) {
+    throw new Error('Invalid public key for nonce replay protection');
   }
-  const nonceStr = String(nonce);
-  if (userNonces.has(nonceStr)) {
+  const res = clobDb.consumeReplayNonceAtomic(key, nonceStr, expiryNum, now);
+  if (!res || !res.accepted) {
     throw new Error(`Nonce ${nonce} already used (replay rejected)`);
   }
-  userNonces.set(nonceStr, expiryNum);
-  saveUsedNonces();
 }
 
 loadUsedNonces();
@@ -517,7 +491,7 @@ function loadProcessedDeposits() {
 function saveProcessedDeposits() {
   try {
     const obj = Object.fromEntries(processedDeposits.entries());
-    fs.writeFileSync(PROCESSED_DEPOSITS_FILE, JSON.stringify(obj, null, 2));
+    atomicWriteJsonSync(PROCESSED_DEPOSITS_FILE, obj, { backup: true });
   } catch (_) {}
 }
 
@@ -784,7 +758,7 @@ function saveWithdrawals() {
   } catch (_) {}
   try {
     const obj = Object.fromEntries(withdrawals.entries());
-    fs.writeFileSync(WITHDRAWALS_FILE, JSON.stringify(obj, null, 2));
+    atomicWriteJsonSync(WITHDRAWALS_FILE, obj, { backup: true });
   } catch (_) {}
 }
 
@@ -1350,23 +1324,19 @@ const exchangeCircuitBreaker = {
 };
 
 function loadCircuitBreakerState() {
-  if (fs.existsSync(CIRCUIT_BREAKER_FILE)) {
-    try {
-      const data = JSON.parse(fs.readFileSync(CIRCUIT_BREAKER_FILE, 'utf8'));
-      if (typeof data.tripped === 'boolean') {
-        exchangeCircuitBreaker.tripped = data.tripped;
-        exchangeCircuitBreaker.reason = data.reason || null;
-        exchangeCircuitBreaker.trippedAt = data.trippedAt || null;
-        exchangeCircuitBreaker.lastCheckedAt = data.lastCheckedAt || null;
-        exchangeCircuitBreaker.lastStateRootHash = data.lastStateRootHash || null;
-      }
-    } catch (_) {}
+  const data = readJsonWithBackupSync(CIRCUIT_BREAKER_FILE, null);
+  if (data && typeof data.tripped === 'boolean') {
+    exchangeCircuitBreaker.tripped = data.tripped;
+    exchangeCircuitBreaker.reason = data.reason || null;
+    exchangeCircuitBreaker.trippedAt = data.trippedAt || null;
+    exchangeCircuitBreaker.lastCheckedAt = data.lastCheckedAt || null;
+    exchangeCircuitBreaker.lastStateRootHash = data.lastStateRootHash || null;
   }
 }
 
 function saveCircuitBreakerState() {
   try {
-    fs.writeFileSync(CIRCUIT_BREAKER_FILE, JSON.stringify(exchangeCircuitBreaker, null, 2));
+    atomicWriteJsonSync(CIRCUIT_BREAKER_FILE, exchangeCircuitBreaker, { backup: true });
   } catch (_) {}
 }
 
@@ -2998,10 +2968,10 @@ function getMarketDepthSnapshot(marketKey = 'xpx_usdt') {
 }
 
 // =========================================================================
-// Cancel-on-Disconnect (COD) / Dead-Man's Switch System
+// Cancel-on-Disconnect (COD) / Dead-Man's Switch System (SQLite Persisted)
 // =========================================================================
-const codRegistry = new Map(); // callerKey -> { timeoutMs, lastHeartbeat, registeredAt, markets: [] }
 let codWatchdogInterval = null;
+let codWatchdogInFlight = false;
 
 function registerHeartbeat(req) {
   const callerKey = normalizeKey(req && (req.publicKey || req.callerPublicKey)).toLowerCase();
@@ -3023,17 +2993,7 @@ function registerHeartbeat(req) {
   const markets = Array.isArray(rawMarkets) ? rawMarkets : [String(rawMarkets)];
 
   const now = Date.now();
-  const existing = codRegistry.get(callerKey);
-  const entry = {
-    publicKey: callerKey,
-    timeoutMs,
-    lastHeartbeat: now,
-    registeredAt: existing ? existing.registeredAt : now,
-    markets,
-    heartbeatCount: (existing ? existing.heartbeatCount : 0) + 1,
-  };
-
-  codRegistry.set(callerKey, entry);
+  const entry = clobDb.upsertCodRegistrationAtomic(callerKey, { timeoutMs, markets, now });
   ensureCodWatchdogRunning();
 
   let monitoredOrders = 0;
@@ -3047,9 +3007,9 @@ function registerHeartbeat(req) {
     ok: true,
     active: true,
     publicKey: callerKey,
-    timeoutMs,
-    lastHeartbeat: now,
-    expiresAt: now + timeoutMs,
+    timeoutMs: entry.timeoutMs,
+    lastHeartbeat: entry.lastHeartbeat,
+    expiresAt: entry.lastHeartbeat + entry.timeoutMs,
     monitoredOrders,
     heartbeatCount: entry.heartbeatCount,
   };
@@ -3067,7 +3027,7 @@ function deregisterHeartbeat(req) {
   verifyEd25519Signature(callerKey, hbMsg, req.signature);
   checkAndRecordNonce(callerKey, req.nonce, req.expiry);
 
-  const deleted = codRegistry.delete(callerKey);
+  const deleted = clobDb.deleteCodRegistration(callerKey);
   return {
     ok: true,
     deregistered: deleted,
@@ -3077,12 +3037,12 @@ function deregisterHeartbeat(req) {
 
 function getHeartbeatStatus(publicKey) {
   const callerKey = normalizeKey(publicKey).toLowerCase();
-  const entry = codRegistry.get(callerKey);
+  const entry = clobDb.getCodRegistration(callerKey);
   if (!entry) {
     return { ok: true, active: false, publicKey: callerKey };
   }
   const now = Date.now();
-  const elapsed = now - entry.lastHeartbeat;
+  const elapsed = Math.max(0, now - entry.lastHeartbeat);
   const remaining = Math.max(0, entry.timeoutMs - elapsed);
   return {
     ok: true,
@@ -3100,6 +3060,7 @@ function getHeartbeatStatus(publicKey) {
 
 async function cancelAllOrdersInternal(callerKeyRaw, pair = 'XPX/USDT', reason = 'Internal') {
   const callerKey = normalizeKey(callerKeyRaw).toLowerCase();
+  const normPair = normalizePair(pair);
   return withAccountLock(callerKey, async () => {
     try {
       const isBnb = pair.toUpperCase().includes('BNB');
@@ -3117,6 +3078,7 @@ async function cancelAllOrdersInternal(callerKeyRaw, pair = 'XPX/USDT', reason =
         {
           parameters: cancelAllParams,
           callerKeyHex: callerKey,
+          marketLane: isBnb ? 'xpx_bnb' : 'xpx_usdt',
         }
       );
       const ret = results[0].returns;
@@ -3127,13 +3089,13 @@ async function cancelAllOrdersInternal(callerKeyRaw, pair = 'XPX/USDT', reason =
       syncGatewayCacheFromDrive(callerKey);
       let removedCount = 0;
       for (const [id, o] of activeOrders.entries()) {
-        if (o.callerKey && o.callerKey.toLowerCase() === callerKey) {
+        if (o.callerKey && o.callerKey.toLowerCase() === callerKey && normalizePair(o.pair) === normPair) {
           activeOrders.delete(id);
           removedCount++;
         }
       }
       saveActiveOrders();
-      console.log(`✅ [COD Watchdog] Cancelled ${removedCount} active orders for ${callerKey} (${reason})`);
+      console.log(`✅ [COD Watchdog] Cancelled ${removedCount} active orders for ${callerKey} on ${normPair} (${reason})`);
       return { ok: true, success: true, removedOrders: removedCount, reason };
     } catch (err) {
       console.error(`[COD CancelAll Error] Failed to cancel orders for ${callerKey}: ${err.message}`);
@@ -3142,27 +3104,45 @@ async function cancelAllOrdersInternal(callerKeyRaw, pair = 'XPX/USDT', reason =
   });
 }
 
-function ensureCodWatchdogRunning() {
-  if (codWatchdogInterval) return;
-  codWatchdogInterval = setInterval(async () => {
+async function runCodWatchdogTick() {
+  if (codWatchdogInFlight) return;
+  codWatchdogInFlight = true;
+  try {
     const now = Date.now();
-    for (const [callerKey, entry] of codRegistry.entries()) {
-      if (now - entry.lastHeartbeat > entry.timeoutMs) {
-        codRegistry.delete(callerKey);
-        const elapsed = now - entry.lastHeartbeat;
-        console.warn(`🚨 [COD Watchdog] Dead-Man's Switch triggered for ${callerKey}! Heartbeat timed out (${elapsed}ms > ${entry.timeoutMs}ms). Auto-cancelling open resting quotes.`);
-        for (const m of entry.markets) {
-          try {
-            await cancelAllOrdersInternal(callerKey, m, 'COD Heartbeat Timeout');
-          } catch (err) {
-            console.error(`[COD Watchdog] Error cancelling orders for ${callerKey} on ${m}: ${err.message}`);
-          }
+    const expiredEntries = clobDb.claimExpiredCodRegistrations(now);
+    for (const entry of expiredEntries) {
+      const elapsed = Math.max(0, now - entry.lastHeartbeat);
+      console.warn(
+        `🚨 [COD Watchdog] Dead-Man's Switch triggered for ${entry.publicKey}! ` +
+        `Heartbeat timed out (${elapsed}ms > ${entry.timeoutMs}ms). Auto-cancelling open resting quotes.`
+      );
+      for (const m of entry.markets) {
+        try {
+          await cancelAllOrdersInternal(entry.publicKey, m, 'COD Heartbeat Timeout');
+        } catch (err) {
+          console.error(`[COD Watchdog] Error cancelling orders for ${entry.publicKey} on ${m}: ${err.message}`);
         }
       }
     }
-  }, 500);
+  } catch (err) {
+    console.warn(`[COD Watchdog] Tick warning: ${err.message}`);
+  } finally {
+    codWatchdogInFlight = false;
+  }
+}
+
+function ensureCodWatchdogRunning() {
+  if (codWatchdogInterval) return;
+  codWatchdogInterval = setInterval(runCodWatchdogTick, 500);
   if (codWatchdogInterval.unref) codWatchdogInterval.unref();
 }
+
+// Auto-resume COD watchdog on boot if persisted SQLite registrations exist (catches heartbeats expired during downtime)
+try {
+  if (clobDb.getAllCodRegistrations().length > 0) {
+    ensureCodWatchdogRunning();
+  }
+} catch (_) {}
 
 // =========================================================================
 // Stale Order Auto-Expiry Sweeper & Internal Single-Order Cancellation
@@ -5753,9 +5733,7 @@ module.exports = {
   BNB_MOSAIC_ID,
   NONCES_FILE,
   loadUsedNonces,
-  saveUsedNonces,
   checkAndRecordNonce,
-  usedNonces,
   PROCESSED_DEPOSITS_FILE,
   recordDepositTx,
   processedDeposits,
@@ -5801,7 +5779,6 @@ module.exports = {
   deregisterHeartbeat,
   getHeartbeatStatus,
   cancelAllOrdersInternal,
-  codRegistry,
   DEFAULT_ORDER_TTL_MS,
   cancelSingleOrderInternal,
   sweepExpiredOrders,
