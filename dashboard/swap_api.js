@@ -39,6 +39,7 @@ const BSC_MAINNET_BRIDGE_READY = Boolean(
 );
 
 const ACTIVE_BSC_CHAIN_ID = IS_SIRIUS_MAINNET ? 56 : 97;
+const ACTIVE_BSC_NETWORK_LABEL = IS_SIRIUS_MAINNET ? 'BSC_MAINNET' : 'BSC_TESTNET';
 const BSC_TESTNET_USDT_CONTRACT = IS_SIRIUS_MAINNET
   ? String(process.env.BSC_MAINNET_USDT_CONTRACT || '').trim()
   : (process.env.BSC_TESTNET_USDT_CONTRACT || '0x337610d27c682E347C9cD60BD4b3b107C9d34dDd');
@@ -526,7 +527,7 @@ async function autoCreditTx(tx, blockNumber) {
     clobDb.saveBridgeSwapRecord({
       swapId,
       timestamp,
-      network: IS_SIRIUS_MAINNET ? 'BSC_MAINNET' : 'BSC_TESTNET',
+      network: ACTIVE_BSC_NETWORK_LABEL,
       txnHash: tx.hash,
       from: tx.from,
       recipient,
@@ -555,7 +556,7 @@ async function autoCreditTx(tx, blockNumber) {
     const record = {
       swapId,
       timestamp,
-      network: 'BSC_TESTNET',
+      network: ACTIVE_BSC_NETWORK_LABEL,
       txnHash: tx.hash,
       from: tx.from,
       recipient,
@@ -903,7 +904,7 @@ const swapApi = {
       clobDb.saveBridgeSwapRecord({
         swapId,
         timestamp,
-        network: txnInfo ? txnInfo.network : (IS_SIRIUS_MAINNET ? 'BSC_MAINNET' : 'BSC_TESTNET'),
+        network: txnInfo ? txnInfo.network : ACTIVE_BSC_NETWORK_LABEL,
         txnHash,
         from: onChainResult.from,
         recipient: targetRecipient,
@@ -1057,7 +1058,7 @@ const swapApi = {
     const record = {
       swapId,
       timestamp,
-      network: 'BSC_TESTNET',
+      network: ACTIVE_BSC_NETWORK_LABEL,
       txnHash: '0x' + Buffer.from(swapId).toString('hex'),
       recipient: targetAddress,
       amount: finalAmount,

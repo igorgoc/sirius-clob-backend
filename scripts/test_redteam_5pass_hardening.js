@@ -589,6 +589,51 @@ async function main() {
     assert.strictEqual(u2After.waitingForCounterparty, false);
     assert.strictEqual(u2After.signedCount, 2);
     assert.strictEqual(u2After.requiredCount, 2);
+    assert.ok(u1Before.expiresAtMs > u1Before.createdAt && u1Before.cosignTtlMs >= 60_000, 'Pending summary must expose expiresAtMs & cosignTtlMs');
+  });
+
+  await test('Phase 1 Mainnet Polish: SQLite persistence of defaulter strikes & rebuild meta across DB reopen, swap_api labels & clobConfig fail-closed', () => {
+    const { Account } = require('tsjs-xpx-chain-sdk');
+    const clobDb = require('../dashboard/clob_db');
+    const cosigner = require('../dashboard/trading_account_cosigner');
+    const defaulter = Account.generateNewAccount(168);
+    const t0 = Date.now();
+    const s1 = cosigner.recordCosignDefaulterStrike(defaulter.publicKey, t0);
+    assert.strictEqual(s1.strikes, 1);
+    const s2 = cosigner.recordCosignDefaulterStrike(defaulter.publicKey, t0 + 1000);
+    assert.strictEqual(s2.strikes, 2);
+    assert.ok(s2.cooldownUntil > s1.cooldownUntil, 'Escalated strike 2 must extend cooldown');
+
+    const sid = `SET_REBUILD_PERSIST_${t0}`;
+    clobDb.incrementSettlementRebuildMeta(sid, t0);
+    clobDb.incrementSettlementRebuildMeta(sid, t0 + 1000);
+
+    // Simulate full server restart: close SQLite and reopen!
+    clobDb.closeDb();
+    const cdAfterRestart = cosigner.checkCosignDefaulterCooldown(defaulter.publicKey, t0 + 2000);
+    assert.strictEqual(cdAfterRestart.restricted, true, 'Defaulter cooldown MUST persist in SQLite across restart');
+    assert.strictEqual(cdAfterRestart.strikes, 2);
+    const metaAfterRestart = clobDb.getSettlementRebuildMeta(sid);
+    assert.strictEqual(metaAfterRestart.count, 2, 'Settlement rebuild counter MUST persist in SQLite across restart');
+    clobDb.deleteSettlementRebuildMeta(sid);
+    assert.strictEqual(clobDb.getSettlementRebuildMeta(sid).count, 0);
+
+    // Strike decay after >24h forward time
+    const sDecayed = cosigner.recordCosignDefaulterStrike(defaulter.publicKey, t0 + 25 * 60 * 60 * 1000);
+    assert.strictEqual(sDecayed.strikes, 1, 'Strikes should decay back to 1 after >24h');
+
+    // swap_api.js must never hardcode network: 'BSC_TESTNET' in records
+    const swapSrc = fs.readFileSync(path.join(__dirname, '../dashboard/swap_api.js'), 'utf8');
+    assert.ok(swapSrc.includes('ACTIVE_BSC_NETWORK_LABEL'), 'swap_api.js must use ACTIVE_BSC_NETWORK_LABEL');
+    assert.strictEqual(/network:\s*'BSC_TESTNET'/.test(swapSrc), false, 'swap_api.js must not hardcode network: BSC_TESTNET');
+
+    // Frontend clobConfig.ts Mainnet fail-closed guard
+    const cfgPath = '/Users/igorgoc/Projects/web-wallet-exchange/src/modules/services/submodule/clob/clobConfig.ts';
+    if (fs.existsSync(cfgPath)) {
+      const cfgSrc = fs.readFileSync(cfgPath, 'utf8');
+      assert.ok(cfgSrc.includes('VITE_CLOB_MAINNET_API_URL') && cfgSrc.includes('requireHttps'), 'clobConfig.ts must enforce Mainnet HTTPS env URL');
+      assert.ok(cfgSrc.includes('formatSettlementCountdown'), 'clobConfig.ts must export formatSettlementCountdown');
+    }
   });
 
   try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}

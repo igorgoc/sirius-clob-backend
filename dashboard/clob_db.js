@@ -175,6 +175,21 @@ function getDb(customPath = null) {
       updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_trading_settlements_owner ON trading_settlements(owner_public_key, status);
+
+    CREATE TABLE IF NOT EXISTS cosign_defaulter_penalties (
+      owner_public_key TEXT PRIMARY KEY,
+      strikes INTEGER NOT NULL DEFAULT 0 CHECK(strikes >= 0),
+      cooldown_until INTEGER NOT NULL DEFAULT 0,
+      last_default_at INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS settlement_rebuild_meta (
+      settlement_id TEXT PRIMARY KEY,
+      rebuild_count INTEGER NOT NULL DEFAULT 0 CHECK(rebuild_count >= 0),
+      last_rebuilt_at INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL
+    );
   `);
 
   try {
@@ -1206,6 +1221,118 @@ function updateTradingSettlementPayload(settlementId, { txHash, aggregatePayload
   return getTradingSettlement(settlementId);
 }
 
+function getCosignDefaulterPenalty(ownerPublicKey) {
+  const db = getDb();
+  const key = String(ownerPublicKey || '').trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(key)) return null;
+  const row = db.prepare(
+    'SELECT owner_public_key, strikes, cooldown_until, last_default_at, updated_at FROM cosign_defaulter_penalties WHERE owner_public_key = ?'
+  ).get(key);
+  if (!row) return null;
+  return {
+    ownerPublicKey: row.owner_public_key,
+    strikes: Math.max(0, Math.trunc(Number(row.strikes) || 0)),
+    cooldownUntil: Math.max(0, Math.trunc(Number(row.cooldown_until) || 0)),
+    lastDefaultAt: Math.max(0, Math.trunc(Number(row.last_default_at) || 0)),
+    updatedAt: Math.max(0, Math.trunc(Number(row.updated_at) || 0)),
+  };
+}
+
+function recordCosignDefaulterStrikeAtomic(
+  ownerPublicKey,
+  {
+    now = Date.now(),
+    decayMs = 24 * 60 * 60 * 1000,
+    baseCooldownMs = 5 * 60 * 1000,
+    maxCooldownMs = 60 * 60 * 1000,
+    maxStrikes = 100,
+  } = {}
+) {
+  const db = getDb();
+  const key = String(ownerPublicKey || '').trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(key)) return null;
+  const safeNow = Number.isFinite(Number(now)) && Number(now) > 0 ? Math.trunc(Number(now)) : Date.now();
+  const safeBase = Math.max(0, Math.trunc(Number(baseCooldownMs) || 0));
+  const safeMaxCd = Math.max(safeBase, Math.trunc(Number(maxCooldownMs) || safeBase));
+  const safeDecay = Math.max(1000, Math.trunc(Number(decayMs) || 24 * 60 * 60 * 1000));
+  const safeMaxStrikes = Math.max(1, Math.trunc(Number(maxStrikes) || 100));
+
+  const tx = db.transaction(() => {
+    const row = db.prepare(
+      'SELECT strikes, cooldown_until, last_default_at FROM cosign_defaulter_penalties WHERE owner_public_key = ?'
+    ).get(key);
+    const prevStrikes = Math.max(0, Math.trunc(Number(row && row.strikes) || 0));
+    const prevLast = Math.max(0, Math.trunc(Number(row && row.last_default_at) || 0));
+    const prevCooldownUntil = Math.max(0, Math.trunc(Number(row && row.cooldown_until) || 0));
+
+    // Decay strikes only if > decayMs elapsed in forward time (immune to negative clock skew)
+    const decayedStrikes = prevLast > 0 && safeNow > prevLast && (safeNow - prevLast) > safeDecay ? 0 : prevStrikes;
+    const strikes = Math.min(safeMaxStrikes, decayedStrikes + 1);
+    const mult = strikes === 1 ? 1 : (strikes === 2 ? 3 : 12);
+    const cooldownMs = Math.min(safeMaxCd, safeBase * mult);
+    // Never shorten an active cooldown if clock skew occurs
+    const cooldownUntil = Math.max(prevCooldownUntil, safeNow + cooldownMs);
+
+    db.prepare(`
+      INSERT INTO cosign_defaulter_penalties (owner_public_key, strikes, cooldown_until, last_default_at, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(owner_public_key) DO UPDATE SET
+        strikes = excluded.strikes,
+        cooldown_until = excluded.cooldown_until,
+        last_default_at = excluded.last_default_at,
+        updated_at = excluded.updated_at
+    `).run(key, strikes, cooldownUntil, safeNow, safeNow);
+
+    return { strikes, cooldownUntil, lastDefaultAt: safeNow };
+  });
+
+  return tx.immediate();
+}
+
+function getSettlementRebuildMeta(settlementId) {
+  const db = getDb();
+  const id = String(settlementId || '').trim();
+  if (!id) return { count: 0, lastRebuiltAt: 0 };
+  const row = db.prepare(
+    'SELECT rebuild_count, last_rebuilt_at FROM settlement_rebuild_meta WHERE settlement_id = ?'
+  ).get(id);
+  if (!row) return { count: 0, lastRebuiltAt: 0 };
+  return {
+    count: Math.max(0, Math.trunc(Number(row.rebuild_count) || 0)),
+    lastRebuiltAt: Math.max(0, Math.trunc(Number(row.last_rebuilt_at) || 0)),
+  };
+}
+
+function incrementSettlementRebuildMeta(settlementId, now = Date.now()) {
+  const db = getDb();
+  const id = String(settlementId || '').trim();
+  if (!id) return { count: 0, lastRebuiltAt: 0 };
+  const safeNow = Number.isFinite(Number(now)) && Number(now) > 0 ? Math.trunc(Number(now)) : Date.now();
+  const tx = db.transaction(() => {
+    const row = db.prepare(
+      'SELECT rebuild_count FROM settlement_rebuild_meta WHERE settlement_id = ?'
+    ).get(id);
+    const nextCount = Math.max(0, Math.trunc(Number(row && row.rebuild_count) || 0)) + 1;
+    db.prepare(`
+      INSERT INTO settlement_rebuild_meta (settlement_id, rebuild_count, last_rebuilt_at, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(settlement_id) DO UPDATE SET
+        rebuild_count = excluded.rebuild_count,
+        last_rebuilt_at = excluded.last_rebuilt_at,
+        updated_at = excluded.updated_at
+    `).run(id, nextCount, safeNow, safeNow);
+    return { count: nextCount, lastRebuiltAt: safeNow };
+  });
+  return tx.immediate();
+}
+
+function deleteSettlementRebuildMeta(settlementId) {
+  const db = getDb();
+  const id = String(settlementId || '').trim();
+  if (!id) return;
+  db.prepare('DELETE FROM settlement_rebuild_meta WHERE settlement_id = ?').run(id);
+}
+
 module.exports = {
   DB_FILE,
   getDb,
@@ -1249,4 +1376,9 @@ module.exports = {
   expirePendingCosignSettlement,
   updateTradingSettlementStatus,
   updateTradingSettlementPayload,
+  getCosignDefaulterPenalty,
+  recordCosignDefaulterStrikeAtomic,
+  getSettlementRebuildMeta,
+  incrementSettlementRebuildMeta,
+  deleteSettlementRebuildMeta,
 };

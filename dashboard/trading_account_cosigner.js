@@ -1386,33 +1386,27 @@ const COSIGN_DEFAULTER_BASE_COOLDOWN_MS = Math.max(
 ); // 5m / 15m / 60m escalating order-placement cooldown for non-cosigning griefers
 const MIN_SETTLEMENT_REBUILD_INTERVAL_MS = 60_000;
 const MAX_SETTLEMENT_REBUILDS = 24;
-const settlementRebuildMeta = new Map();
-const cosignDefaulterPenalties = new Map(); // ownerPubLower -> { strikes, cooldownUntil, lastDefaultAt }
 
 function recordCosignDefaulterStrike(ownerPublicKey, now = Date.now()) {
-  const key = String(ownerPublicKey || '').trim().toLowerCase();
-  if (!/^[0-9a-f]{64}$/.test(key)) return null;
-  const prev = cosignDefaulterPenalties.get(key) || { strikes: 0, cooldownUntil: 0, lastDefaultAt: 0 };
-  // Decay strikes if >24h since last default
-  const decayedStrikes = prev.lastDefaultAt > 0 && now - prev.lastDefaultAt > 24 * 60 * 60 * 1000 ? 0 : prev.strikes;
-  const strikes = decayedStrikes + 1;
-  const mult = strikes === 1 ? 1 : (strikes === 2 ? 3 : 12);
-  const cooldownMs = Math.min(60 * 60 * 1000, COSIGN_DEFAULTER_BASE_COOLDOWN_MS * mult);
-  const entry = { strikes, cooldownUntil: now + cooldownMs, lastDefaultAt: now };
-  cosignDefaulterPenalties.set(key, entry);
-  return entry;
+  return clobDb.recordCosignDefaulterStrikeAtomic(ownerPublicKey, {
+    now,
+    decayMs: 24 * 60 * 60 * 1000,
+    baseCooldownMs: COSIGN_DEFAULTER_BASE_COOLDOWN_MS,
+    maxCooldownMs: 60 * 60 * 1000,
+    maxStrikes: 100,
+  });
 }
 
 function checkCosignDefaulterCooldown(ownerPublicKey, now = Date.now()) {
-  const key = String(ownerPublicKey || '').trim().toLowerCase();
-  const entry = cosignDefaulterPenalties.get(key);
-  if (!entry || now >= entry.cooldownUntil) {
+  const entry = clobDb.getCosignDefaulterPenalty(ownerPublicKey);
+  const safeNow = Number.isFinite(Number(now)) && Number(now) > 0 ? Math.trunc(Number(now)) : Date.now();
+  if (!entry || safeNow >= entry.cooldownUntil) {
     return { restricted: false, strikes: entry ? entry.strikes : 0, remainingMs: 0 };
   }
   return {
     restricted: true,
     strikes: entry.strikes,
-    remainingMs: entry.cooldownUntil - now,
+    remainingMs: entry.cooldownUntil - safeNow,
     cooldownUntil: entry.cooldownUntil,
   };
 }
@@ -1426,7 +1420,7 @@ async function expireStalePendingSettlements({ ttlMs = SETTLEMENT_COSIGN_TTL_MS,
   const rows = clobDb.getAllPendingCosignSettlements();
   const expired = [];
   for (const row of rows) {
-    const meta = settlementRebuildMeta.get(String(row.settlementId)) || { count: 0 };
+    const meta = clobDb.getSettlementRebuildMeta(String(row.settlementId));
     const ageMs = now - Number(row.createdAt || now);
     const hitTtl = ageMs >= ttlMs;
     const hitRebuildCap = meta.count >= MAX_SETTLEMENT_REBUILDS;
@@ -1450,7 +1444,7 @@ async function expireStalePendingSettlements({ ttlMs = SETTLEMENT_COSIGN_TTL_MS,
       const didExpire = clobDb.expirePendingCosignSettlement(fresh.settlementId);
       if (!didExpire) return;
 
-      settlementRebuildMeta.delete(String(fresh.settlementId));
+      clobDb.deleteSettlementRebuildMeta(String(fresh.settlementId));
       for (const defPk of defaulters) {
         recordCosignDefaulterStrike(defPk, now);
       }
@@ -1584,9 +1578,15 @@ function rebuildExpiredSettlement(settlement, { force = false, bufferMs = SETTLE
     return { rebuilt: false, settlement };
   }
 
-  // Anti-griefing & anti-loop guard: cap total rebuilds and enforce cooldown on non-forced rebuilds
+  // Never rebuild a settlement that has already exceeded the overall cosign TTL (prevents TTL boundary race)
+  const createdAtMs = Number(settlement.createdAt || 0);
+  if (createdAtMs > 0 && Date.now() - createdAtMs >= SETTLEMENT_COSIGN_TTL_MS) {
+    return { rebuilt: false, settlement };
+  }
+
+  // Anti-griefing & anti-loop guard: cap total rebuilds and enforce cooldown on non-forced rebuilds (persisted in SQLite)
   const metaKey = String(settlement.settlementId);
-  const meta = settlementRebuildMeta.get(metaKey) || { count: 0, lastRebuiltAt: 0 };
+  const meta = clobDb.getSettlementRebuildMeta(metaKey);
   if (meta.count >= MAX_SETTLEMENT_REBUILDS) {
     console.warn(`[TradingCosigner] Settlement ${metaKey} hit max rebuild limit (${MAX_SETTLEMENT_REBUILDS}); skipping rebuild`);
     return { rebuilt: false, settlement };
@@ -1608,11 +1608,11 @@ function rebuildExpiredSettlement(settlement, { force = false, bufferMs = SETTLE
     collectedCosigs: [],
     status: 'pending_cosign',
   });
-  settlementRebuildMeta.set(metaKey, { count: meta.count + 1, lastRebuiltAt: Date.now() });
+  const nextMeta = clobDb.incrementSettlementRebuildMeta(metaKey, Date.now());
 
   console.log(
     `[TradingCosigner] 🔄 Auto-rebuilt expired settlement ${settlement.settlementId}: ` +
-    `oldHash=${oldHash ? oldHash.slice(0, 12) : 'none'} -> newHash=${built.signedByVault.hash.slice(0, 12)} (rebuild #${meta.count + 1})`
+    `oldHash=${oldHash ? oldHash.slice(0, 12) : 'none'} -> newHash=${built.signedByVault.hash.slice(0, 12)} (rebuild #${nextMeta.count})`
   );
 
   return { rebuilt: true, settlement: updated };
@@ -1724,6 +1724,12 @@ function buildSettlementSignatureSummary(settlement, viewerPublicKey) {
     ? (Number(filledBaseAtomic) / 1_000_000).toString()
     : myOrderAmount;
 
+  const createdAtMs = Number(settlement.createdAt || 0);
+  const expiresAtMs = createdAtMs > 0 ? createdAtMs + SETTLEMENT_COSIGN_TTL_MS : 0;
+  const remainingMs = settlement.status === 'pending_cosign' && expiresAtMs > 0
+    ? Math.max(0, expiresAtMs - Date.now())
+    : 0;
+
   return {
     settlementId: settlement.settlementId,
     orderId: String(settlement.orderId || ''),
@@ -1747,6 +1753,9 @@ function buildSettlementSignatureSummary(settlement, viewerPublicKey) {
     allPartiesSigned,
     createdAt: settlement.createdAt,
     updatedAt: settlement.updatedAt,
+    expiresAtMs,
+    cosignTtlMs: SETTLEMENT_COSIGN_TTL_MS,
+    remainingMs,
   };
 }
 
@@ -2042,11 +2051,13 @@ async function reconcileInFlightL1Txs() {
               testnetClient.invalidateAccountBalanceCache(addr);
             }
             clobDb.updateTradingSettlementStatus(s.settlementId, 'confirmed', s.txHash, null);
+            clobDb.deleteSettlementRebuildMeta(s.settlementId);
           } else if (st && st.group === 'failed') {
             if (String(st.status || '').includes('Past_Deadline')) {
               rebuildExpiredSettlement(s, { force: true });
             } else {
               clobDb.updateTradingSettlementStatus(s.settlementId, 'failed', s.txHash, null);
+              clobDb.deleteSettlementRebuildMeta(s.settlementId);
             }
           }
         } catch (_) {}
